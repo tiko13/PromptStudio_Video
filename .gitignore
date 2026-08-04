@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+promptstudio_video_projects.json
+promptstudio_video_projects.json.bak
+promptstudio_video_workflows.json
+promptstudio_video_workflows.json.bak
+*.tmp
+*.log
+.DS_Store
+Thumbs.db

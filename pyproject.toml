@@ -1,0 +1,16 @@
+[project]
+name = "PromptStudio_Video"
+version = "0.1.0"
+description = "Structured video direction and MiniMax H3 generation for ComfyUI Prompt Studio"
+license = { text = "MIT License" }
+requires-python = ">=3.9"
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/tiko13/PromptStudio_Video"
+
+[tool.comfy]
+PublisherId = "tiko13"
+DisplayName = "PromptStudio Video"
