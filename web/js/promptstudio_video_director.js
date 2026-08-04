@@ -3,6 +3,9 @@ import { api } from "../../../scripts/api.js";
 
 const NODE_TYPE = "PSV_MiniMaxH3Director";
 const MODES = ["auto", "t2va", "i2va", "fl2va", "l2va", "ref2va"];
+const FPS = 24;
+const MIN_SHOT_SECONDS = 0.25;
+const MAX_DURATION_SECONDS = 150;
 const CAMERA_TYPES = ["", "Zoom In", "Zoom Out", "Push In", "Pull Out", "Pan Left", "Pan Right", "Truck Left", "Truck Right", "Tilt Up", "Tilt Down", "Pedestal Up", "Pedestal Down", "Arc Shot", "Tracking Shot", "Static Shot", "Shake Slightly", "Shake Strongly", "POV", "Roll Clockwise", "Roll Counterclockwise"];
 const ROLE_LABELS = {
   first_frame: "First frame",
@@ -24,9 +27,12 @@ let stylesLoaded = false;
 function loadStyles() {
   if (stylesLoaded) return;
   stylesLoaded = true;
+  const moduleUrl = new URL(import.meta.url);
+  const stylesheetUrl = new URL("../css/promptstudio_video_director.css", moduleUrl);
+  stylesheetUrl.search = moduleUrl.search;
   const link = document.createElement("link");
   link.rel = "stylesheet";
-  link.href = new URL("../css/promptstudio_video_director.css", import.meta.url).href;
+  link.href = stylesheetUrl.href;
   document.head.append(link);
 }
 
@@ -132,7 +138,23 @@ function mediaKind(file) {
   if (file.type.startsWith("image/")) return "image";
   if (file.type.startsWith("video/")) return "video";
   if (file.type.startsWith("audio/")) return "audio";
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].includes(extension)) return "image";
+  if (["mp4", "webm", "mov", "mkv", "avi", "m4v"].includes(extension)) return "video";
+  if (["wav", "mp3", "flac", "ogg", "m4a", "aac"].includes(extension)) return "audio";
   return "";
+}
+
+function isFileDrag(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+function roundTime(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function snapToFrame(value) {
+  return roundTime(Math.round(value * FPS) / FPS);
 }
 
 function install(node) {
@@ -165,6 +187,8 @@ function install(node) {
     let draft = structuredClone(parseDocument(dataWidget.value));
     let selectedShotId = draft.shots[0]?.id;
     let selectedReferenceId = null;
+    let shotDrag = null;
+    let mediaDragDepth = 0;
     const dialog = el("dialog", "psv-dialog");
     const shell = el("div", "psv-shell");
     const header = el("header", "psv-header");
@@ -177,8 +201,14 @@ function install(node) {
     const footer = el("footer", "psv-footer");
 
     const modeControl = select(MODES, draft.mode || "auto", value => { draft.mode = value; render(); });
-    const durationControl = input(draft.duration_seconds, value => { if (Number.isFinite(value) && value > 0) draft.duration_seconds = value; renderTimeline(); }, "number");
-    durationControl.min = "0.25"; durationControl.max = "150"; durationControl.step = "0.25";
+    const durationControl = input(draft.duration_seconds, value => {
+      if (!Number.isFinite(value) || value <= 0) return;
+      const minimum = (Number(draft.shots.at(-1)?.start) || 0) + MIN_SHOT_SECONDS;
+      draft.duration_seconds = roundTime(Math.min(MAX_DURATION_SECONDS, Math.max(minimum, value)));
+      durationControl.value = draft.duration_seconds;
+      renderTimeline();
+    }, "number");
+    durationControl.min = String(MIN_SHOT_SECONDS); durationControl.max = String(MAX_DURATION_SECONDS); durationControl.step = "0.25";
     const widthControl = input(draft.width, value => { if (value > 0) draft.width = Math.round(value / 32) * 32; }, "number");
     const heightControl = input(draft.height, value => { if (value > 0) draft.height = Math.round(value / 32) * 32; }, "number");
     [widthControl, heightControl].forEach(control => { control.min = "32"; control.step = "32"; });
@@ -186,24 +216,72 @@ function install(node) {
 
     const fileInput = document.createElement("input");
     fileInput.type = "file"; fileInput.multiple = true; fileInput.accept = "image/*,video/*,audio/*"; fileInput.hidden = true;
-    fileInput.addEventListener("change", async () => {
-      for (const file of fileInput.files || []) {
+    async function addMediaFiles(fileList) {
+      const files = Array.from(fileList || []);
+      const supported = files.filter(mediaKind);
+      if (!supported.length) {
+        status.textContent = files.length ? "Drop images, video, or audio files." : "No media files were dropped.";
+        return;
+      }
+      let added = 0;
+      const errors = [];
+      for (const file of supported) {
         const kind = mediaKind(file);
-        if (!kind) continue;
         try {
           const path = await uploadFile(file, status);
-          draft.references.push({ id: identifier("reference"), kind, path, name: file.name, roles: kind === "image" && !draft.references.some(ref => (ref.roles || []).includes("first_frame")) ? ["first_frame"] : [kind === "audio" ? "audio_reference" : "subject"], prompt: "", trim_start: 0, trim_end: null, use_embedded_audio: false });
+          const firstFrameTaken = draft.references.some(ref => (ref.roles || []).includes("first_frame"));
+          const roles = kind === "image" && !firstFrameTaken
+            ? ["first_frame"]
+            : [kind === "audio" ? "audio_reference" : "subject"];
+          draft.references.push({ id: identifier("reference"), kind, path, name: file.name, roles, prompt: "", trim_start: 0, trim_end: null, use_embedded_audio: false });
           selectedReferenceId = draft.references.at(-1).id;
-          status.textContent = `${file.name} added.`;
-          render();
-        } catch (error) { status.textContent = error.message; }
+          added += 1;
+        } catch (error) {
+          errors.push(`${file.name}: ${error.message}`);
+        }
       }
+      if (added) render();
+      status.textContent = errors.length
+        ? `${added} media file${added === 1 ? "" : "s"} added. ${errors.join(" ")}`
+        : `${added} media file${added === 1 ? "" : "s"} added.`;
+    }
+
+    fileInput.addEventListener("change", async () => {
+      await addMediaFiles(fileInput.files);
       fileInput.value = "";
+    });
+
+    dialog.addEventListener("dragenter", event => {
+      if (!isFileDrag(event)) return;
+      event.preventDefault();
+      mediaDragDepth += 1;
+      dialog.classList.add("psv-media-drag-active");
+    });
+    dialog.addEventListener("dragover", event => {
+      if (!isFileDrag(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    });
+    dialog.addEventListener("dragleave", event => {
+      if (!isFileDrag(event)) return;
+      mediaDragDepth = Math.max(0, mediaDragDepth - 1);
+      if (!mediaDragDepth) dialog.classList.remove("psv-media-drag-active");
+    });
+    dialog.addEventListener("drop", async event => {
+      if (!isFileDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      mediaDragDepth = 0;
+      dialog.classList.remove("psv-media-drag-active");
+      await addMediaFiles(event.dataTransfer.files);
     });
 
     function renderReferences() {
       referencesPane.replaceChildren();
-      referencesPane.append(el("h3", "", "References"), button("Add media", () => fileInput.click()));
+      const heading = el("div", "psv-row");
+      heading.append(el("h3", "", "References"), button("Add media", () => fileInput.click()));
+      const dropZone = button("Drop image, video, or audio here", () => fileInput.click(), "psv-media-dropzone");
+      dropZone.title = "Choose files, or drop media anywhere on the Director Canvas";
       const stack = el("div", "psv-stack");
       if (!draft.references.length) stack.append(el("div", "psv-empty", "No references. Auto mode resolves to T2VA."));
       draft.references.forEach(reference => {
@@ -214,16 +292,168 @@ function install(node) {
         card.addEventListener("click", () => { selectedReferenceId = reference.id; renderInspector(); renderReferences(); });
         stack.append(card);
       });
-      referencesPane.append(stack, fileInput);
+      referencesPane.append(heading, dropZone, stack, fileInput);
+    }
+
+    function documentDuration() {
+      return Math.max(MIN_SHOT_SECONDS, Number(draft.duration_seconds) || 5);
+    }
+
+    function captureShotDurations() {
+      const duration = documentDuration();
+      return new Map(draft.shots.map((shot, index) => [
+        shot.id,
+        Math.max(MIN_SHOT_SECONDS, (Number(draft.shots[index + 1]?.start) || duration) - (Number(shot.start) || 0)),
+      ]));
+    }
+
+    function clearDropMarkers() {
+      dialog.querySelectorAll(".psv-drop-marker,.psv-list-drop-marker").forEach(marker => marker.remove());
+      dialog.querySelectorAll(".psv-dragging").forEach(item => item.classList.remove("psv-dragging"));
+    }
+
+    function beginShotDrag(event, shot) {
+      if (event.target.closest(".psv-trim-handle")) { event.preventDefault(); return; }
+      shotDrag = { id: shot.id, durations: captureShotDurations() };
+      selectedShotId = shot.id;
+      selectedReferenceId = null;
+      event.currentTarget.classList.add("psv-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/x-promptstudio-shot", shot.id);
+      event.dataTransfer.setData("text/plain", shot.id);
+    }
+
+    function reorderShot(insertIndex) {
+      if (!shotDrag) return;
+      const shot = draft.shots.find(item => item.id === shotDrag.id);
+      const remaining = draft.shots.filter(item => item.id !== shotDrag.id);
+      if (!shot) return;
+      remaining.splice(Math.max(0, Math.min(insertIndex, remaining.length)), 0, shot);
+      let start = 0;
+      remaining.forEach(item => {
+        item.start = roundTime(start);
+        start += shotDrag.durations.get(item.id) || MIN_SHOT_SECONDS;
+      });
+      draft.shots = remaining;
+      draft.duration_seconds = roundTime(start);
+      durationControl.value = draft.duration_seconds;
+      selectedShotId = shot.id;
+      selectedReferenceId = null;
+    }
+
+    function timelineInsertionIndex(track, clientX) {
+      const blocks = Array.from(track.querySelectorAll(".psv-shot-block"))
+        .filter(block => block.dataset.shotId !== shotDrag?.id);
+      return blocks.filter(block => {
+        const rect = block.getBoundingClientRect();
+        return clientX >= rect.left + rect.width / 2;
+      }).length;
+    }
+
+    function showTimelineDropMarker(track, insertIndex) {
+      track.querySelector(".psv-drop-marker")?.remove();
+      const blocks = Array.from(track.querySelectorAll(".psv-shot-block"))
+        .filter(block => block.dataset.shotId !== shotDrag?.id);
+      const marker = el("div", "psv-drop-marker");
+      const left = insertIndex < blocks.length
+        ? blocks[insertIndex].offsetLeft - 3
+        : blocks.length ? blocks.at(-1).offsetLeft + blocks.at(-1).offsetWidth + 1 : 0;
+      marker.style.left = `${Math.max(0, left)}px`;
+      track.append(marker);
+    }
+
+    function currentBoundary(boundaryIndex) {
+      return boundaryIndex < draft.shots.length
+        ? Number(draft.shots[boundaryIndex].start) || 0
+        : documentDuration();
+    }
+
+    function setBoundary(boundaryIndex, requestedTime) {
+      if (boundaryIndex < 1 || boundaryIndex > draft.shots.length) return;
+      const previousStart = Number(draft.shots[boundaryIndex - 1].start) || 0;
+      const minimum = previousStart + MIN_SHOT_SECONDS;
+      const maximum = boundaryIndex < draft.shots.length
+        ? (Number(draft.shots[boundaryIndex + 1]?.start) || documentDuration()) - MIN_SHOT_SECONDS
+        : MAX_DURATION_SECONDS;
+      const time = roundTime(Math.max(minimum, Math.min(maximum, requestedTime)));
+      if (boundaryIndex < draft.shots.length) draft.shots[boundaryIndex].start = time;
+      else {
+        draft.duration_seconds = time;
+        durationControl.value = time;
+      }
+    }
+
+    function refreshTimelineGeometry(track, scale) {
+      const duration = documentDuration();
+      track.style.width = `${Math.max(520, duration * scale)}px`;
+      draft.shots.forEach((shot, index) => {
+        const end = Number(draft.shots[index + 1]?.start) || duration;
+        const block = track.querySelector(`[data-shot-id="${CSS.escape(shot.id)}"]`);
+        if (!block) return;
+        block.style.left = `${Math.max(0, Number(shot.start) || 0) * scale}px`;
+        block.style.width = `${Math.max(14, (end - (Number(shot.start) || 0)) * scale - 2)}px`;
+        const range = block.querySelector(".psv-shot-range");
+        if (range) range.textContent = `${Number(shot.start).toFixed(2)}–${Number(end).toFixed(2)}s`;
+      });
+    }
+
+    function beginBoundaryResize(event, index, edge, track, scale) {
+      event.preventDefault();
+      event.stopPropagation();
+      const boundaryIndex = edge === "left" ? index : index + 1;
+      if (!boundaryIndex) return;
+      selectedShotId = draft.shots[index].id;
+      selectedReferenceId = null;
+      document.body.classList.add("psv-resizing");
+      const move = moveEvent => {
+        const trackRect = track.getBoundingClientRect();
+        const rawTime = (moveEvent.clientX - trackRect.left) / scale;
+        setBoundary(boundaryIndex, moveEvent.altKey ? roundTime(rawTime) : snapToFrame(rawTime));
+        refreshTimelineGeometry(track, scale);
+        const start = Number(draft.shots[index].start) || 0;
+        const end = Number(draft.shots[index + 1]?.start) || documentDuration();
+        status.textContent = `Shot ${index + 1}: ${(end - start).toFixed(2)}s${moveEvent.altKey ? "" : " · snapped to 24 fps"}`;
+      };
+      const finish = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        document.body.classList.remove("psv-resizing");
+        render();
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", finish, { once: true });
+      window.addEventListener("pointercancel", finish, { once: true });
+    }
+
+    function trimHandle(index, edge, track, scale) {
+      const handle = el("div", `psv-trim-handle psv-trim-${edge}`);
+      const boundaryIndex = edge === "left" ? index : index + 1;
+      handle.role = "separator";
+      handle.tabIndex = boundaryIndex ? 0 : -1;
+      handle.ariaLabel = edge === "left" ? `Trim the start of shot ${index + 1}` : `Trim the end of shot ${index + 1}`;
+      handle.title = boundaryIndex ? "Drag to trim. Hold Alt for sub-frame precision." : "The video starts at 0 seconds.";
+      if (!boundaryIndex) handle.classList.add("disabled");
+      handle.addEventListener("pointerdown", event => beginBoundaryResize(event, index, edge, track, scale));
+      handle.addEventListener("dragstart", event => event.preventDefault());
+      handle.addEventListener("keydown", event => {
+        if (!boundaryIndex || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+        event.preventDefault();
+        const step = event.shiftKey ? 1 : 1 / FPS;
+        setBoundary(boundaryIndex, currentBoundary(boundaryIndex) + (event.key === "ArrowLeft" ? -step : step));
+        render();
+      });
+      return handle;
     }
 
     function renderTimeline() {
       const old = shotsPane.querySelector(".psv-timeline");
       if (old) old.remove();
       const timeline = el("div", "psv-timeline");
+      timeline.append(el("div", "psv-timeline-help", "Drag shots to reorder · drag either edge to trim · 24 fps snap"));
       const ruler = el("div", "psv-ruler");
-      const duration = Math.max(1, Number(draft.duration_seconds) || 5);
-      const scale = Math.max(45, 680 / duration);
+      const duration = documentDuration();
+      const scale = Math.max(56, 680 / duration);
       for (let second = 0; second <= Math.ceil(duration); second += 1) {
         const tick = el("span", "", `${second}s`); tick.style.left = `${second * scale}px`; ruler.append(tick);
       }
@@ -231,11 +461,38 @@ function install(node) {
       draft.shots.forEach((shot, index) => {
         const end = draft.shots[index + 1]?.start ?? duration;
         const block = el("div", `psv-shot-block${shot.id === selectedShotId ? " selected" : ""}`);
+        block.dataset.shotId = shot.id;
+        block.draggable = true;
+        block.title = "Drag to rearrange this shot";
         block.style.left = `${Math.max(0, shot.start) * scale}px`;
-        block.style.width = `${Math.max(70, (end - shot.start) * scale - 4)}px`;
-        block.append(el("strong", "", `Shot ${index + 1}`), el("small", "", `${Number(shot.start).toFixed(2)}–${Number(end).toFixed(2)}s`), el("small", "", shot.camera?.type || "No camera motion"));
+        block.style.width = `${Math.max(14, (end - shot.start) * scale - 2)}px`;
+        block.append(
+          trimHandle(index, "left", track, scale),
+          el("strong", "", `Shot ${index + 1}`),
+          el("small", "psv-shot-range", `${Number(shot.start).toFixed(2)}–${Number(end).toFixed(2)}s`),
+          el("small", "", shot.camera?.type || "No camera motion"),
+          trimHandle(index, "right", track, scale),
+        );
         block.addEventListener("click", () => { selectedShotId = shot.id; selectedReferenceId = null; render(); });
+        block.addEventListener("dragstart", event => beginShotDrag(event, shot));
+        block.addEventListener("dragend", () => { shotDrag = null; clearDropMarkers(); render(); });
         track.append(block);
+      });
+      track.addEventListener("dragover", event => {
+        if (!shotDrag || isFileDrag(event)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        const insertIndex = timelineInsertionIndex(track, event.clientX);
+        showTimelineDropMarker(track, insertIndex);
+      });
+      track.addEventListener("drop", event => {
+        if (!shotDrag || isFileDrag(event)) return;
+        event.preventDefault();
+        const insertIndex = timelineInsertionIndex(track, event.clientX);
+        reorderShot(insertIndex);
+        shotDrag = null;
+        clearDropMarkers();
+        render();
       });
       timeline.append(ruler, track);
       shotsPane.prepend(timeline);
@@ -246,20 +503,62 @@ function install(node) {
       const heading = el("div", "psv-row");
       heading.append(el("h3", "", "Shots"), button("Add shot", () => {
         const last = draft.shots.at(-1);
-        const start = Math.min((Number(last?.start) || 0) + 2, Math.max(0.25, Number(draft.duration_seconds) - 0.25));
+        const duration = documentDuration();
+        const lastStart = Number(last?.start) || 0;
+        let start = snapToFrame(lastStart + (duration - lastStart) / 2);
+        if (duration - lastStart < MIN_SHOT_SECONDS * 2) {
+          if (duration >= MAX_DURATION_SECONDS) {
+            status.textContent = "The final shot is too short to split and the video is already at 150 seconds.";
+            return;
+          }
+          start = duration;
+          draft.duration_seconds = Math.min(MAX_DURATION_SECONDS, roundTime(duration + MIN_SHOT_SECONDS));
+          durationControl.value = draft.duration_seconds;
+        }
         const shot = { ...defaultShot(draft.shots.length), start };
         draft.shots.push(shot); selectedShotId = shot.id; render();
       }));
       shotsPane.append(heading);
       renderTimeline();
-      const list = el("div", "psv-stack");
+      const list = el("div", "psv-stack psv-shot-list");
       draft.shots.forEach((shot, index) => {
         const card = el("div", `psv-shot-card${shot.id === selectedShotId ? " selected" : ""}`);
+        card.dataset.shotId = shot.id;
+        card.draggable = true;
+        card.title = "Drag to rearrange this shot";
         const head = el("div", "psv-shot-head");
         head.append(el("strong", "", `Shot ${index + 1}`), el("span", "psv-help", index ? `Cut ${Number(shot.start).toFixed(3)}s` : "Opening"));
         card.append(head, el("div", "psv-help", shot.composition || shot.action || "Empty shot"));
         card.addEventListener("click", () => { selectedShotId = shot.id; selectedReferenceId = null; render(); });
+        card.addEventListener("dragstart", event => beginShotDrag(event, shot));
+        card.addEventListener("dragend", () => { shotDrag = null; clearDropMarkers(); render(); });
         list.append(card);
+      });
+      list.addEventListener("dragover", event => {
+        if (!shotDrag || isFileDrag(event)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        list.querySelector(".psv-list-drop-marker")?.remove();
+        const cards = Array.from(list.querySelectorAll(".psv-shot-card"))
+          .filter(card => card.dataset.shotId !== shotDrag.id);
+        const insertIndex = cards.filter(card => {
+          const rect = card.getBoundingClientRect();
+          return event.clientY >= rect.top + rect.height / 2;
+        }).length;
+        const marker = el("div", "psv-list-drop-marker");
+        if (insertIndex < cards.length) list.insertBefore(marker, cards[insertIndex]);
+        else list.append(marker);
+        marker.dataset.insertIndex = String(insertIndex);
+      });
+      list.addEventListener("drop", event => {
+        if (!shotDrag || isFileDrag(event)) return;
+        event.preventDefault();
+        const marker = list.querySelector(".psv-list-drop-marker");
+        const insertIndex = Number(marker?.dataset.insertIndex ?? draft.shots.length - 1);
+        reorderShot(insertIndex);
+        shotDrag = null;
+        clearDropMarkers();
+        render();
       });
       shotsPane.append(list);
     }
@@ -314,8 +613,10 @@ function install(node) {
     function renderShotInspector(shot) {
       const index = draft.shots.indexOf(shot);
       inspectorPane.append(el("h3", "", `Shot ${index + 1}`));
+      const shotEnd = Number(draft.shots[index + 1]?.start) || documentDuration();
+      inspectorPane.append(el("div", "psv-shot-timing", `${(shotEnd - (Number(shot.start) || 0)).toFixed(2)}s · ${Number(shot.start).toFixed(2)}–${shotEnd.toFixed(2)}s`));
       if (index) {
-        const start = input(shot.start, value => { if (Number.isFinite(value)) shot.start = value; renderTimeline(); }, "number"); start.min = "0.001"; start.step = "0.001";
+        const start = input(shot.start, value => { if (Number.isFinite(value)) setBoundary(index, value); renderTimeline(); }, "number"); start.min = String(MIN_SHOT_SECONDS); start.step = String(1 / FPS);
         inspectorPane.append(field("Cut time", start), field("Transition", input(shot.transition || "the camera cuts to", value => { shot.transition = value; })));
       }
       [["Composition and framing", "composition"], ["Subjects and positions", "subjects"], ["Environment", "environment"], ["Lighting", "lighting"], ["Actions and state changes", "action"]].forEach(([label, name]) => inspectorPane.append(field(label, textarea(shot[name], value => { shot[name] = value; }))));
@@ -357,7 +658,7 @@ function install(node) {
 
   if (node.addDOMWidget) {
     domWidget = node.addDOMWidget("promptstudio_video_director", "custom", summary, { serialize: false, hideOnZoom: false, getHeight: () => 150 });
-    domWidget.computeSize = width => [Math.max(420, width), 150];
+    domWidget.computeSize = width => [width, 150];
   }
   const oldConfigure = node.onConfigure;
   node.onConfigure = function (...args) { oldConfigure?.apply(this, args); requestAnimationFrame(updateSummary); };

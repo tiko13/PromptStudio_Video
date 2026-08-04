@@ -14,8 +14,9 @@ This repository is under active development. The first vertical slice contains:
 - native ComfyUI MiniMax conditioning and latent creation;
 - lazy FL2VA/REF2VA model selection;
 - first-frame, last-frame, image, video, and audio reference loading;
-- a transactional full-screen Director Canvas for shots, camera direction,
-  dialogue, visible text, sound, and media roles; and
+- a transactional full-screen Director Canvas with frame-snapped shot trimming,
+  drag-to-reorder editing, media drag-and-drop, camera direction, dialogue,
+  visible text, sound, and media roles; and
 - a versioned capability endpoint for future Prompt Studio integration.
 
 ## Requirements
