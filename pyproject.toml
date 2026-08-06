@@ -14,3 +14,4 @@ Repository = "https://github.com/tiko13/PromptStudio_Video"
 [tool.comfy]
 PublisherId = "tiko13"
 DisplayName = "PromptStudio Video"
+Icon = "https://raw.githubusercontent.com/tiko13/PromptStudio_Video/master/web/prompt-studio-video-icon.svg"

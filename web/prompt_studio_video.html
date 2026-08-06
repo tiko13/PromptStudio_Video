@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Prompt Studio Video</title>
+  <base href="/extensions/PromptStudio_Video/">
+  <link rel="icon" href="./prompt-studio-video-favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./css/promptstudio_video_studio.css?v=3">
+</head>
+<body class="psvstudio-popout-body">
+  <main id="promptstudio-video-mount" class="psvstudio-popout-mount">
+    <div class="psvstudio-loading">
+      <img class="psvstudio-loading-mark" src="./prompt-studio-video-icon.svg" alt="" aria-hidden="true">
+      <strong>Prompt Studio Video</strong>
+      <span id="promptstudio-video-standalone-status">Connecting to ComfyUI…</span>
+    </div>
+  </main>
+  <iframe id="promptstudio-video-host" class="psvstudio-standalone-host" title="ComfyUI workflow host" aria-hidden="true" tabindex="-1"></iframe>
+  <script type="module" src="./js/promptstudio_video_standalone.js?v=1"></script>
+</body>
+</html>

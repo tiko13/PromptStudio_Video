@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Prompt Studio Video</title>
+  <defs>
+    <linearGradient id="background" x1="28" y1="20" x2="226" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#151722"/>
+      <stop offset="1" stop-color="#090a0f"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="49" y1="35" x2="202" y2="235" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#795cff"/>
+      <stop offset=".52" stop-color="#9a7fff"/>
+      <stop offset="1" stop-color="#c1afff"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="248" height="248" rx="52" fill="url(#background)"/>
+  <rect x="4.5" y="4.5" width="247" height="247" rx="51.5" fill="none" stroke="#fff" stroke-opacity=".1"/>
+  <path
+    d="M58 219V42h84c37 0 61 21 61 53 0 29-20 47-55 47h-39"
+    fill="none"
+    stroke="url(#mark)"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="26"
+  />
+  <path d="m143 69 35 23-35 23Z" fill="url(#mark)"/>
+  <path
+    d="M178 139h-65c-22 0-35 11-35 28s13 28 35 28h40c19 0 30 9 30 22s-12 21-30 21H88"
+    fill="none"
+    stroke="url(#mark)"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="22"
+  />
+</svg>

@@ -2,6 +2,7 @@ import unittest
 
 from video.contracts import (
     PromptDocumentError,
+    adapt_canvas,
     align_frame_count,
     effective_duration,
     normalize_document,
@@ -21,6 +22,45 @@ def document(**overrides):
 
 
 class ContractTests(unittest.TestCase):
+    def test_main_description_is_preserved(self):
+        normalized = normalize_document(document(main_description="A cyclist crosses the city at dawn."))
+        self.assertEqual(normalized["main_description"], "A cyclist crosses the city at dawn.")
+
+    def test_adaptive_canvas_preserves_ratio_on_minimax_grid(self):
+        self.assertEqual(adapt_canvas(1920, 1080), (1344, 768))
+        self.assertEqual(adapt_canvas(1080, 1920), (768, 1344))
+        self.assertEqual(adapt_canvas(1024, 1024), (1024, 1024))
+        width, height = adapt_canvas(2520, 1080)
+        self.assertEqual((width % 32, height % 32), (0, 0))
+        self.assertLessEqual(width * height, 768 * 1344 + 32 * max(width, height))
+        smaller = adapt_canvas(1920, 1080, target_megapixels=0.5)
+        self.assertEqual((smaller[0] % 32, smaller[1] % 32), (0, 0))
+        self.assertLess(smaller[0] * smaller[1], 1344 * 768)
+
+    def test_reference_dimensions_and_canvas_link_are_preserved(self):
+        reference = {
+            "id": "opening",
+            "kind": "image",
+            "path": "opening.png",
+            "roles": ["first_frame"],
+            "source_width": 1920,
+            "source_height": 1080,
+        }
+        normalized = normalize_document(document(
+            width=1024,
+            height=1024,
+            target_megapixels=0.5,
+            canvas_reference_id="opening",
+            references=[reference],
+        ))
+        self.assertEqual(normalized["canvas_reference_id"], "opening")
+        self.assertEqual((normalized["width"], normalized["height"]), adapt_canvas(1920, 1080, 0.5))
+        self.assertEqual(normalized["target_megapixels"], 0.5)
+        self.assertEqual(
+            (normalized["references"][0]["source_width"], normalized["references"][0]["source_height"]),
+            (1920, 1080),
+        )
+
     def test_frame_count_uses_minimax_grid(self):
         self.assertEqual(align_frame_count(120), 124)
         self.assertEqual(align_frame_count(124), 124)

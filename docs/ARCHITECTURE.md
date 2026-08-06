@@ -13,6 +13,7 @@ The versioned structured document is authoritative:
 ```text
 document
 ├── mode, duration, and canvas
+├── main whole-video description and visual style
 ├── references and semantic roles
 ├── shots
 │   ├── composition, subjects, environment, lighting, action
@@ -28,6 +29,70 @@ produces the queue prompt deterministically. Alignment instructions, section
 ordering, reference labels, dialogue tags, and timestamps must not be delegated
 to unrestricted LLM prose.
 
+The standalone studio wraps the prompt document in a project record containing
+the user's production brief, selected `[PSV]` workflow, and immutable generation
+snapshots. Manual controls and AI Director patches operate on the same
+document; there is no separate simplified prompt state.
+
+## AI Directors
+
+The production card opens a project-scoped Grand Director. It receives every
+shot, the production brief, global audiovisual fields, compact production
+constraints, canonical MiniMax reference tokens, and a bounded recent-message
+tail. Its validated change set supports project-field updates, edits across
+existing shots, cut-time changes, adding or removing unprotected shots, and the
+structured reference definitions and retention analysis required by REF2VA.
+
+The selected-shot inspector opens a separate shot-scoped Director. It receives
+the selected shot, its immediate neighbors, and the same compact constraints.
+Its write contract remains limited to descriptive, sound, and camera updates on
+that selected shot, plus reference-semantic fields when an attached reference
+must be activated for that shot. Neither scope receives the compiled queue
+prompt or unlimited conversation history.
+
+Conversational answers do not mutate project state. Requested edits use a
+video-specific change set whose base-document hash, scope, target IDs, field
+allowlists, camera vocabulary, timing, reference coverage, and normalized
+result are validated on the server. Reference assets themselves, dialogue,
+speaker IDs, and visible text remain outside both write scopes; reference
+analysis may describe and activate already-committed assets but cannot replace
+them. A project proposal cannot remove a shot that contains protected dialogue
+or visible text. The browser applies the validated document only after explicit
+user approval and rejects proposals made against an older document revision.
+
+Director history is stored separately in browser storage and capped. Approved
+document changes remain the durable memory that subsequent bounded-context
+requests receive.
+
+Assistant turns retain response variants. Regeneration replays the bounded
+conversation through the preceding user turn, stores the new answer alongside
+the old one, and keeps proposal, proposal error, context usage, and
+apply/discard state per variant. Only the selected variant is exposed to the
+proposal preview and apply flow.
+
+Director output length defaults to provider-aware automatic mode rather than a
+fixed ceiling. KoboldCpp reports its true context length and tokenizes the
+request, allowing the client to allocate the remaining window to the response.
+Ollama receives its fill-context `num_predict` sentinel. Explicit positive
+limits still override automatic behavior.
+
+The Director chat route supports background jobs. The standalone UI starts a
+job, polls its status route, and—while a KoboldCpp job is running—uses
+`/api/extra/perf` plus `/api/extra/generate/check` to distinguish active prompt
+processing or generation from a completed or failed Director task.
+
+Sampling is intent-sensitive. Conversational advice uses the configured
+temperature, structured proposal requests cap it at `0.2`, and the single
+contract-correction retry uses `0.0` to favor exact document enums.
+
+Director image attachments are uploaded to normal ComfyUI input storage and
+loaded only through validated paths beneath that directory. A per-image usage
+separates visual description from conditioning: `describe` images are current-
+turn vision context only, while explicit first-frame, last-frame, subject,
+scene, style, pose, camera, and storyboard usages become normal project
+references before the request. Image bytes are attached only to the latest user
+message and are never replayed with older chat history.
+
 ## Runtime dispatch
 
 `PSV_MiniMaxH3Director` normalizes and compiles the document, loads media from
@@ -39,3 +104,12 @@ resolved mode:
 
 The node returns the selected lazy model alongside native conditioning and
 latent outputs, keeping the rest of the workflow conventional and editable.
+
+## Standalone workflow dispatch
+
+The frontend discovers `[PSV]` workflow files through ComfyUI user data, loads
+each into an isolated graph, and caches the executable `graphToPrompt` snapshot.
+Queueing clones that snapshot and changes only the Director's `document_json`
+input plus explicitly requested seed randomization. The queued snapshot is then
+stored with the generation so subsequent project edits cannot change an active
+render and completed work can be replayed exactly.

@@ -50,7 +50,7 @@ function defaultShot(index = 0) {
 }
 
 function defaultDocument() {
-  return { version: 1, mode: "auto", duration_seconds: 5, width: 1344, height: 768, ref_image_size: "match", style: "Live-action, cinematic", shots: [defaultShot()], references: [], overall_soundscape: "", non_diegetic_music: "N/A", complete_silence: false, task_types: [], subject_definitions: [], summary: "", retention_analysis: [] };
+  return { version: 1, mode: "auto", duration_seconds: 5, width: 1344, height: 768, ref_image_size: "match", main_description: "", style: "Live-action, cinematic", shots: [defaultShot()], references: [], overall_soundscape: "", non_diegetic_music: "N/A", complete_silence: false, task_types: [], subject_definitions: [], summary: "", retention_analysis: [] };
 }
 
 function parseDocument(value) {
@@ -143,6 +143,12 @@ function mediaKind(file) {
   if (["mp4", "webm", "mov", "mkv", "avi", "m4v"].includes(extension)) return "video";
   if (["wav", "mp3", "flac", "ogg", "m4a", "aac"].includes(extension)) return "audio";
   return "";
+}
+
+function referenceDisplayLabel(references, reference) {
+  const typeName = reference.kind === "image" ? "Picture" : reference.kind === "video" ? "Video" : "Audio";
+  const ordinal = references.filter(item => item.kind === reference.kind).findIndex(item => item.id === reference.id) + 1;
+  return `${typeName} ${Math.max(1, ordinal)}`;
 }
 
 function isFileDrag(event) {
@@ -251,30 +257,40 @@ function install(node) {
       fileInput.value = "";
     });
 
-    dialog.addEventListener("dragenter", event => {
-      if (!isFileDrag(event)) return;
-      event.preventDefault();
-      mediaDragDepth += 1;
-      dialog.classList.add("psv-media-drag-active");
-    });
-    dialog.addEventListener("dragover", event => {
-      if (!isFileDrag(event)) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "copy";
-    });
-    dialog.addEventListener("dragleave", event => {
-      if (!isFileDrag(event)) return;
-      mediaDragDepth = Math.max(0, mediaDragDepth - 1);
-      if (!mediaDragDepth) dialog.classList.remove("psv-media-drag-active");
-    });
-    dialog.addEventListener("drop", async event => {
-      if (!isFileDrag(event)) return;
-      event.preventDefault();
-      event.stopPropagation();
+    const clearMediaDrag = () => {
       mediaDragDepth = 0;
       dialog.classList.remove("psv-media-drag-active");
-      await addMediaFiles(event.dataTransfer.files);
-    });
+    };
+    const captureMediaDrag = event => {
+      if (!isFileDrag(event)) return;
+
+      // ComfyUI also accepts files on its graph canvas. Capture native file
+      // drags at the window boundary while this modal is open so the graph's
+      // document-level handler cannot consume the drop before the Director.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      if (event.type === "dragenter") {
+        mediaDragDepth += 1;
+        dialog.classList.add("psv-media-drag-active");
+      } else if (event.type === "dragover") {
+        dialog.classList.add("psv-media-drag-active");
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      } else if (event.type === "dragleave") {
+        if (!event.relatedTarget) {
+          clearMediaDrag();
+        } else {
+          mediaDragDepth = Math.max(0, mediaDragDepth - 1);
+          if (!mediaDragDepth) dialog.classList.remove("psv-media-drag-active");
+        }
+      } else if (event.type === "drop") {
+        const files = Array.from(event.dataTransfer?.files || []);
+        clearMediaDrag();
+        void addMediaFiles(files);
+      }
+    };
+    const mediaDragEvents = ["dragenter", "dragover", "dragleave", "drop"];
+    mediaDragEvents.forEach(type => window.addEventListener(type, captureMediaDrag, true));
 
     function renderReferences() {
       referencesPane.replaceChildren();
@@ -287,7 +303,10 @@ function install(node) {
       draft.references.forEach(reference => {
         const card = el("div", `psv-reference${reference.id === selectedReferenceId ? " selected" : ""}`);
         const head = el("div", "psv-reference-head");
-        head.append(el("strong", "", reference.name || reference.path), el("span", "", reference.kind));
+        head.append(
+          el("strong", "", referenceDisplayLabel(draft.references, reference)),
+          el("span", "", reference.name || reference.path || reference.kind),
+        );
         card.append(head, el("div", "psv-help", (reference.roles || []).map(role => ROLE_LABELS[role] || role).join(" · ") || "No role"));
         card.addEventListener("click", () => { selectedReferenceId = reference.id; renderInspector(); renderReferences(); });
         stack.append(card);
@@ -564,7 +583,10 @@ function install(node) {
     }
 
     function renderReferenceInspector(reference) {
-      inspectorPane.append(el("h3", "", "Reference roles"), el("div", "psv-help", reference.name || reference.path));
+      inspectorPane.append(
+        el("h3", "", `${referenceDisplayLabel(draft.references, reference)} roles`),
+        el("div", "psv-help", reference.name || reference.path),
+      );
       const available = reference.kind === "image" ? ["first_frame", "last_frame", "subject", "scene", "style", "action", "pose", "camera", "storyboard"] : reference.kind === "video" ? ["subject", "scene", "style", "action", "pose", "camera", "video_edit", "video_continue"] : ["audio_copy", "audio_reference"];
       const grid = el("div", "psv-role-grid");
       available.forEach(role => {
@@ -634,7 +656,12 @@ function install(node) {
       if (reference) { renderReferenceInspector(reference); return; }
       const shot = draft.shots.find(item => item.id === selectedShotId) || draft.shots[0];
       renderShotInspector(shot);
-      inspectorPane.append(el("h4", "", "Whole-video sound"), field("Overall soundscape", textarea(draft.overall_soundscape, value => { draft.overall_soundscape = value; })), field("Non-diegetic music", textarea(draft.non_diegetic_music, value => { draft.non_diegetic_music = value; })));
+      inspectorPane.append(
+        el("h4", "", "Whole video"),
+        field("Main video description", textarea(draft.main_description, value => { draft.main_description = value; })),
+        field("Overall soundscape", textarea(draft.overall_soundscape, value => { draft.overall_soundscape = value; })),
+        field("Non-diegetic music", textarea(draft.non_diegetic_music, value => { draft.non_diegetic_music = value; })),
+      );
     }
 
     function render() {
@@ -652,7 +679,11 @@ function install(node) {
     }, "psv-primary"));
     shell.append(header, body, footer); body.append(referencesPane, shotsPane, inspectorPane); dialog.append(shell);
     document.body.append(dialog);
-    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    dialog.addEventListener("close", () => {
+      clearMediaDrag();
+      mediaDragEvents.forEach(type => window.removeEventListener(type, captureMediaDrag, true));
+      dialog.remove();
+    }, { once: true });
     render(); dialog.showModal();
   }
 

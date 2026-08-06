@@ -1,0 +1,3024 @@
+import { app } from "/scripts/app.js";
+import { api } from "/scripts/api.js";
+
+const EXTENSION_NAME = "PromptStudio.Video.Standalone";
+const CHANNEL_NAME = "promptstudio.video.standalone.v1";
+const DIRECTOR_TYPE = "PSV_MiniMaxH3Director";
+const WORKFLOW_PREFIX = "[PSV]";
+const PROJECTS_ENDPOINT = "/promptstudio-video/projects";
+const WORKFLOWS_ENDPOINT = "/promptstudio-video/workflows";
+const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
+const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
+const DIRECTOR_JOB_POLL_MS = 1000;
+const DIRECTOR_SETTINGS_KEY = "promptstudio.video.director.settings.v1";
+const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
+const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
+const IMAGE_CONSULT_SETTINGS_KEY = "promptstudio.promptStudio.consult.settings.v1";
+const CANVAS_MEDIA_ROLES = new Set(["first_frame", "last_frame", "video_edit", "video_continue"]);
+const DIRECTOR_MAX_IMAGES = 4;
+const DIRECTOR_IMAGE_USAGES = Object.freeze([
+  { value: "describe", label: "Describe only · no reference" },
+  { value: "first_frame", label: "Use as first frame" },
+  { value: "last_frame", label: "Use as last frame" },
+  { value: "subject", label: "Subject / identity reference" },
+  { value: "scene", label: "Scene / environment reference" },
+  { value: "style", label: "Visual style reference" },
+  { value: "pose", label: "Pose reference" },
+  { value: "camera", label: "Camera / composition reference" },
+  { value: "storyboard", label: "Storyboard reference" },
+]);
+const DISCONNECTED_GENERATION_GRACE_MS = 15 * 1000;
+const GENERATION_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+const PLACEHOLDERS = Object.freeze({
+  projectTitle: "Last Train Letter",
+  brief: "Live-action, cinematic: a young woman on a rain-soaked train unfolds a letter, looks toward the passing city lights, and whispers a farewell.",
+  durationSeconds: "8",
+  directorCommand: "Split this into two shots at 00:04.000, add a slow push-in toward the letter, and keep the dialogue verbatim.",
+  cutTime: "3.5",
+  action: "She lifts her gaze from the folded letter, watches the city lights pass, then folds the paper along its existing crease.",
+  subjects: "A young woman in a navy coat sits beside the window, holding a folded letter in both hands.",
+  environment: "Inside a nearly empty commuter train at night; rain streaks the window and blurred city lights pass outside.",
+  composition: "A medium-wide shot frames the woman in profile on the right, with the rain-covered window filling the left side.",
+  lighting: "Cool blue light from the window outlines her face, balanced by warm carriage lights overhead.",
+  transition: "the camera cuts to a close-up of the folded letter",
+  cameraTarget: "the folded letter in her hands",
+  speaker: "The young woman with a quiet, breathy voice",
+  speakerId: "S1",
+  language: "English",
+  dialogue: "I get off at the next station.",
+  delivery: "in a quiet, breathy voice at a restrained pace",
+  visibleText: "Next stop: Central Station",
+  sounds: "Rain ticks against the window\nPaper rustles softly in her hands",
+  style: "Live-action, cinematic",
+  soundscape: "The train wheels produce a steady metallic rhythm beneath a low ventilation hum. Rain ticks against the window while paper rustles softly.",
+  music: "Sparse piano notes at a slow tempo, joined by sustained low strings that gradually decrease in volume.",
+});
+
+const state = {
+  panel: null,
+  popup: null,
+  config: null,
+  projects: [],
+  activeProjectId: null,
+  projectRevision: 0,
+  projectMutation: 0,
+  projectSavedMutation: 0,
+  projectSaveTimer: null,
+  projectSaveChain: Promise.resolve(),
+  workflows: [],
+  workflowRevision: 0,
+  selectedShotId: null,
+  generationProgress: new Map(),
+  generationPollers: new Map(),
+  generationActivity: new Map(),
+  generationFailures: new Map(),
+  promptWorkerSeenAlive: false,
+  promptWorkerHealthCheckedAt: 0,
+  promptWorkerHealthRequest: null,
+  apiConnected: true,
+  disconnectedGenerationTimer: null,
+  timelineZoom: 80,
+  shotDrag: null,
+  mediaDragId: "",
+  mediaDropDocuments: new WeakSet(),
+  mediaDropDepth: new WeakMap(),
+  mediaDimensionLoads: new Set(),
+  drawer: "",
+  directorDialog: null,
+  directorBusy: false,
+  directorSessions: null,
+  directorScope: "shot",
+  ready: false,
+};
+
+function clone(value) {
+  return structuredClone(value);
+}
+
+function makeId(prefix) {
+  const value = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${value}`;
+}
+
+function el(tag, className = "", text = "") {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text) element.textContent = text;
+  return element;
+}
+
+function button(text, handler, className = "psvstudio-button") {
+  const control = el("button", className, text);
+  control.type = "button";
+  control.addEventListener("click", handler);
+  return control;
+}
+
+function field(label, control, help = "") {
+  const wrapper = el("label", "psvstudio-field");
+  wrapper.append(el("span", "", label), control);
+  if (help) wrapper.append(el("small", "psvstudio-help", help));
+  return wrapper;
+}
+
+function checkControl(label, checked, onChange) {
+  const wrapper = el("label", "psvstudio-inline psvstudio-help");
+  const control = document.createElement("input");
+  control.type = "checkbox";
+  control.checked = Boolean(checked);
+  control.addEventListener("change", () => onChange(control.checked, control));
+  wrapper.append(control, document.createTextNode(label));
+  return wrapper;
+}
+
+function textInput(value, onInput, type = "text", placeholder = "") {
+  const control = document.createElement("input");
+  control.type = type;
+  control.value = value ?? "";
+  control.placeholder = placeholder;
+  control.addEventListener("input", () => onInput(type === "number" ? Number(control.value) : control.value, control));
+  return control;
+}
+
+function textArea(value, onInput, rows = 3, placeholder = "") {
+  const control = document.createElement("textarea");
+  control.rows = rows;
+  control.value = value ?? "";
+  control.placeholder = placeholder;
+  control.addEventListener("input", () => onInput(control.value, control));
+  return control;
+}
+
+function selectInput(options, value, onChange) {
+  const control = document.createElement("select");
+  for (const item of options) {
+    const option = document.createElement("option");
+    if (typeof item === "object") {
+      option.value = item.value;
+      option.textContent = item.label;
+    } else {
+      option.value = item;
+      option.textContent = item || "None";
+    }
+    control.append(option);
+  }
+  control.value = value ?? "";
+  control.addEventListener("change", () => onChange(control.value, control));
+  return control;
+}
+
+function storedObject(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function directorSettings() {
+  const studio = storedObject(IMAGE_STUDIO_SETTINGS_KEY);
+  const consult = storedObject(IMAGE_CONSULT_SETTINGS_KEY);
+  const video = storedObject(DIRECTOR_SETTINGS_KEY);
+  const storedResponseTokens = Number(video.max_response_tokens);
+  const storedTimeout = Number(video.request_timeout);
+  const responseTokens = !Object.hasOwn(video, "max_response_tokens") || storedResponseTokens === 700
+    ? 0
+    : Math.max(0, Math.min(131072, Number.isFinite(storedResponseTokens) ? storedResponseTokens : 0));
+  return {
+    llm_provider: video.llm_provider || studio.llm_provider || "koboldcpp",
+    kobold_url: video.kobold_url || studio.kobold_url || "http://localhost:5001",
+    ollama_url: video.ollama_url || studio.ollama_url || "http://localhost:11434",
+    ollama_model: video.ollama_model || studio.ollama_model || "",
+    thinking_mode: video.thinking_mode || consult.thinking_mode || "Disabled",
+    max_response_tokens: responseTokens,
+    context_budget_chars: Math.max(4000, Math.min(32000, Number(video.context_budget_chars || 8000))),
+    temperature: Number(video.temperature ?? consult.temperature ?? 0.7),
+    top_p: Number(video.top_p ?? consult.top_p ?? 0.9),
+    top_k: Number(video.top_k ?? consult.top_k ?? 100),
+    min_p: Number(video.min_p ?? consult.min_p ?? 0),
+    rep_pen: Number(video.rep_pen ?? consult.rep_pen ?? 1.05),
+    rep_pen_range: Number(video.rep_pen_range ?? consult.rep_pen_range ?? 360),
+    sampler_seed: Number(video.sampler_seed ?? consult.sampler_seed ?? -1),
+    request_timeout: !Object.hasOwn(video, "request_timeout") || storedTimeout === 120
+      ? 600
+      : Math.max(5, Math.min(3600, Number.isFinite(storedTimeout) ? storedTimeout : 600)),
+  };
+}
+
+function directorControlValue(dialog, id) {
+  return dialog?.querySelector(`#${id}`)?.value;
+}
+
+function saveDirectorSettings(dialog = state.directorDialog) {
+  if (!dialog) return directorSettings();
+  const settings = {
+    llm_provider: directorControlValue(dialog, "psvstudio-director-provider") || "koboldcpp",
+    kobold_url: directorControlValue(dialog, "psvstudio-director-kobold-url") || "http://localhost:5001",
+    ollama_url: directorControlValue(dialog, "psvstudio-director-ollama-url") || "http://localhost:11434",
+    ollama_model: directorControlValue(dialog, "psvstudio-director-ollama-model") || "",
+    thinking_mode: directorControlValue(dialog, "psvstudio-director-thinking") || "Disabled",
+    max_response_tokens: Math.max(0, Math.min(131072, Number(directorControlValue(dialog, "psvstudio-director-max-tokens") || 0))),
+    context_budget_chars: Number(directorControlValue(dialog, "psvstudio-director-context-budget") || 8000),
+    temperature: 0.7,
+    top_p: 0.9,
+    top_k: 100,
+    min_p: 0,
+    rep_pen: 1.05,
+    rep_pen_range: 360,
+    sampler_seed: -1,
+    request_timeout: Math.max(5, Math.min(3600, Number(directorControlValue(dialog, "psvstudio-director-timeout") || 600))),
+  };
+  try {
+    localStorage.setItem(DIRECTOR_SETTINGS_KEY, JSON.stringify(settings));
+  } catch (_) {
+    // The active request can still use these settings when storage is unavailable.
+  }
+  return settings;
+}
+
+function directorSessions() {
+  if (!state.directorSessions) state.directorSessions = storedObject(DIRECTOR_SESSIONS_KEY);
+  return state.directorSessions;
+}
+
+function directorSession(projectId = state.activeProjectId, scope = state.directorScope) {
+  const sessions = directorSessions();
+  const projectKey = String(projectId || "");
+  const normalizedScope = scope === "project" ? "project" : "shot";
+  const id = normalizedScope === "project" ? `${projectKey}:project` : projectKey;
+  if (!sessions[id] || !Array.isArray(sessions[id].messages)) {
+    sessions[id] = { scope: normalizedScope, messages: [], draft_attachments: [], updated_at: Date.now() };
+  }
+  sessions[id].scope = normalizedScope;
+  if (!Array.isArray(sessions[id].draft_attachments)) sessions[id].draft_attachments = [];
+  return sessions[id];
+}
+
+function persistDirectorSessions() {
+  const sessions = directorSessions();
+  for (const session of Object.values(sessions)) {
+    if (!Array.isArray(session?.messages)) continue;
+    session.messages = session.messages.slice(-30).map(message => {
+      if (message?.role === "assistant") ensureDirectorVariants(message);
+      return {
+        ...message,
+        text: String(message?.text || "").slice(0, 4000),
+        variants: Array.isArray(message?.variants) ? message.variants.map(variant => ({
+          ...variant,
+          text: String(variant?.text || "").slice(0, 4000),
+        })) : undefined,
+      };
+    });
+  }
+  const retained = Object.fromEntries(
+    Object.entries(sessions)
+      .sort((a, b) => Number(b[1]?.updated_at || 0) - Number(a[1]?.updated_at || 0))
+      .slice(0, 20)
+      .map(([id, session]) => [id, {
+        scope: session?.scope === "project" ? "project" : "shot",
+        updated_at: Number(session?.updated_at || Date.now()),
+        last_context_usage: session?.last_context_usage || null,
+        messages: Array.isArray(session?.messages) ? session.messages : [],
+      }]),
+  );
+  try {
+    localStorage.setItem(DIRECTOR_SESSIONS_KEY, JSON.stringify(retained));
+  } catch (_) {
+    // Chat remains available for the current page when storage is unavailable.
+  }
+}
+
+function boundedDirectorMessages(messages, maximumChars = 6500) {
+  const normalized = (messages || [])
+    .filter(message => ["user", "assistant"].includes(message?.role) && String(message?.text || "").trim())
+    .map(message => ({ role: message.role, content: String(message.text).trim() }));
+  const retained = [];
+  let used = 0;
+  for (const message of normalized.slice().reverse()) {
+    const cost = message.content.length + 32;
+    if (retained.length && used + cost > maximumChars) break;
+    retained.push(message);
+    used += cost;
+    if (retained.length >= 10) break;
+  }
+  return retained.reverse();
+}
+
+function directorShotLabel(project = activeProject(), shot = selectedShot(project)) {
+  const index = project?.document?.shots?.indexOf(shot) ?? -1;
+  return index >= 0 ? `Shot ${index + 1}` : "Selected shot";
+}
+
+function directorProposalFields(proposal) {
+  const rows = [];
+  for (const operation of proposal?.operations || []) {
+    if (operation.op === "add_shot") {
+      const shot = operation.shot || {};
+      rows.push({ name: `Add shot at ${Number(shot.start || 0).toFixed(3)}s`, value: shot.action || JSON.stringify(shot) });
+      continue;
+    }
+    if (operation.op === "remove_shot") {
+      rows.push({ name: "Remove shot", value: operation.shot_id || "" });
+      continue;
+    }
+    for (const [name, value] of Object.entries(operation.fields || {})) {
+      const display = typeof value === "string" ? value : JSON.stringify(value);
+      const prefix = operation.op === "update_project" ? "Project" : (operation.shot_id || "Shot");
+      rows.push({ name: `${prefix} · ${name}`, value: display });
+    }
+  }
+  return rows;
+}
+
+function ensureDirectorVariants(message) {
+  if (message?.role !== "assistant") return [];
+  if (!Array.isArray(message.variants)) message.variants = [];
+  message.variants = message.variants
+    .filter(variant => variant && typeof variant === "object")
+    .map((variant, index) => ({
+      id: String(variant.id || `${message.id}-response-${index}`),
+      text: String(variant.text || ""),
+      proposal: variant.proposal || null,
+      proposal_error: String(variant.proposal_error || ""),
+      proposal_state: String(variant.proposal_state || ""),
+      context_usage: variant.context_usage || null,
+      created_at: Number(variant.created_at || message.created_at || Date.now()),
+    }));
+  if (!message.variants.length) {
+    message.variants.push({
+      id: `${message.id}-response-0`,
+      text: String(message.text || ""),
+      proposal: message.proposal || null,
+      proposal_error: String(message.proposal_error || ""),
+      proposal_state: String(message.proposal_state || ""),
+      context_usage: message.context_usage || null,
+      created_at: Number(message.created_at || Date.now()),
+    });
+  }
+  const requestedIndex = Number(message.variant_index);
+  const index = Number.isFinite(requestedIndex)
+    ? Math.max(0, Math.min(Math.trunc(requestedIndex), message.variants.length - 1))
+    : message.variants.length - 1;
+  syncDirectorVariant(message, index);
+  return message.variants;
+}
+
+function syncDirectorVariant(message, index) {
+  const variant = message?.variants?.[index];
+  if (!variant) return null;
+  message.variant_index = index;
+  message.text = variant.text;
+  message.proposal = variant.proposal || null;
+  message.proposal_error = variant.proposal_error || "";
+  message.proposal_state = variant.proposal_state || "";
+  message.context_usage = variant.context_usage || null;
+  return variant;
+}
+
+function selectedDirectorVariant(message) {
+  const variants = ensureDirectorVariants(message);
+  return variants[message.variant_index] || null;
+}
+
+function directorAttachmentMetadata(attachments) {
+  return (attachments || []).map(attachment => ({
+    id: attachment.id,
+    path: attachment.path,
+    name: attachment.name,
+    usage: attachment.usage,
+    reference_id: attachment.reference_id || "",
+    source_width: Number(attachment.source_width || 0),
+    source_height: Number(attachment.source_height || 0),
+  }));
+}
+
+function renderDirectorAttachments() {
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  const container = dialog?.querySelector("#psvstudio-director-attachments");
+  if (!dialog || !project || !container) return;
+  const session = directorSession(project.id);
+  container.replaceChildren();
+  container.classList.toggle("is-empty", !session.draft_attachments.length);
+  if (!session.draft_attachments.length) {
+    container.append(el("small", "", "Drop images here, paste them into the project first, or use Add image. Choose whether each image is visual context only or a MiniMax reference."));
+    return;
+  }
+  for (const attachment of session.draft_attachments) {
+    const card = el("div", "psvstudio-director-attachment");
+    const image = dialog.ownerDocument.createElement("img");
+    image.src = mediaInputUrl({ path: attachment.path });
+    image.alt = "";
+    const details = el("div", "psvstudio-director-attachment-details");
+    const displayLabel = directorAttachmentDisplayLabel(project, attachment, session.draft_attachments);
+    details.append(
+      el("strong", "", displayLabel),
+      el("small", "", attachment.name || attachment.path || "Image"),
+    );
+    const usage = selectInput(DIRECTOR_IMAGE_USAGES, attachment.usage, value => {
+      attachment.usage = value;
+      attachment.reference_id = "";
+      renderDirectorAttachments();
+    });
+    usage.setAttribute("aria-label", `Use of ${displayLabel}`);
+    details.append(usage);
+    const remove = button("×", () => {
+      session.draft_attachments = session.draft_attachments.filter(item => item.id !== attachment.id);
+      renderDirectorAttachments();
+    }, "psvstudio-media-remove");
+    remove.ariaLabel = `Remove ${attachment.name} from Director turn`;
+    card.append(image, details, remove);
+    container.append(card);
+  }
+}
+
+function directorImageFile(file) {
+  if (file?.type?.startsWith("image/")) return true;
+  return ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].includes(file?.name?.split(".").pop()?.toLowerCase());
+}
+
+async function addDirectorImages(fileList) {
+  const project = activeProject();
+  const dialog = state.directorDialog;
+  if (!project || !dialog) return;
+  const session = directorSession(project.id);
+  const files = Array.from(fileList || []).filter(directorImageFile);
+  const remaining = Math.max(0, DIRECTOR_MAX_IMAGES - session.draft_attachments.length);
+  if (!files.length) {
+    dialog.querySelector("#psvstudio-director-status").textContent = "Director accepts image files only.";
+    return;
+  }
+  if (!remaining) {
+    dialog.querySelector("#psvstudio-director-status").textContent = `Attach at most ${DIRECTOR_MAX_IMAGES} images per turn.`;
+    return;
+  }
+  const errors = [];
+  for (const file of files.slice(0, remaining)) {
+    try {
+      dialog.querySelector("#psvstudio-director-status").textContent = `Uploading ${file.name} to ComfyUI input storage…`;
+      const dimensions = await fileMediaDimensions(file, "image");
+      const path = await uploadMediaFile(file);
+      session.draft_attachments.push({
+        id: makeId("director-image"), path, name: file.name, usage: "describe", reference_id: "",
+        source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
+      });
+    } catch (error) {
+      errors.push(`${file.name}: ${error.message || error}`);
+    }
+  }
+  if (files.length > remaining) errors.push(`Only the first ${remaining} image${remaining === 1 ? "" : "s"} fit this turn.`);
+  dialog.querySelector("#psvstudio-director-status").textContent = errors.length ? errors.join(" ") : "Images are ready for this Director turn.";
+  renderDirectorAttachments();
+}
+
+function commitDirectorImageReferences(project, attachments) {
+  let changed = false;
+  for (const attachment of attachments || []) {
+    if (attachment.usage === "describe") continue;
+    let reference = project.document.references.find(item =>
+      item.id === attachment.reference_id || (item.kind === "image" && item.path === attachment.path));
+    if (!reference) {
+      reference = {
+        id: makeId("reference"), kind: "image", path: attachment.path, name: attachment.name,
+        roles: [attachment.usage], prompt: "", label: "", trim_start: 0, trim_end: null,
+        use_embedded_audio: false, source_width: attachment.source_width || 0,
+        source_height: attachment.source_height || 0,
+      };
+      project.document.references.push(reference);
+      changed = true;
+    }
+    if (["first_frame", "last_frame"].includes(attachment.usage)) {
+      for (const item of project.document.references) {
+        if (item.id === reference.id || !(item.roles || []).includes(attachment.usage)) continue;
+        item.roles = item.roles.filter(role => role !== attachment.usage);
+        if (!item.roles.length) item.roles = [item.kind === "audio" ? "audio_reference" : "subject"];
+        changed = true;
+      }
+    }
+    if (reference.roles?.length !== 1 || reference.roles[0] !== attachment.usage) {
+      reference.roles = [attachment.usage];
+      changed = true;
+    }
+    if (!reference.source_width && attachment.source_width) {
+      reference.source_width = attachment.source_width;
+      changed = true;
+    }
+    if (!reference.source_height && attachment.source_height) {
+      reference.source_height = attachment.source_height;
+      changed = true;
+    }
+    attachment.reference_id = reference.id;
+  }
+  if (!changed) return false;
+  project.document.references.forEach(item => { item.label = ""; });
+  invalidateReferenceSemantics(project);
+  synchronizeGeometryCanvas(project);
+  markProjectChanged({ render: true });
+  return true;
+}
+
+function invalidateReferenceSemantics(project) {
+  project.document.task_types = [];
+  project.document.subject_definitions = [];
+  project.document.summary = "";
+  project.document.retention_analysis = [];
+}
+
+function renderDirectorDialog() {
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  const shot = selectedShot(project);
+  const projectScope = state.directorScope === "project";
+  if (!dialog || !project || (!projectScope && !shot)) return;
+  dialog.querySelector("#psvstudio-director-title").textContent = projectScope
+    ? "Grand Director · Entire video"
+    : `Shot Director · ${directorShotLabel(project, shot)}`;
+  dialog.querySelector("#psvstudio-director-subtitle").textContent = projectScope
+    ? "Full-production consultation and multi-shot composition"
+    : "Context-efficient selected-shot consultation";
+  const input = dialog.querySelector("#psvstudio-director-input");
+  input.placeholder = projectScope
+    ? "Ask about the whole video or request a multi-shot composition…"
+    : "Ask about this shot or request a concrete revision…";
+  const history = dialog.querySelector("#psvstudio-director-history");
+  history.replaceChildren();
+  const session = directorSession(project.id);
+  if (!session.messages.length) {
+    history.append(el("div", "psvstudio-director-empty", projectScope
+      ? "Ask for a full-video critique, alternatives, or a multi-shot composition. Only approved proposals can change the project."
+      : "Ask for advice, alternatives, or a concrete revision. Only approved proposals can change the selected shot."));
+  }
+  for (const [messageIndex, message] of session.messages.entries()) {
+    if (message.role === "assistant") ensureDirectorVariants(message);
+    const card = el("article", `psvstudio-director-message is-${message.role}`);
+    card.append(el("small", "", message.role === "user" ? "You" : "Director"), el("div", "psvstudio-director-message-text", message.text));
+    if (message.attachments?.length) {
+      const attached = el("div", "psvstudio-director-message-attachments");
+      for (const attachment of message.attachments) {
+        const usage = DIRECTOR_IMAGE_USAGES.find(item => item.value === attachment.usage)?.label || attachment.usage;
+        const displayLabel = directorAttachmentDisplayLabel(project, attachment, message.attachments);
+        const chip = el("span", "", `${displayLabel} · ${usage}`);
+        chip.title = attachment.name || attachment.path || "Image";
+        attached.append(chip);
+      }
+      card.append(attached);
+    }
+    if (message.proposal) {
+      const proposal = el("section", "psvstudio-director-proposal");
+      proposal.append(el("strong", "", message.proposal.summary || "Proposed shot update"));
+      for (const row of directorProposalFields(message.proposal)) {
+        const item = el("div", "psvstudio-director-change");
+        item.append(el("span", "", row.name), el("p", "", row.value || "(clear field)"));
+        proposal.append(item);
+      }
+      const actions = el("div", "psvstudio-inline");
+      if (message.proposal_state === "applied") {
+        actions.append(el("small", "psvstudio-director-applied", "Applied"));
+      } else if (message.proposal_state === "discarded") {
+        actions.append(el("small", "psvstudio-help", "Discarded"));
+      } else {
+        const apply = button("Apply proposal", () => applyDirectorProposal(message.id), "psvstudio-button psvstudio-button-primary");
+        const discard = button("Discard", () => discardDirectorProposal(message.id));
+        apply.disabled = state.directorBusy;
+        discard.disabled = state.directorBusy;
+        actions.append(apply, discard);
+      }
+      proposal.append(actions);
+      card.append(proposal);
+    }
+    if (message.proposal_error) card.append(el("small", "psvstudio-director-error", `Proposal omitted: ${message.proposal_error}`));
+    const canNavigateResponses = message.role === "assistant"
+      && messageIndex === session.messages.length - 1
+      && session.messages[messageIndex - 1]?.role === "user";
+    if (canNavigateResponses) {
+      const variants = message.variants || [];
+      const selectedIndex = Math.max(0, Math.min(Number(message.variant_index) || 0, variants.length - 1));
+      const controls = el("div", "psvstudio-director-response-controls");
+      if (selectedIndex > 0) {
+        const previous = button("", () => selectDirectorResponse(message.id, selectedIndex - 1), "psvstudio-director-response-arrow");
+        previous.setAttribute("aria-label", "Show previous answer");
+        previous.title = "Show previous answer";
+        previous.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 18-6-6 6-6"/></svg>';
+        previous.disabled = state.directorBusy;
+        controls.append(previous);
+      } else {
+        controls.append(el("span"));
+      }
+      const position = el("span", "psvstudio-director-response-position", variants.length > 1 ? `${selectedIndex + 1} / ${variants.length}` : "");
+      controls.append(position);
+      const hasNewer = selectedIndex < variants.length - 1;
+      const next = button("", () => {
+        if (hasNewer) selectDirectorResponse(message.id, selectedIndex + 1);
+        else regenerateDirectorResponse(message.id);
+      }, "psvstudio-director-response-arrow");
+      next.setAttribute("aria-label", hasNewer ? "Show next answer" : "Regenerate answer");
+      next.title = hasNewer ? "Show next answer" : "Regenerate answer";
+      next.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg>';
+      next.disabled = state.directorBusy;
+      controls.append(next);
+      card.append(controls);
+    }
+    history.append(card);
+  }
+  const usage = session.last_context_usage;
+  const status = dialog.querySelector("#psvstudio-director-status");
+  if (!state.directorBusy && usage) {
+    const omitted = Number(usage.omitted_messages || 0);
+      status.textContent = `Sent ${usage.history_messages} recent messages · ${usage.context_chars + usage.history_chars} context characters${omitted ? ` · omitted ${omitted} older messages` : ""}`;
+  } else if (!state.directorBusy) {
+    status.textContent = projectScope
+      ? "The full video is in context; project changes require approval."
+      : "Only the selected shot is in write scope.";
+  }
+  const send = dialog.querySelector("#psvstudio-director-send");
+  if (send) send.disabled = state.directorBusy;
+  renderDirectorAttachments();
+  history.scrollTop = history.scrollHeight;
+}
+
+function ensureDirectorDialog() {
+  const owner = state.panel?.ownerDocument || document;
+  if (state.directorDialog?.ownerDocument === owner) return state.directorDialog;
+  state.directorDialog?.remove();
+  const settings = directorSettings();
+  const dialog = owner.createElement("dialog");
+  dialog.className = "psvstudio-director-dialog";
+  dialog.innerHTML = `
+    <header><div><h2 id="psvstudio-director-title">Director</h2><small id="psvstudio-director-subtitle">Context-efficient selected-shot consultation</small></div><button id="psvstudio-director-close" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close Director">×</button></header>
+    <div id="psvstudio-director-history" class="psvstudio-director-history"></div>
+    <div class="psvstudio-director-composer">
+      <div id="psvstudio-director-attachments" class="psvstudio-director-attachments is-empty"></div>
+      <textarea id="psvstudio-director-input" rows="3" placeholder="Ask about this shot or request a concrete revision…"></textarea>
+      <div class="psvstudio-director-composer-actions"><small id="psvstudio-director-status">Only the selected shot is in write scope.</small><div class="psvstudio-inline"><button id="psvstudio-director-add-image" class="psvstudio-button" type="button">Add image</button><button id="psvstudio-director-send" class="psvstudio-button psvstudio-button-primary" type="button">Ask Director</button></div></div>
+      <input id="psvstudio-director-image-input" class="psvstudio-sr-only" type="file" accept="image/*" multiple />
+    </div>
+    <details class="psvstudio-director-settings"><summary>Local LLM and context settings</summary><div class="psvstudio-director-settings-grid">
+      <label><span>Provider</span><select id="psvstudio-director-provider"><option value="koboldcpp">KoboldCpp</option><option value="ollama">Ollama</option></select></label>
+      <label><span>Thinking</span><select id="psvstudio-director-thinking">${["Disabled", "Minimal", "Low", "Medium", "High"].map(value => `<option value="${value}">${value}</option>`).join("")}</select></label>
+      <label><span>KoboldCpp URL</span><input id="psvstudio-director-kobold-url" /></label>
+      <label><span>Ollama URL</span><input id="psvstudio-director-ollama-url" /></label>
+      <label><span>Ollama model</span><input id="psvstudio-director-ollama-model" placeholder="model:tag" /></label>
+      <label><span>Response tokens · 0 = full available context</span><input id="psvstudio-director-max-tokens" type="number" min="0" max="131072" step="128" /></label>
+      <label><span>Context characters</span><input id="psvstudio-director-context-budget" type="number" min="4000" max="32000" step="1000" /></label>
+      <label><span>Request timeout seconds</span><input id="psvstudio-director-timeout" type="number" min="5" max="3600" step="30" /></label>
+    </div><small>Approved document state plus at most ten recent messages are sent. Older conversation stays stored locally.</small></details>`;
+  dialog.querySelector("#psvstudio-director-provider").value = settings.llm_provider;
+  dialog.querySelector("#psvstudio-director-thinking").value = settings.thinking_mode;
+  dialog.querySelector("#psvstudio-director-kobold-url").value = settings.kobold_url;
+  dialog.querySelector("#psvstudio-director-ollama-url").value = settings.ollama_url;
+  dialog.querySelector("#psvstudio-director-ollama-model").value = settings.ollama_model;
+  dialog.querySelector("#psvstudio-director-max-tokens").value = String(settings.max_response_tokens);
+  dialog.querySelector("#psvstudio-director-context-budget").value = String(settings.context_budget_chars);
+  dialog.querySelector("#psvstudio-director-timeout").value = String(settings.request_timeout);
+  dialog.querySelector("#psvstudio-director-close").addEventListener("click", () => dialog.close());
+  dialog.querySelector("#psvstudio-director-send").addEventListener("click", sendDirectorMessage);
+  dialog.querySelector("#psvstudio-director-add-image").addEventListener("click", () => dialog.querySelector("#psvstudio-director-image-input").click());
+  dialog.querySelector("#psvstudio-director-image-input").addEventListener("change", event => {
+    addDirectorImages(event.target.files);
+    event.target.value = "";
+  });
+  dialog.addEventListener("dragover", event => {
+    if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    clearMediaDrag(owner);
+    dialog.classList.add("is-image-dragover");
+  });
+  dialog.addEventListener("dragleave", event => {
+    if (!event.relatedTarget || !dialog.contains(event.relatedTarget)) dialog.classList.remove("is-image-dragover");
+  });
+  dialog.addEventListener("drop", event => {
+    if (!Array.from(event.dataTransfer?.types || []).includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dialog.classList.remove("is-image-dragover");
+    addDirectorImages(event.dataTransfer.files);
+  });
+  dialog.addEventListener("close", () => dialog.classList.remove("is-image-dragover"));
+  dialog.querySelector("#psvstudio-director-input").addEventListener("keydown", event => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      sendDirectorMessage();
+    }
+  });
+  owner.body.append(dialog);
+  state.directorDialog = dialog;
+  return dialog;
+}
+
+function openDirector(scope = "shot", prefill = "") {
+  const project = activeProject();
+  const shot = selectedShot(project);
+  if (!project || (scope !== "project" && !shot)) return;
+  const previousScope = state.directorScope;
+  state.directorScope = scope === "project" ? "project" : "shot";
+  const dialog = ensureDirectorDialog();
+  const input = dialog.querySelector("#psvstudio-director-input");
+  if (prefill || previousScope !== state.directorScope) input.value = prefill;
+  renderDirectorDialog();
+  if (!dialog.open) dialog.showModal();
+  input.focus();
+}
+
+async function requestDirectorResponse(project, shot, scope, attachments, messages) {
+  const normalizedScope = scope === "project" ? "project" : "shot";
+  const projectScope = normalizedScope === "project";
+  const settings = saveDirectorSettings(state.directorDialog);
+  const response = await api.fetchApi(DIRECTOR_CHAT_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...settings,
+      async: true,
+      project_name: project.name,
+      brief: project.brief,
+      document: project.document,
+      scope: normalizedScope,
+      selected_shot_id: projectScope ? "" : (shot?.id || ""),
+      attachments,
+      messages: boundedDirectorMessages(messages),
+    }),
+  });
+  let data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Director request failed (${response.status}).`);
+  if (response.status === 202 && data.job_id) data = await pollDirectorJob(data.job_id);
+  if (data.scope && data.scope !== normalizedScope) {
+    throw new Error(`Director scope mismatch: requested ${normalizedScope}, received ${data.scope}. Refresh Video Studio and try again.`);
+  }
+  return data;
+}
+
+function directorJobStatusText(job) {
+  if (job.status === "queued") return "Director request is queued…";
+  const provider = job.provider_status || {};
+  if (provider.provider !== "koboldcpp") return "The local Director is still working…";
+  if (provider.reachable === false) return "Director is running; KoboldCpp status is temporarily unavailable…";
+  if (provider.busy) {
+    const characters = Number(provider.generated_characters);
+    return Number.isFinite(characters) && characters > 0
+      ? `KoboldCpp is still generating · ${characters.toLocaleString()} characters received…`
+      : "KoboldCpp is still processing the prompt…";
+  }
+  return "Director is validating KoboldCpp's response…";
+}
+
+async function pollDirectorJob(jobId) {
+  while (true) {
+    await new Promise(resolve => setTimeout(resolve, DIRECTOR_JOB_POLL_MS));
+    const response = await api.fetchApi(`${DIRECTOR_CHAT_ENDPOINT}/${encodeURIComponent(jobId)}`);
+    const job = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(job.error || `Director status check failed (${response.status}).`);
+    if (job.status === "complete") return job.result || {};
+    if (job.status === "failed") throw new Error(job.error || "Director request failed.");
+    const status = state.directorDialog?.querySelector("#psvstudio-director-status");
+    if (status) status.textContent = directorJobStatusText(job);
+  }
+}
+
+async function sendDirectorMessage() {
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  const shot = selectedShot(project);
+  const input = dialog?.querySelector("#psvstudio-director-input");
+  let text = String(input?.value || "").trim();
+  const directorScope = state.directorScope === "project" ? "project" : "shot";
+  const projectScope = directorScope === "project";
+  if (!dialog || !project || (!projectScope && !shot) || state.directorBusy) return;
+  const session = directorSession(project.id, directorScope);
+  const attachments = directorAttachmentMetadata(session.draft_attachments);
+  if (!text && !attachments.length) return;
+  if (!text) text = projectScope
+    ? "Inspect the attached image in the context of the entire video. Suggest concrete production improvements and propose multi-shot changes when useful."
+    : "Inspect the attached image and suggest concrete improvements for the selected shot. Propose descriptive shot changes when useful.";
+  commitDirectorImageReferences(project, attachments);
+  session.messages.push({
+    id: makeId("director-message"), role: "user", text,
+    attachments,
+    created_at: Date.now(),
+  });
+  session.updated_at = Date.now();
+  input.value = "";
+  persistDirectorSessions();
+  state.directorBusy = true;
+  dialog.querySelector("#psvstudio-director-status").textContent = "Consulting the local Director…";
+  renderDirectorDialog();
+  const projectId = project.id;
+  try {
+    const data = await requestDirectorResponse(project, shot, directorScope, attachments, session.messages);
+    const assistant = {
+      id: makeId("director-message"), role: "assistant", text: String(data.message || "").trim() || "No response.",
+      proposal: data.proposal || null, proposal_error: String(data.proposal_error || ""),
+      context_usage: data.context_usage || null, created_at: Date.now(),
+    };
+    ensureDirectorVariants(assistant);
+    session.messages.push(assistant);
+    session.last_context_usage = data.context_usage || null;
+    session.draft_attachments = [];
+    session.updated_at = Date.now();
+    persistDirectorSessions();
+  } catch (error) {
+    const assistant = { id: makeId("director-message"), role: "assistant", text: `Director request failed: ${error.message || String(error)}`, proposal_error: "", created_at: Date.now() };
+    ensureDirectorVariants(assistant);
+    session.messages.push(assistant);
+    session.updated_at = Date.now();
+    persistDirectorSessions();
+  } finally {
+    state.directorBusy = false;
+    if (activeProject()?.id === projectId) renderDirectorDialog();
+  }
+}
+
+function selectDirectorResponse(messageId, variantIndex) {
+  if (state.directorBusy) return;
+  const session = directorSession();
+  const message = session.messages.find(item => item.id === messageId);
+  const variants = ensureDirectorVariants(message);
+  if (!variants[variantIndex]) return;
+  const variant = syncDirectorVariant(message, variantIndex);
+  session.last_context_usage = variant.context_usage || null;
+  session.updated_at = Date.now();
+  persistDirectorSessions();
+  renderDirectorDialog();
+  const status = state.directorDialog?.querySelector("#psvstudio-director-status");
+  if (status) status.textContent = `Showing answer ${variantIndex + 1} of ${variants.length}.`;
+}
+
+async function regenerateDirectorResponse(messageId) {
+  if (state.directorBusy) return;
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  const shot = selectedShot(project);
+  const directorScope = state.directorScope === "project" ? "project" : "shot";
+  const projectScope = directorScope === "project";
+  const session = directorSession(project?.id, directorScope);
+  const messageIndex = session?.messages?.findIndex(message => message.id === messageId) ?? -1;
+  const message = session?.messages?.[messageIndex];
+  const userMessage = session?.messages?.[messageIndex - 1];
+  if (
+    !dialog || !project || (!projectScope && !shot)
+    || messageIndex !== session.messages.length - 1
+    || message?.role !== "assistant" || userMessage?.role !== "user"
+  ) return;
+
+  const attachments = directorAttachmentMetadata(userMessage.attachments).filter(attachment => attachment.path);
+  state.directorBusy = true;
+  dialog.querySelector("#psvstudio-director-status").textContent = "Regenerating the Director answer...";
+  renderDirectorDialog();
+  const projectId = project.id;
+  let failure = "";
+  try {
+    const data = await requestDirectorResponse(
+      project,
+      shot,
+      directorScope,
+      attachments,
+      session.messages.slice(0, messageIndex),
+    );
+    const variants = ensureDirectorVariants(message);
+    variants.push({
+      id: makeId("director-response"),
+      text: String(data.message || "").trim() || "No response.",
+      proposal: data.proposal || null,
+      proposal_error: String(data.proposal_error || ""),
+      proposal_state: "",
+      context_usage: data.context_usage || null,
+      created_at: Date.now(),
+    });
+    syncDirectorVariant(message, variants.length - 1);
+    message.created_at ||= Date.now();
+    session.last_context_usage = data.context_usage || null;
+    const regeneratedPaths = new Set(attachments.map(attachment => attachment.path));
+    session.draft_attachments = session.draft_attachments.filter(attachment => !regeneratedPaths.has(attachment.path));
+    session.updated_at = Date.now();
+    persistDirectorSessions();
+  } catch (error) {
+    failure = error.message || String(error);
+  } finally {
+    state.directorBusy = false;
+    if (activeProject()?.id === projectId) {
+      renderDirectorDialog();
+      if (failure) dialog.querySelector("#psvstudio-director-status").textContent = failure;
+    }
+  }
+}
+
+async function applyDirectorProposal(messageId) {
+  const project = activeProject();
+  const session = directorSession(project?.id);
+  const message = session.messages.find(item => item.id === messageId);
+  if (!project || !message?.proposal || state.directorBusy) return;
+  state.directorBusy = true;
+  renderDirectorDialog();
+  try {
+    const response = await api.fetchApi(DIRECTOR_PREVIEW_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document: project.document, proposal: message.proposal }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The Director proposal could not be applied.");
+    const selectedId = state.selectedShotId;
+    project.document = data.document;
+    project.brief = project.document.main_description || "";
+    state.selectedShotId = project.document.shots.some(item => item.id === selectedId) ? selectedId : project.document.shots[0]?.id;
+    const variant = selectedDirectorVariant(message);
+    message.proposal_state = "applied";
+    if (variant) variant.proposal_state = "applied";
+    session.updated_at = Date.now();
+    persistDirectorSessions();
+    markProjectChanged({ render: true });
+    setStatus(`${message.proposal.summary} Applied after document validation.`, "ready");
+  } catch (error) {
+    const variant = selectedDirectorVariant(message);
+    message.proposal_error = error.message || String(error);
+    if (variant) variant.proposal_error = message.proposal_error;
+    session.updated_at = Date.now();
+    persistDirectorSessions();
+    setStatus(message.proposal_error, "error");
+  } finally {
+    state.directorBusy = false;
+    renderDirectorDialog();
+  }
+}
+
+function discardDirectorProposal(messageId) {
+  const session = directorSession();
+  const message = session.messages.find(item => item.id === messageId);
+  if (!message) return;
+  const variant = selectedDirectorVariant(message);
+  message.proposal_state = "discarded";
+  if (variant) variant.proposal_state = "discarded";
+  session.updated_at = Date.now();
+  persistDirectorSessions();
+  renderDirectorDialog();
+}
+
+function mediaKind(file) {
+  if (file.type?.startsWith("image/")) return "image";
+  if (file.type?.startsWith("video/")) return "video";
+  if (file.type?.startsWith("audio/")) return "audio";
+  const extension = file.name?.split(".").pop()?.toLowerCase();
+  if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].includes(extension)) return "image";
+  if (["mp4", "webm", "mov", "mkv", "avi", "m4v"].includes(extension)) return "video";
+  if (["wav", "mp3", "flac", "ogg", "m4a", "aac"].includes(extension)) return "audio";
+  return "";
+}
+
+function roundHalfEven(value) {
+  const lower = Math.floor(value);
+  const fraction = value - lower;
+  if (Math.abs(fraction - 0.5) < 1e-10) return lower % 2 ? lower + 1 : lower;
+  return Math.round(value);
+}
+
+function minimaxCanvasDimensions(sourceWidth, sourceHeight, targetMegapixels = null) {
+  const width = Number(sourceWidth);
+  const height = Number(sourceHeight);
+  if (!(width > 0) || !(height > 0)) return null;
+  const rules = state.config?.canvas || {};
+  const multiple = Number(rules.multiple) || 32;
+  const minimumMegapixels = Number(rules.minimum_megapixels) || 0.1;
+  const maximumMegapixels = Number(rules.maximum_megapixels) || 4;
+  const defaultMegapixels = Number(rules.default_megapixels) || (768 * 1344) / 1_000_000;
+  const megapixels = Math.min(maximumMegapixels, Math.max(
+    minimumMegapixels,
+    Number(targetMegapixels) || defaultMegapixels,
+  ));
+  const scale = Math.sqrt((megapixels * 1_000_000) / (width * height));
+  const targetWidth = width * scale;
+  const targetHeight = height * scale;
+  return {
+    width: Math.max(multiple, roundHalfEven(targetWidth / multiple) * multiple),
+    height: Math.max(multiple, roundHalfEven(targetHeight / multiple) * multiple),
+  };
+}
+
+function visualMediaDimensions(url, kind) {
+  if (!url || !["image", "video"].includes(kind)) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const media = kind === "image" ? new Image() : document.createElement("video");
+    let settled = false;
+    const finish = dimensions => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      media.onload = null;
+      media.onerror = null;
+      media.onloadedmetadata = null;
+      resolve(dimensions);
+    };
+    const timer = setTimeout(() => finish(null), 5000);
+    media.onerror = () => finish(null);
+    if (kind === "image") {
+      media.onload = () => finish({ width: media.naturalWidth, height: media.naturalHeight });
+    } else {
+      media.preload = "metadata";
+      media.muted = true;
+      media.onloadedmetadata = () => finish({ width: media.videoWidth, height: media.videoHeight });
+    }
+    media.src = url;
+  });
+}
+
+async function fileMediaDimensions(file, kind) {
+  if (!["image", "video"].includes(kind)) return null;
+  const url = URL.createObjectURL(file);
+  try {
+    return await visualMediaDimensions(url, kind);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function preferredCanvasReference(project) {
+  const references = project?.document?.references || [];
+  for (const role of ["first_frame", "video_edit", "video_continue", "last_frame"]) {
+    const reference = references.find(item =>
+      (item.roles || []).includes(role) && minimaxCanvasDimensions(
+        item.source_width, item.source_height, project.document.target_megapixels));
+    if (reference) return reference;
+  }
+  return null;
+}
+
+function useReferenceCanvas(project, reference) {
+  const canvas = minimaxCanvasDimensions(
+    reference?.source_width,
+    reference?.source_height,
+    project?.document?.target_megapixels,
+  );
+  if (!project || !reference || !canvas) return false;
+  project.document.width = canvas.width;
+  project.document.height = canvas.height;
+  project.document.canvas_reference_id = reference.id;
+  return true;
+}
+
+function synchronizeGeometryCanvas(project) {
+  const reference = preferredCanvasReference(project);
+  if (reference) return useReferenceCanvas(project, reference);
+  project.document.canvas_reference_id = "";
+  return false;
+}
+
+async function ensureReferenceDimensions(project, reference) {
+  if (!["image", "video"].includes(reference?.kind) ||
+      minimaxCanvasDimensions(reference.source_width, reference.source_height) ||
+      state.mediaDimensionLoads.has(reference.id)) return;
+  state.mediaDimensionLoads.add(reference.id);
+  const dimensions = await visualMediaDimensions(mediaInputUrl(reference), reference.kind);
+  if (!dimensions?.width || !dimensions?.height) return;
+  reference.source_width = dimensions.width;
+  reference.source_height = dimensions.height;
+  if (project.document.canvas_reference_id === reference.id) useReferenceCanvas(project, reference);
+  markProjectChanged({ render: true });
+}
+
+function isFileDrag(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+async function uploadMediaFile(file) {
+  const form = new FormData();
+  form.append("image", file, file.name);
+  form.append("type", "input");
+  form.append("overwrite", "false");
+  const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Upload failed (${response.status}).`);
+  return result.subfolder ? `${result.subfolder}/${result.name}` : result.name;
+}
+
+function mediaInputUrl(reference) {
+  const parts = String(reference?.path || "").replaceAll("\\", "/").split("/").filter(Boolean);
+  const filename = parts.pop();
+  if (!filename) return "";
+  const params = new URLSearchParams({ filename, subfolder: parts.join("/"), type: "input" });
+  return `/view?${params}`;
+}
+
+function defaultReferenceRoles(project, kind) {
+  if (kind === "audio") return ["audio_reference"];
+  if (kind === "image" && !(project.document.references || []).some(reference => (reference.roles || []).includes("first_frame"))) {
+    return ["first_frame"];
+  }
+  return ["subject"];
+}
+
+function referenceRoleOptions(kind) {
+  const shared = [
+    { value: "subject", label: "Subject / identity" },
+    { value: "scene", label: "Scene / environment" },
+    { value: "style", label: "Visual style" },
+    { value: "action", label: "Action / motion" },
+    { value: "pose", label: "Pose" },
+    { value: "camera", label: "Camera / composition" },
+    { value: "storyboard", label: "Storyboard" },
+  ];
+  if (kind === "image") return [
+    { value: "first_frame", label: "First frame" },
+    { value: "last_frame", label: "Last frame" },
+    ...shared,
+  ];
+  if (kind === "video") return [
+    ...shared,
+    { value: "video_edit", label: "Video editing source" },
+    { value: "video_continue", label: "Video continuation" },
+  ];
+  return [
+    { value: "audio_reference", label: "Audio reference" },
+    { value: "audio_copy", label: "Copy audio" },
+  ];
+}
+
+function setReferenceRole(project, reference, role) {
+  if (["first_frame", "last_frame"].includes(role)) {
+    for (const item of project.document.references) {
+      if (item.id === reference.id || !(item.roles || []).includes(role)) continue;
+      item.roles = item.roles.filter(value => value !== role);
+      if (!item.roles.length) item.roles = [item.kind === "audio" ? "audio_reference" : "subject"];
+    }
+  }
+  reference.roles = [role];
+  invalidateReferenceSemantics(project);
+  if (CANVAS_MEDIA_ROLES.has(role)) synchronizeGeometryCanvas(project);
+  else if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
+  markProjectChanged({ render: true });
+  const displayLabel = referenceDisplayLabel(project.document.references || [], reference);
+  setStatus(`${displayLabel} now provides: ${referenceRoleOptions(reference.kind).find(item => item.value === role)?.label || role}.`, "ready");
+}
+
+function referenceDisplayLabel(references, reference) {
+  const typeName = reference.kind === "image" ? "Picture" : reference.kind === "video" ? "Video" : "Audio";
+  const ordinal = references.filter(item => item.kind === reference.kind).findIndex(item => item.id === reference.id) + 1;
+  return `${typeName} ${Math.max(1, ordinal)}`;
+}
+
+function directorAttachmentDisplayLabel(project, attachment, attachments = []) {
+  if (attachment.usage === "describe") return "Visual context";
+  const references = project?.document?.references || [];
+  const existing = references.find(item =>
+    item.id === attachment.reference_id || (item.kind === "image" && item.path === attachment.path));
+  if (existing) return referenceDisplayLabel(references, existing);
+  const pendingPaths = [];
+  for (const item of attachments || []) {
+    if (item.usage === "describe") continue;
+    const committed = references.some(reference =>
+      reference.id === item.reference_id || (reference.kind === "image" && reference.path === item.path));
+    if (!committed && !pendingPaths.includes(item.path)) pendingPaths.push(item.path);
+    if (item === attachment) break;
+  }
+  const pendingIndex = Math.max(0, pendingPaths.indexOf(attachment.path));
+  const imageCount = references.filter(item => item.kind === "image").length;
+  return `Picture ${imageCount + pendingIndex + 1}`;
+}
+
+function moveReference(project, referenceId, destinationIndex) {
+  const references = project.document.references || [];
+  const sourceIndex = references.findIndex(item => item.id === referenceId);
+  if (sourceIndex < 0) return;
+  const [reference] = references.splice(sourceIndex, 1);
+  const index = Math.max(0, Math.min(references.length, destinationIndex > sourceIndex ? destinationIndex - 1 : destinationIndex));
+  references.splice(index, 0, reference);
+  references.forEach(item => { item.label = ""; });
+  invalidateReferenceSemantics(project);
+  state.mediaDragId = "";
+  markProjectChanged({ render: true });
+  setStatus("Reference order updated; Picture, Video, and Audio numbering follows the new order.", "ready");
+}
+
+function clearMediaDropMarkers(lane) {
+  lane?.querySelectorAll(".is-drop-before,.is-drop-after").forEach(card => card.classList.remove("is-drop-before", "is-drop-after"));
+}
+
+function mediaDropDestination(lane, clientX) {
+  const cards = [...lane.querySelectorAll(".psvstudio-media-chip:not(.is-dragging)")];
+  clearMediaDropMarkers(lane);
+  for (const card of cards) {
+    const bounds = card.getBoundingClientRect();
+    if (clientX < bounds.left + bounds.width / 2) {
+      card.classList.add("is-drop-before");
+      return Number(card.dataset.referenceIndex);
+    }
+  }
+  cards.at(-1)?.classList.add("is-drop-after");
+  return (activeProject()?.document?.references || []).length;
+}
+
+function mediaLimit(project, kind) {
+  const limits = state.config?.reference_limits || {};
+  const key = kind === "image" ? "images" : kind === "video" ? "videos" : "audio_tracks";
+  const references = project.document.references || [];
+  if (references.length >= Number(limits.active_items || 12)) return "The project already has the maximum number of active references.";
+  if (references.filter(reference => reference.kind === kind).length >= Number(limits[key] || 12)) {
+    return `The project already has the maximum number of ${kind} references.`;
+  }
+  return "";
+}
+
+async function addMediaFiles(fileList) {
+  const files = Array.from(fileList || []);
+  const supported = files.filter(mediaKind);
+  if (!supported.length) {
+    setStatus(files.length ? "Drop image, video, or audio files." : "No media files were dropped.", "warning");
+    return;
+  }
+  if (!activeProject()) newProject();
+  const project = activeProject();
+  if (!project) return;
+  let added = 0;
+  const errors = [];
+  for (const file of supported) {
+    const kind = mediaKind(file);
+    const limitError = mediaLimit(project, kind);
+    if (limitError) {
+      errors.push(`${file.name}: ${limitError}`);
+      continue;
+    }
+    try {
+      setStatus(`Uploading ${file.name}…`, "working");
+      const dimensions = await fileMediaDimensions(file, kind);
+      const path = await uploadMediaFile(file);
+      project.document.references ||= [];
+      const reference = {
+        id: makeId("reference"), kind, path, name: file.name,
+        roles: defaultReferenceRoles(project, kind), prompt: "", label: "",
+        trim_start: 0, trim_end: null, use_embedded_audio: false,
+        source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
+      };
+      project.document.references.push(reference);
+      if ((reference.roles || []).some(role => CANVAS_MEDIA_ROLES.has(role))) {
+        synchronizeGeometryCanvas(project);
+      }
+      invalidateReferenceSemantics(project);
+      added += 1;
+    } catch (error) {
+      errors.push(`${file.name}: ${error.message || error}`);
+    }
+  }
+  if (added) markProjectChanged({ render: true });
+  const summary = `${added} media file${added === 1 ? "" : "s"} added to project references.`;
+  setStatus(errors.length ? `${summary} ${errors.join(" ")}` : summary, errors.length ? "warning" : "ready");
+}
+
+function clearMediaDrag(doc) {
+  state.mediaDropDepth.set(doc, 0);
+  doc.body?.classList.remove("psvstudio-media-drag-active");
+}
+
+function installMediaDrop(doc) {
+  if (!doc || state.mediaDropDocuments.has(doc)) return;
+  state.mediaDropDocuments.add(doc);
+  const activeHere = () => state.panel?.ownerDocument === doc && !state.panel.hidden;
+  const targetsDirector = event => event.composedPath().some(target =>
+    target?.classList?.contains("psvstudio-director-dialog") && target.open
+  );
+  doc.addEventListener("dragenter", event => {
+    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
+    event.preventDefault();
+    state.mediaDropDepth.set(doc, (state.mediaDropDepth.get(doc) || 0) + 1);
+    doc.body?.classList.add("psvstudio-media-drag-active");
+  }, true);
+  doc.addEventListener("dragover", event => {
+    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }, true);
+  doc.addEventListener("dragleave", event => {
+    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
+    const depth = Math.max(0, (state.mediaDropDepth.get(doc) || 0) - 1);
+    state.mediaDropDepth.set(doc, depth);
+    if (!depth || !event.relatedTarget) clearMediaDrag(doc);
+  }, true);
+  doc.addEventListener("drop", event => {
+    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    clearMediaDrag(doc);
+    addMediaFiles(event.dataTransfer.files);
+  }, true);
+}
+
+function activeProject() {
+  return state.projects.find(project => project.id === state.activeProjectId) || null;
+}
+
+function selectedShot(project = activeProject()) {
+  return project?.document?.shots?.find(shot => shot.id === state.selectedShotId) || project?.document?.shots?.[0] || null;
+}
+
+function localResolvedMode(document) {
+  if (document?.mode && document.mode !== "auto") return document.mode;
+  const references = document?.references || [];
+  const roles = new Set(references.flatMap(reference => reference.roles || []));
+  if (references.some(reference => ["video", "audio"].includes(reference.kind))) return "ref2va";
+  if ([...roles].some(role => !["first_frame", "last_frame"].includes(role))) return "ref2va";
+  if (roles.has("first_frame") && roles.has("last_frame")) return "fl2va";
+  if (roles.has("first_frame")) return "i2va";
+  if (roles.has("last_frame")) return "l2va";
+  return "t2va";
+}
+
+function setStatus(message, kind = "") {
+  const status = state.panel?.querySelector("#psvstudio-status");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.kind = kind;
+}
+
+function setSaveState(message) {
+  const status = state.panel?.querySelector("#psvstudio-save-state");
+  if (status) status.textContent = message;
+}
+
+function markProjectChanged({ render = false } = {}) {
+  const project = activeProject();
+  if (project) project.updated_at = Date.now();
+  state.projectMutation += 1;
+  setSaveState("Saving…");
+  if (state.projectSaveTimer) clearTimeout(state.projectSaveTimer);
+  state.projectSaveTimer = setTimeout(() => persistProjects(), 450);
+  if (render) renderAll();
+}
+
+async function persistProjects({ immediate = false } = {}) {
+  if (state.projectSaveTimer) clearTimeout(state.projectSaveTimer);
+  state.projectSaveTimer = null;
+  const mutation = state.projectMutation;
+  if (!immediate && mutation === state.projectSavedMutation) return;
+  const operation = state.projectSaveChain.catch(() => {}).then(async () => {
+    const payload = {
+      version: 2,
+      revision: state.projectRevision,
+      active_project_id: state.activeProjectId,
+      projects: clone(state.projects),
+    };
+    const response = await api.fetchApi(PROJECTS_ENDPOINT, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Projects could not be saved (${response.status}).`);
+    state.projectRevision = Number(data.revision || state.projectRevision);
+    state.projectSavedMutation = Math.max(state.projectSavedMutation, mutation);
+    setSaveState(state.projectSavedMutation === state.projectMutation ? "Saved" : "Saving…");
+    if (state.projectSavedMutation !== state.projectMutation) persistProjects();
+  });
+  state.projectSaveChain = operation;
+  try {
+    await operation;
+  } catch (error) {
+    setSaveState("Save failed");
+    setStatus(error.message || String(error), "error");
+  }
+}
+
+async function loadConfig() {
+  const response = await api.fetchApi("/promptstudio-video/config");
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Video Studio configuration could not be loaded.");
+  state.config = data;
+}
+
+async function loadProjects() {
+  const response = await api.fetchApi(PROJECTS_ENDPOINT);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Video projects could not be loaded.");
+  state.projects = Array.isArray(data.projects) ? data.projects : [];
+  state.projectRevision = Number(data.revision || 0);
+  state.activeProjectId = data.active_project_id || state.projects[0]?.id || null;
+  state.selectedShotId = activeProject()?.document?.shots?.[0]?.id || null;
+  state.projectMutation = state.projectSavedMutation = 0;
+}
+
+function newProject() {
+  const now = Date.now();
+  const document = clone(state.config.default_document);
+  document.shots[0].id = makeId("shot");
+  const project = {
+    id: makeId("project"),
+    name: "Untitled video",
+    brief: "",
+    document,
+    workflow_id: state.workflows[0]?.id || "",
+    generations: [],
+    created_at: now,
+    updated_at: now,
+  };
+  state.projects.unshift(project);
+  state.activeProjectId = project.id;
+  state.selectedShotId = project.document.shots[0].id;
+  markProjectChanged({ render: true });
+  setStatus("New video project created.", "ready");
+}
+
+function selectProject(projectId) {
+  state.activeProjectId = projectId;
+  state.selectedShotId = activeProject()?.document?.shots?.[0]?.id || null;
+  state.projectMutation += 1;
+  persistProjects();
+  renderAll();
+}
+
+function projectPendingGenerationCount(project) {
+  return (project?.generations || []).filter(generation => (
+    ["queued", "generating"].includes(generation.status)
+  )).length;
+}
+
+function deleteProject(projectId) {
+  const index = state.projects.findIndex(project => project.id === projectId);
+  if (index < 0) return;
+  const project = state.projects[index];
+  const pendingCount = projectPendingGenerationCount(project);
+  if (pendingCount || (state.directorBusy && projectId === state.activeProjectId)) return;
+  const view = state.panel?.ownerDocument.defaultView;
+  if (!view?.confirm(`Delete the video session "${project.name || "Untitled video"}"? This cannot be undone.`)) return;
+
+  const wasActive = projectId === state.activeProjectId;
+  state.projects.splice(index, 1);
+  delete directorSessions()[projectId];
+  delete directorSessions()[`${projectId}:project`];
+  persistDirectorSessions();
+  if (wasActive) {
+    const replacement = [...state.projects].sort((left, right) => (
+      Number(right.updated_at) - Number(left.updated_at)
+    ))[0] || null;
+    state.activeProjectId = replacement?.id || null;
+    state.selectedShotId = replacement?.document?.shots?.[0]?.id || null;
+  }
+  state.projectMutation += 1;
+  setSaveState("Saving...");
+  renderAll();
+  persistProjects({ immediate: true });
+  setStatus(`Deleted video session "${project.name || "Untitled video"}".`, "ready");
+}
+
+function duplicateProject() {
+  const source = activeProject();
+  if (!source) return;
+  const copy = clone(source);
+  copy.id = makeId("project");
+  copy.name = `${source.name} copy`;
+  copy.generations = [];
+  copy.created_at = copy.updated_at = Date.now();
+  copy.document.shots.forEach(shot => { shot.id = makeId("shot"); });
+  state.projects.unshift(copy);
+  state.activeProjectId = copy.id;
+  state.selectedShotId = copy.document.shots[0]?.id || null;
+  markProjectChanged({ render: true });
+}
+
+function addShot() {
+  const project = activeProject();
+  if (!project) return;
+  const shots = project.document.shots;
+  const duration = Number(project.document.duration_seconds || 5);
+  const lastStart = Number(shots.at(-1)?.start || 0);
+  let start = Math.round((lastStart + Math.max(lastStart + 0.25, duration)) * 12) / 24;
+  if (start >= duration) {
+    project.document.duration_seconds = Math.min(150, Math.ceil((duration + 1) * 4) / 4);
+    start = duration;
+  }
+  const shot = {
+    id: makeId("shot"), start, transition: "the camera cuts to", composition: "", subjects: "",
+    environment: "", lighting: "", action: "", camera: { type: "Static Shot", amplitude: "default", speed: "default", target: "" },
+    dialogue: [], visible_text: [], sounds: [], notes: "",
+  };
+  shots.push(shot);
+  state.selectedShotId = shot.id;
+  markProjectChanged({ render: true });
+}
+
+function removeSelectedShot() {
+  const project = activeProject();
+  const shot = selectedShot(project);
+  if (!project || !shot || project.document.shots.length < 2) return;
+  const index = project.document.shots.indexOf(shot);
+  project.document.shots.splice(index, 1);
+  project.document.shots[0].start = 0;
+  state.selectedShotId = project.document.shots[Math.max(0, index - 1)].id;
+  markProjectChanged({ render: true });
+}
+
+function addDialogue() {
+  const shot = selectedShot();
+  if (!shot) return;
+  shot.dialogue ||= [];
+  shot.dialogue.push({
+    id: makeId("dialogue"), speaker: "The speaker", speaker_id: `S${shot.dialogue.length + 1}`,
+    language: "English", text: "", delivery: "", voiceover: false, offscreen: false,
+    crosses_cut: false, cutoff: false,
+  });
+  markProjectChanged({ render: true });
+}
+
+function effectiveDurationHint(seconds) {
+  const requestedFrames = Math.max(5, Math.round(Number(seconds || 5) * 24));
+  let frames = requestedFrames;
+  while (frames % 17 !== 5) frames += 1;
+  return `${frames} frames · ${(frames / 24).toFixed(2)}s effective`;
+}
+
+function workflowNameFromPath(path) {
+  return String(path || "").replaceAll("\\", "/").split("/").pop()?.replace(/\.json$/i, "") || "Workflow";
+}
+
+function isVideoWorkflowPath(path) {
+  const filename = String(path || "").replaceAll("\\", "/").split("/").pop() || "";
+  return filename.startsWith(WORKFLOW_PREFIX) && filename.toLowerCase().endsWith(".json");
+}
+
+async function buildWorkflowTemplate(file, workflowData) {
+  const Graph = app.rootGraph?.constructor || app.graph?.constructor;
+  if (typeof Graph !== "function") throw new Error("ComfyUI's workflow graph is not ready.");
+  const graph = new Graph();
+  const configureErrors = graph.configure(clone(workflowData));
+  if (Array.isArray(configureErrors) && configureErrors.length) {
+    throw new Error(`ComfyUI could not configure ${configureErrors.length} workflow node${configureErrors.length === 1 ? "" : "s"}.`);
+  }
+  const snapshot = clone(await app.graphToPrompt(graph));
+  const output = snapshot.output || {};
+  const directors = Object.entries(output).filter(([, node]) => node?.class_type === DIRECTOR_TYPE);
+  if (directors.length !== 1) {
+    throw new Error(`Workflow needs exactly one executable Prompt Studio MiniMax H3 Director; found ${directors.length}.`);
+  }
+  const saveVideoNodes = Object.entries(output).filter(([, node]) => node?.class_type === "SaveVideo");
+  if (saveVideoNodes.length !== 1) {
+    throw new Error(`Workflow needs exactly one executable native Save Video node; found ${saveVideoNodes.length}.`);
+  }
+  return {
+    id: file.path,
+    path: file.path,
+    name: workflowNameFromPath(file.path),
+    adapter: "minimax_h3",
+    director_node_id: String(directors[0][0]),
+    result_node_ids: [String(saveVideoNodes[0][0])],
+    result_fields: ["videos", "gifs", "images"],
+    snapshot,
+    source_modified: Number(file.modified || 0),
+    updated_at: Date.now(),
+    stale: false,
+    error: "",
+  };
+}
+
+async function loadWorkflowCache() {
+  const response = await api.fetchApi(WORKFLOWS_ENDPOINT);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Video workflow cache could not be loaded.");
+  state.workflows = Array.isArray(data.templates) ? data.templates : [];
+  state.workflowRevision = Number(data.revision || 0);
+}
+
+async function saveWorkflowCache() {
+  const response = await api.fetchApi(WORKFLOWS_ENDPOINT, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version: 1, revision: state.workflowRevision, templates: state.workflows }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `Video workflow cache could not be saved (${response.status}).`);
+  state.workflowRevision = Number(data.revision || state.workflowRevision);
+}
+
+async function refreshWorkflows({ announce = true } = {}) {
+  const previous = state.workflows;
+  const cached = new Map(previous.map(workflow => [workflow.path, workflow]));
+  const next = [];
+  const issues = [];
+  try {
+    const response = await api.fetchApi("/userdata?dir=workflows&recurse=true&full_info=true");
+    if (!response.ok) throw new Error(`ComfyUI workflows could not be listed (${response.status}).`);
+    const files = (await response.json())
+      .filter(file => file && typeof file.path === "string" && isVideoWorkflowPath(file.path))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    for (const file of files) {
+      const old = cached.get(file.path);
+      if (old && !old.stale && Number(old.source_modified || 0) === Number(file.modified || 0)) {
+        next.push(old);
+        continue;
+      }
+      try {
+        const userDataPath = `workflows/${file.path}`;
+        const workflowResponse = typeof api.getUserData === "function"
+          ? await api.getUserData(userDataPath)
+          : await api.fetchApi(`/userdata/${encodeURIComponent(userDataPath)}`);
+        if (!workflowResponse.ok) throw new Error(`ComfyUI could not read the workflow (${workflowResponse.status}).`);
+        next.push(await buildWorkflowTemplate(file, await workflowResponse.json()));
+      } catch (error) {
+        const message = error.message || String(error);
+        issues.push(`${workflowNameFromPath(file.path)}: ${message}`);
+        if (old?.snapshot?.output) next.push({ ...old, stale: true, error: message });
+      }
+    }
+    state.workflows = next;
+    if (JSON.stringify(previous) !== JSON.stringify(next)) await saveWorkflowCache();
+    for (const project of state.projects) {
+      if (!state.workflows.some(workflow => workflow.id === project.workflow_id)) {
+        project.workflow_id = state.workflows[0]?.id || "";
+      }
+    }
+    if (announce) {
+      if (issues.length) setStatus(`${issues.length} [PSV] workflow update${issues.length === 1 ? "" : "s"} failed. Cached copies remain available.`, "warning");
+      else if (next.length) setStatus(`Loaded ${next.length} compatible [PSV] workflow${next.length === 1 ? "" : "s"}.`, "ready");
+      else setStatus("No [PSV] workflow found. Save the working workflow with a [PSV] filename prefix, then refresh.", "warning");
+    }
+    renderAll();
+  } catch (error) {
+    state.workflows = previous.map(workflow => ({ ...workflow, stale: true, error: error.message || String(error) }));
+    setStatus(`${error.message || error} The last working workflow cache remains available.`, "warning");
+    renderAll();
+  }
+}
+
+function randomizeSnapshotSeeds(snapshot) {
+  for (const node of Object.values(snapshot?.output || {})) {
+    for (const name of Object.keys(node?.inputs || {})) {
+      if (/^(seed|noise_seed)$/i.test(name)) node.inputs[name] = Math.floor(Math.random() * 0x100000000);
+    }
+  }
+}
+
+function outputUrl(reference) {
+  if (!reference?.filename) return "";
+  const params = new URLSearchParams({
+    filename: reference.filename,
+    subfolder: reference.subfolder || "",
+    type: reference.type || "output",
+  });
+  return `/view?${params}`;
+}
+
+function collectHistoryOutputs(historyItem, resultNodeIds = [], resultFields = []) {
+  const outputs = [];
+  const selected = new Set(resultNodeIds.map(String));
+  for (const [nodeId, value] of Object.entries(historyItem?.outputs || {})) {
+    if (selected.size && !selected.has(String(nodeId))) continue;
+    const fields = resultFields.length ? resultFields : Object.keys(value || {});
+    for (const name of fields) {
+      const records = value?.[name];
+      if (Array.isArray(records)) {
+        for (const record of records) if (record && typeof record === "object" && record.filename) outputs.push(record);
+      } else if (records && typeof records === "object" && records.filename) {
+        outputs.push(records);
+      }
+    }
+  }
+  return outputs;
+}
+
+function historyError(historyItem) {
+  if (String(historyItem?.status?.status_str || "").toLowerCase() !== "error") return "";
+  const messages = Array.isArray(historyItem.status.messages) ? historyItem.status.messages : [];
+  const entry = [...messages].reverse().find(item => (
+    Array.isArray(item) && ["execution_error", "execution_interrupted"].includes(item[0])
+  ));
+  const detail = entry?.[1] || {};
+  return executionFailureMessage(entry?.[0] || "execution_error", detail);
+}
+
+function executionFailureMessage(eventName, detail = {}) {
+  const reason = String(
+    detail?.exception_message || detail?.error || detail?.message || detail?.exception_type || "",
+  ).replace(/\s+/g, " ").trim().slice(0, 1000);
+  const nodeType = String(detail?.node_type || "").trim();
+  const nodeId = String(detail?.node_id || "").trim();
+  const node = nodeType && nodeId ? `${nodeType}, node ${nodeId}` : nodeType || (nodeId ? `node ${nodeId}` : "");
+  const fallback = eventName === "execution_interrupted"
+    ? "ComfyUI interrupted execution."
+    : "ComfyUI reported an execution error without further details.";
+  return `Generation failed: ${reason || fallback}${node ? ` (${node})` : ""}`;
+}
+
+function generationByPromptId(promptId) {
+  for (const project of state.projects) {
+    const generation = project.generations.find(item => item.prompt_id === String(promptId));
+    if (generation) return { project, generation };
+  }
+  return null;
+}
+
+function updateGeneration(promptId, changes) {
+  const record = generationByPromptId(promptId);
+  if (!record) return;
+  Object.assign(record.generation, changes, { updated_at: Date.now() });
+  record.project.updated_at = Date.now();
+  markProjectChanged();
+  if (record.project.id === state.activeProjectId) renderGenerations();
+}
+
+function stopGenerationPolling(promptId) {
+  const id = String(promptId || "");
+  const timer = state.generationPollers.get(id);
+  if (timer && timer !== true) clearTimeout(timer);
+  state.generationPollers.delete(id);
+  state.generationActivity.delete(id);
+  state.generationProgress.delete(id);
+}
+
+function touchGeneration(promptId) {
+  const id = String(promptId || "");
+  if (id) state.generationActivity.set(id, Date.now());
+}
+
+function failGeneration(promptId, message) {
+  const id = String(promptId || "");
+  const record = generationByPromptId(id);
+  const error = String(message || "Generation failed because ComfyUI stopped processing it.");
+  if (!record || !["queued", "generating"].includes(record.generation.status)) {
+    if (id) {
+      state.generationFailures.set(id, error);
+      while (state.generationFailures.size > 50) {
+        state.generationFailures.delete(state.generationFailures.keys().next().value);
+      }
+    }
+    return false;
+  }
+  stopGenerationPolling(id);
+  updateGeneration(id, { status: "error", error });
+  setStatus(error, "error");
+  return true;
+}
+
+function activeGenerationPromptIds() {
+  const ids = [];
+  for (const project of state.projects) {
+    for (const generation of project.generations || []) {
+      if (["queued", "generating"].includes(generation.status) && generation.prompt_id) {
+        ids.push(String(generation.prompt_id));
+      }
+    }
+  }
+  return ids;
+}
+
+function setApiConnected(connected) {
+  state.apiConnected = Boolean(connected);
+  if (state.apiConnected) {
+    if (state.disconnectedGenerationTimer) clearTimeout(state.disconnectedGenerationTimer);
+    state.disconnectedGenerationTimer = null;
+    return;
+  }
+  if (state.disconnectedGenerationTimer || !activeGenerationPromptIds().length) return;
+  state.disconnectedGenerationTimer = setTimeout(() => {
+    state.disconnectedGenerationTimer = null;
+    if (state.apiConnected) return;
+    const message = "Generation failed: ComfyUI disconnected while processing and did not reconnect. The prompt worker may have stopped, for example after a CUDA out-of-memory error.";
+    activeGenerationPromptIds().forEach(promptId => failGeneration(promptId, message));
+  }, DISCONNECTED_GENERATION_GRACE_MS);
+}
+
+async function promptWorkerStopped() {
+  const now = Date.now();
+  if (state.promptWorkerHealthRequest) return state.promptWorkerHealthRequest;
+  if (now - state.promptWorkerHealthCheckedAt < 3000) return false;
+  state.promptWorkerHealthCheckedAt = now;
+  state.promptWorkerHealthRequest = (async () => {
+    try {
+      const response = await api.fetchApi("/promptstudio-video/runtime-health", { cache: "no-store" });
+      if (!response.ok) return false;
+      const health = await response.json();
+      if (health?.prompt_worker_alive === true) {
+        state.promptWorkerSeenAlive = true;
+        return false;
+      }
+      return state.promptWorkerSeenAlive && health?.prompt_worker_alive === false;
+    } catch (_) {
+      return false;
+    } finally {
+      state.promptWorkerHealthRequest = null;
+    }
+  })();
+  return state.promptWorkerHealthRequest;
+}
+
+function pollGeneration(promptId) {
+  const id = String(promptId || "");
+  if (!id || state.generationPollers.has(id)) return;
+  if (generationByPromptId(id)?.generation.status === "generating") touchGeneration(id);
+  const tick = async () => {
+    const record = generationByPromptId(id);
+    if (!record || !["queued", "generating"].includes(record.generation.status)) {
+      stopGenerationPolling(id);
+      return;
+    }
+    const lastActivity = state.generationActivity.get(id);
+    if (
+      record.generation.status === "generating"
+      && lastActivity
+      && Date.now() - lastActivity > GENERATION_STALL_TIMEOUT_MS
+    ) {
+      failGeneration(id, "Generation failed: ComfyUI stopped reporting progress for five minutes. The prompt worker may have stopped after an execution or CUDA memory error.");
+      return;
+    }
+    try {
+      const response = await api.fetchApi(`/history/${encodeURIComponent(id)}`);
+      if (response.ok) {
+        const history = await response.json();
+        const item = history?.[id];
+        if (item) {
+          const error = historyError(item);
+          const outputs = collectHistoryOutputs(item, record.generation.result_node_ids, record.generation.result_fields);
+          if (error) {
+            failGeneration(id, error);
+            return;
+          }
+          if (item.status?.completed) {
+            updateGeneration(id, {
+              status: outputs.length ? "complete" : "error",
+              outputs,
+              error: outputs.length ? "" : "Generation completed without a saved video output.",
+            });
+            setStatus(outputs.length ? "Video generation completed." : "Generation completed without a saved video output.", outputs.length ? "ready" : "error");
+            stopGenerationPolling(id);
+            renderAll();
+            return;
+          }
+        }
+      }
+    } catch (_) {
+      // A transient history failure is retried; ComfyUI may still be reconnecting.
+    }
+    if (await promptWorkerStopped()) {
+      failGeneration(id, "Generation failed: ComfyUI's prompt worker stopped during processing, usually after an unrecovered execution or CUDA out-of-memory error.");
+      return;
+    }
+    const timer = setTimeout(tick, 1100);
+    state.generationPollers.set(id, timer);
+  };
+  state.generationPollers.set(id, true);
+  tick();
+}
+
+async function queueSnapshot(project, workflow, snapshot, metadata) {
+  const queued = await api.queuePrompt(-1, snapshot);
+  const promptId = queued?.prompt_id;
+  if (!promptId) throw new Error("ComfyUI did not return a prompt ID.");
+  const generation = {
+    id: makeId("generation"),
+    prompt_id: String(promptId),
+    status: "queued",
+    error: "",
+    document: clone(metadata.document),
+    compiled_prompt: metadata.compiled_prompt,
+    resolved_mode: metadata.resolved_mode,
+    frame_count: metadata.frame_count,
+    effective_duration: metadata.effective_duration,
+    workflow_id: workflow.id,
+    workflow_name: workflow.name,
+    workflow_snapshot: clone(snapshot),
+    result_node_ids: clone(workflow.result_node_ids),
+    result_fields: clone(workflow.result_fields),
+    outputs: [],
+    created_at: Date.now(),
+    updated_at: Date.now(),
+  };
+  project.generations.unshift(generation);
+  project.generations = project.generations.slice(0, 200);
+  markProjectChanged({ render: true });
+  await persistProjects({ immediate: true });
+  state.generationProgress.set(String(promptId), { phase: "queued" });
+  touchGeneration(promptId);
+  const reportedFailure = state.generationFailures.get(String(promptId));
+  if (reportedFailure) {
+    state.generationFailures.delete(String(promptId));
+    failGeneration(promptId, reportedFailure);
+  } else {
+    pollGeneration(promptId);
+    setStatus(`Queued with ComfyUI (${String(promptId).slice(0, 8)}).`, "ready");
+  }
+}
+
+async function generateProject() {
+  const project = activeProject();
+  if (!project) return;
+  const workflow = state.workflows.find(item => item.id === project.workflow_id);
+  if (!workflow) {
+    setStatus("Select a compatible [PSV] workflow before generating.", "error");
+    return;
+  }
+  const generate = state.panel.querySelector("#psvstudio-generate");
+  generate.disabled = true;
+  setStatus("Validating and compiling the production…");
+  try {
+    const response = await api.fetchApi("/promptstudio-video/document/compile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document: project.document }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The video document is invalid.");
+    project.document = data.document;
+    project.brief = project.document.main_description || "";
+    const snapshot = clone(workflow.snapshot);
+    const director = snapshot.output?.[workflow.director_node_id];
+    if (!director) throw new Error("The selected workflow no longer contains its Director node.");
+    director.inputs ||= {};
+    director.inputs.document_json = JSON.stringify(data.document);
+    if (state.panel.querySelector("#psvstudio-new-seed")?.checked !== false) randomizeSnapshotSeeds(snapshot);
+    await queueSnapshot(project, workflow, snapshot, data);
+  } catch (error) {
+    setStatus(error.message || String(error), "error");
+  } finally {
+    generate.disabled = false;
+  }
+}
+
+async function replayGeneration(generation) {
+  const project = activeProject();
+  const workflow = state.workflows.find(item => item.id === generation.workflow_id) || {
+    id: generation.workflow_id,
+    name: generation.workflow_name,
+    result_node_ids: generation.result_node_ids,
+    result_fields: generation.result_fields,
+  };
+  if (!project || !generation.workflow_snapshot) return;
+  try {
+    setStatus("Queueing the exact saved workflow snapshot…");
+    await queueSnapshot(project, workflow, clone(generation.workflow_snapshot), {
+      document: generation.document,
+      compiled_prompt: generation.compiled_prompt,
+      resolved_mode: generation.resolved_mode,
+      frame_count: generation.frame_count,
+      effective_duration: generation.effective_duration,
+    });
+  } catch (error) {
+    setStatus(error.message || String(error), "error");
+  }
+}
+
+function renderProjectList() {
+  const list = state.panel?.querySelector("#psvstudio-project-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!state.projects.length) {
+    list.append(el("div", "psvstudio-empty", "No video projects yet."));
+    return;
+  }
+  for (const project of [...state.projects].sort((left, right) => Number(right.updated_at) - Number(left.updated_at))) {
+    const pendingCount = projectPendingGenerationCount(project);
+    const row = el("div", "psvstudio-project-row");
+    row.dataset.active = project.id === state.activeProjectId ? "true" : "false";
+    const control = el("button", "psvstudio-project");
+    control.type = "button";
+    control.setAttribute("aria-current", project.id === state.activeProjectId ? "true" : "false");
+    control.append(
+      el("strong", "", project.name || "Untitled video"),
+      el("small", "", `${project.document?.shots?.length || 0} shot${project.document?.shots?.length === 1 ? "" : "s"} · ${project.generations?.length || 0} render${project.generations?.length === 1 ? "" : "s"}`),
+    );
+    control.addEventListener("click", () => selectProject(project.id));
+    const remove = el("button", "psvstudio-project-delete", "Delete");
+    remove.type = "button";
+    remove.disabled = pendingCount > 0 || (state.directorBusy && project.id === state.activeProjectId);
+    remove.title = pendingCount
+      ? "Wait for this session's queued video work to finish before deleting it."
+      : state.directorBusy && project.id === state.activeProjectId
+        ? "Wait for Video Director to finish before deleting this session."
+        : `Delete video session ${project.name || "Untitled video"}`;
+    remove.setAttribute("aria-label", remove.title);
+    remove.addEventListener("click", () => deleteProject(project.id));
+    row.append(control, remove);
+    list.append(row);
+  }
+}
+
+function renderWorkflowSelect() {
+  const select = state.panel?.querySelector("#psvstudio-workflow");
+  const project = activeProject();
+  if (!select) return;
+  select.replaceChildren();
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = state.workflows.length ? "Choose workflow" : "No [PSV] workflow found";
+  select.append(empty);
+  for (const workflow of state.workflows) {
+    const option = document.createElement("option");
+    option.value = workflow.id;
+    option.textContent = `${workflow.name}${workflow.stale ? " (cached)" : ""}`;
+    select.append(option);
+  }
+  select.value = project?.workflow_id || "";
+  select.disabled = !project;
+}
+
+function latestOutput(project) {
+  for (const generation of project?.generations || []) {
+    if (generation.status === "complete" && generation.outputs?.length) return generation.outputs[0];
+  }
+  return null;
+}
+
+function renderPreview() {
+  const preview = state.panel?.querySelector("#psvstudio-preview");
+  const project = activeProject();
+  if (!preview) return;
+  preview.replaceChildren();
+  if (!project) {
+    const empty = el("div", "psvstudio-preview-empty");
+    empty.append(el("strong", "", "Create your first video project"), el("span", "", "Build manually, ask the Director, or combine both approaches."));
+    empty.append(button("New video", newProject, "psvstudio-button psvstudio-button-primary"));
+    preview.append(empty);
+    return;
+  }
+  preview.append(el("span", "psvstudio-mode-badge", localResolvedMode(project.document).toUpperCase()));
+  const output = latestOutput(project);
+  if (output) {
+    const video = document.createElement("video");
+    video.controls = true;
+    video.preload = "metadata";
+    video.src = outputUrl(output);
+    preview.append(video);
+  } else {
+    const empty = el("div", "psvstudio-preview-empty");
+    empty.append(
+      el("strong", "", "Your production starts here"),
+      el("span", "", "Describe the video, refine the selected shot, then generate an immutable workflow snapshot."),
+    );
+    preview.append(empty);
+  }
+}
+
+function renderBriefCard() {
+  const container = state.panel?.querySelector("#psvstudio-brief-card");
+  const project = activeProject();
+  if (!container) return;
+  container.replaceChildren();
+  if (!project) return;
+  container.append(el("h2", "", "Production brief"));
+  const brief = textArea(project.brief, value => {
+    project.brief = value;
+    project.document.main_description = value;
+    markProjectChanged();
+  }, 4, PLACEHOLDERS.brief);
+  container.append(field("Main video description", brief, "This general prompt is compiled into the video before the timeline-specific shot details."));
+
+  const command = textArea("", () => {}, 2, PLACEHOLDERS.directorCommand);
+  const ask = button(
+    "Ask Grand Director",
+    () => openDirector("project", command.value.trim()),
+    "psvstudio-button psvstudio-button-primary psvstudio-director-launch-button",
+  );
+  ask.title = "Consult about the entire video and review any proposed multi-shot changes before applying them.";
+  const directorActions = el("div", "psvstudio-director-launch");
+  directorActions.append(
+    field("Grand Director instruction", command),
+    ask,
+    el("small", "psvstudio-help", `Full-video scope · ${project.document.shots.length} shot${project.document.shots.length === 1 ? "" : "s"} in context`),
+  );
+  container.append(directorActions);
+
+  const sizeValue = `${project.document.width}x${project.document.height}`;
+  const aspectOptions = state.config.aspect_presets.map(item => ({ value: `size:${item.width}x${item.height}`, label: item.label }));
+  for (const reference of project.document.references || []) {
+    const canvas = minimaxCanvasDimensions(
+      reference.source_width,
+      reference.source_height,
+      project.document.target_megapixels,
+    );
+    if (!canvas || !["image", "video"].includes(reference.kind)) continue;
+    const role = (reference.roles || []).some(value => CANVAS_MEDIA_ROLES.has(value)) ? "final-media" : "reference";
+    aspectOptions.push({
+      value: `media:${reference.id}`,
+      label: `${reference.name || "Imported media"} · ${reference.source_width}×${reference.source_height} → ${canvas.width}×${canvas.height} (${role})`,
+    });
+  }
+  if (!aspectOptions.some(item => item.value === `size:${sizeValue}`)) {
+    aspectOptions.push({ value: `size:${sizeValue}`, label: `Custom ${project.document.width}×${project.document.height}` });
+  }
+  const linkedReference = (project.document.references || []).find(reference => reference.id === project.document.canvas_reference_id);
+  const selectedCanvas = linkedReference && minimaxCanvasDimensions(
+    linkedReference.source_width,
+    linkedReference.source_height,
+    project.document.target_megapixels,
+  )
+    ? `media:${linkedReference.id}`
+    : `size:${sizeValue}`;
+  const aspect = selectInput(aspectOptions, selectedCanvas, value => {
+    if (value.startsWith("media:")) {
+      const reference = project.document.references.find(item => item.id === value.slice(6));
+      useReferenceCanvas(project, reference);
+    } else {
+      const [width, height] = value.slice(5).split("x").map(Number);
+      project.document.width = width;
+      project.document.height = height;
+      project.document.canvas_reference_id = "";
+    }
+    markProjectChanged();
+  });
+  const canvasRules = state.config.canvas || {};
+  const targetMegapixelValue = Number(
+    project.document.target_megapixels ?? canvasRules.default_megapixels ?? (768 * 1344) / 1_000_000,
+  );
+  const targetMegapixels = textInput(
+    Number.isFinite(targetMegapixelValue) ? Number(targetMegapixelValue.toFixed(2)) : "",
+    (value, control) => {
+      if (!Number.isFinite(value)) return;
+      const minimum = Number(canvasRules.minimum_megapixels) || 0.1;
+      const maximum = Number(canvasRules.maximum_megapixels) || 4;
+      project.document.target_megapixels = Math.min(maximum, Math.max(minimum, value));
+      const activeLinkedReference = project.document.references.find(
+        reference => reference.id === project.document.canvas_reference_id,
+      );
+      if (activeLinkedReference && useReferenceCanvas(project, activeLinkedReference)) {
+        const canvas = minimaxCanvasDimensions(
+          activeLinkedReference.source_width,
+          activeLinkedReference.source_height,
+          project.document.target_megapixels,
+        );
+        const option = [...aspect.options].find(item => item.value === `media:${activeLinkedReference.id}`);
+        const role = (activeLinkedReference.roles || []).some(item => CANVAS_MEDIA_ROLES.has(item)) ? "final-media" : "reference";
+        if (option && canvas) {
+          option.textContent = `${activeLinkedReference.name || "Imported media"} · ${activeLinkedReference.source_width}×${activeLinkedReference.source_height} → ${canvas.width}×${canvas.height} (${role})`;
+        }
+      }
+      markProjectChanged();
+    },
+    "number",
+  );
+  targetMegapixels.min = String(canvasRules.minimum_megapixels ?? 0.1);
+  targetMegapixels.max = String(canvasRules.maximum_megapixels ?? 4);
+  targetMegapixels.step = "0.05";
+  const duration = textInput(project.document.duration_seconds, (value, control) => {
+    if (!Number.isFinite(value) || value <= 0) return;
+    project.document.duration_seconds = Math.min(150, Math.max(0.25, value));
+    control.nextElementSibling && (control.nextElementSibling.textContent = effectiveDurationHint(value));
+    markProjectChanged();
+  }, "number", PLACEHOLDERS.durationSeconds);
+  duration.min = "0.25";
+  duration.max = "150";
+  duration.step = "0.25";
+  const durationField = field("Requested duration", duration);
+  durationField.append(el("small", "psvstudio-help", effectiveDurationHint(project.document.duration_seconds)));
+  const row = el("div", "psvstudio-field-row psvstudio-canvas-row");
+  row.append(
+    field("Canvas", aspect, "Imported ratios keep their shape and snap to MiniMax H3's 32 px grid."),
+    field("Target MP", targetMegapixels, "For imported media ratios."),
+    durationField,
+  );
+  container.append(row);
+}
+
+function documentDuration(project = activeProject()) {
+  return Math.max(0.25, Number(project?.document?.duration_seconds) || 5);
+}
+
+function captureShotDurations(project) {
+  const duration = documentDuration(project);
+  return new Map(project.document.shots.map((shot, index) => [
+    shot.id,
+    Math.max(0.25, Number(project.document.shots[index + 1]?.start ?? duration) - Number(shot.start || 0)),
+  ]));
+}
+
+function clearTimelineDragArtifacts(track = state.panel?.querySelector("#psvstudio-timeline-track")) {
+  track?.querySelectorAll(".psvstudio-timeline-drop-marker").forEach(marker => marker.remove());
+  state.panel?.querySelectorAll(".psvstudio-shot-block.is-dragging").forEach(block => block.classList.remove("is-dragging"));
+}
+
+function beginShotPointerDrag(event, project, shot, block, track) {
+  if (event.button !== 0 || event.target.closest(".psvstudio-trim-handle")) return;
+  const ownerWindow = state.panel.ownerDocument.defaultView;
+  const startX = event.clientX;
+  const startY = event.clientY;
+  let dragging = false;
+  const move = moveEvent => {
+    if (!dragging && Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < 5) return;
+    if (!dragging) {
+      dragging = true;
+      state.shotDrag = { projectId: project.id, id: shot.id, durations: captureShotDurations(project) };
+      state.selectedShotId = shot.id;
+      block.classList.add("is-dragging");
+      state.panel.ownerDocument.body.classList.add("psvstudio-dragging-shot");
+    }
+    moveEvent.preventDefault();
+    showTimelineDropMarker(track, timelineInsertionIndex(track, moveEvent.clientX));
+  };
+  const finish = finishEvent => {
+    ownerWindow.removeEventListener("pointermove", move);
+    ownerWindow.removeEventListener("pointerup", finish);
+    ownerWindow.removeEventListener("pointercancel", cancel);
+    state.panel.ownerDocument.body.classList.remove("psvstudio-dragging-shot");
+    if (!dragging) return;
+    const insertIndex = timelineInsertionIndex(track, finishEvent.clientX);
+    reorderShot(project, insertIndex);
+    state.shotDrag = null;
+    clearTimelineDragArtifacts(track);
+    renderBriefCard();
+    renderTimeline();
+    renderInspector();
+  };
+  const cancel = () => {
+    ownerWindow.removeEventListener("pointermove", move);
+    ownerWindow.removeEventListener("pointerup", finish);
+    ownerWindow.removeEventListener("pointercancel", cancel);
+    state.panel.ownerDocument.body.classList.remove("psvstudio-dragging-shot");
+    state.shotDrag = null;
+    clearTimelineDragArtifacts(track);
+  };
+  ownerWindow.addEventListener("pointermove", move, { passive: false });
+  ownerWindow.addEventListener("pointerup", finish, { once: true });
+  ownerWindow.addEventListener("pointercancel", cancel, { once: true });
+}
+
+function reorderShot(project, insertIndex) {
+  const drag = state.shotDrag;
+  if (!drag || drag.projectId !== project.id) return;
+  const shot = project.document.shots.find(item => item.id === drag.id);
+  const remaining = project.document.shots.filter(item => item.id !== drag.id);
+  if (!shot) return;
+  remaining.splice(Math.max(0, Math.min(insertIndex, remaining.length)), 0, shot);
+  let start = 0;
+  for (const item of remaining) {
+    item.start = Math.round(start * 1000) / 1000;
+    start += drag.durations.get(item.id) || 0.25;
+  }
+  project.document.shots = remaining;
+  project.document.duration_seconds = Math.round(start * 1000) / 1000;
+  state.selectedShotId = shot.id;
+  markProjectChanged();
+}
+
+function timelineInsertionIndex(track, clientX) {
+  const blocks = [...track.querySelectorAll(".psvstudio-shot-block")]
+    .filter(block => block.dataset.shotId !== state.shotDrag?.id);
+  return blocks.filter(block => {
+    const rect = block.getBoundingClientRect();
+    return clientX >= rect.left + rect.width / 2;
+  }).length;
+}
+
+function showTimelineDropMarker(track, insertIndex) {
+  track.querySelector(".psvstudio-timeline-drop-marker")?.remove();
+  const blocks = [...track.querySelectorAll(".psvstudio-shot-block")]
+    .filter(block => block.dataset.shotId !== state.shotDrag?.id);
+  const marker = el("div", "psvstudio-timeline-drop-marker");
+  const left = insertIndex < blocks.length
+    ? blocks[insertIndex].offsetLeft - 2
+    : blocks.length ? blocks.at(-1).offsetLeft + blocks.at(-1).offsetWidth : 0;
+  marker.style.left = `${Math.max(0, left)}px`;
+  track.append(marker);
+}
+
+function currentBoundary(project, boundaryIndex) {
+  return boundaryIndex < project.document.shots.length
+    ? Number(project.document.shots[boundaryIndex].start) || 0
+    : documentDuration(project);
+}
+
+function setBoundary(project, boundaryIndex, requestedTime) {
+  const shots = project.document.shots;
+  if (boundaryIndex < 1 || boundaryIndex > shots.length) return;
+  const minimum = (Number(shots[boundaryIndex - 1].start) || 0) + 0.25;
+  const maximum = boundaryIndex < shots.length
+    ? Number(shots[boundaryIndex + 1]?.start ?? documentDuration(project)) - 0.25
+    : 150;
+  const time = Math.round(Math.max(minimum, Math.min(maximum, requestedTime)) * 1000) / 1000;
+  if (boundaryIndex < shots.length) shots[boundaryIndex].start = time;
+  else project.document.duration_seconds = time;
+}
+
+function refreshTimelineGeometry(track, project, scale) {
+  const duration = documentDuration(project);
+  track.style.width = `${Math.max(600, duration * scale)}px`;
+  project.document.shots.forEach((shot, index) => {
+    const start = Number(shot.start) || 0;
+    const end = Number(project.document.shots[index + 1]?.start ?? duration);
+    const block = track.querySelector(`[data-shot-id="${CSS.escape(shot.id)}"]`);
+    if (!block) return;
+    block.style.left = `${start * scale}px`;
+    block.style.width = `${Math.max(30, (end - start) * scale - 3)}px`;
+    const range = block.querySelector(".psvstudio-shot-range");
+    if (range) range.textContent = `${start.toFixed(2)}–${end.toFixed(2)}s`;
+    const durationLabel = block.querySelector(".psvstudio-shot-duration");
+    if (durationLabel) durationLabel.textContent = `${(end - start).toFixed(2)}s`;
+  });
+}
+
+function finishBoundaryResize(project) {
+  markProjectChanged();
+  renderBriefCard();
+  renderTimeline();
+  renderInspector();
+}
+
+function beginBoundaryResize(event, project, index, edge, track, scale) {
+  event.preventDefault();
+  event.stopPropagation();
+  const boundaryIndex = edge === "left" ? index : index + 1;
+  if (!boundaryIndex) return;
+  state.selectedShotId = project.document.shots[index].id;
+  const ownerWindow = state.panel.ownerDocument.defaultView;
+  state.panel.ownerDocument.body.classList.add("psvstudio-resizing");
+  const move = moveEvent => {
+    const rect = track.getBoundingClientRect();
+    const rawTime = (moveEvent.clientX - rect.left) / scale;
+    const time = moveEvent.altKey ? rawTime : Math.round(rawTime * 24) / 24;
+    setBoundary(project, boundaryIndex, time);
+    refreshTimelineGeometry(track, project, scale);
+    const start = Number(project.document.shots[index].start) || 0;
+    const end = Number(project.document.shots[index + 1]?.start ?? documentDuration(project));
+    setStatus(`Shot ${index + 1}: ${(end - start).toFixed(2)}s${moveEvent.altKey ? "" : " · snapped to 24 fps"}`, "working");
+  };
+  const finish = () => {
+    ownerWindow.removeEventListener("pointermove", move);
+    ownerWindow.removeEventListener("pointerup", finish);
+    ownerWindow.removeEventListener("pointercancel", finish);
+    state.panel.ownerDocument.body.classList.remove("psvstudio-resizing");
+    finishBoundaryResize(project);
+  };
+  ownerWindow.addEventListener("pointermove", move);
+  ownerWindow.addEventListener("pointerup", finish, { once: true });
+  ownerWindow.addEventListener("pointercancel", finish, { once: true });
+}
+
+function trimHandle(project, index, edge, track, scale) {
+  const boundaryIndex = edge === "left" ? index : index + 1;
+  const handle = el("div", `psvstudio-trim-handle psvstudio-trim-${edge}${boundaryIndex ? "" : " is-disabled"}`);
+  handle.role = "separator";
+  handle.tabIndex = boundaryIndex ? 0 : -1;
+  handle.ariaLabel = edge === "left" ? `Resize the start of shot ${index + 1}` : `Resize the end of shot ${index + 1}`;
+  handle.title = boundaryIndex ? "Drag to resize. Hold Alt for sub-frame precision." : "The production starts at 0 seconds.";
+  handle.addEventListener("pointerdown", resizeEvent => beginBoundaryResize(resizeEvent, project, index, edge, track, scale));
+  handle.addEventListener("dragstart", dragEvent => dragEvent.preventDefault());
+  handle.addEventListener("keydown", keyEvent => {
+    if (!boundaryIndex || !["ArrowLeft", "ArrowRight"].includes(keyEvent.key)) return;
+    keyEvent.preventDefault();
+    const step = keyEvent.shiftKey ? 1 : 1 / 24;
+    setBoundary(project, boundaryIndex, currentBoundary(project, boundaryIndex) + (keyEvent.key === "ArrowLeft" ? -step : step));
+    finishBoundaryResize(project);
+  });
+  return handle;
+}
+
+function fitTimeline() {
+  const viewport = state.panel?.querySelector("#psvstudio-shot-list");
+  const project = activeProject();
+  if (!viewport || !project) return;
+  state.timelineZoom = Math.max(36, Math.min(160, (viewport.clientWidth - 34) / documentDuration(project)));
+  const zoom = state.panel.querySelector("#psvstudio-timeline-zoom");
+  if (zoom) zoom.value = String(Math.round(state.timelineZoom));
+  renderTimeline();
+}
+
+function renderTimeline() {
+  const viewport = state.panel?.querySelector("#psvstudio-shot-list");
+  const project = activeProject();
+  const add = state.panel?.querySelector("#psvstudio-add-shot");
+  if (!viewport) return;
+  const previousScroll = viewport.scrollLeft;
+  viewport.replaceChildren();
+  if (add) add.disabled = !project;
+  if (!project) return;
+  const duration = documentDuration(project);
+  const minimumWidth = Math.max(600, viewport.clientWidth - 28);
+  const scale = Math.max(state.timelineZoom, minimumWidth / duration);
+  const timeline = el("div", "psvstudio-timeline");
+  const ruler = el("div", "psvstudio-timeline-ruler");
+  const track = el("div", "psvstudio-timeline-track");
+  track.id = "psvstudio-timeline-track";
+  track.role = "list";
+  track.ariaLabel = "Video shots";
+  const width = Math.max(minimumWidth, duration * scale);
+  ruler.style.width = `${width}px`;
+  track.style.width = `${width}px`;
+
+  const tickStep = scale >= 100 ? 0.5 : 1;
+  for (let time = 0; time <= duration + 0.001; time += tickStep) {
+    const tick = el("span", Number.isInteger(time) ? "is-major" : "");
+    tick.style.left = `${time * scale}px`;
+    if (Number.isInteger(time)) tick.textContent = `${time}s`;
+    ruler.append(tick);
+  }
+
+  project.document.shots.forEach((shot, index) => {
+    const start = Number(shot.start) || 0;
+    const end = Number(project.document.shots[index + 1]?.start ?? duration);
+    const block = el("div", `psvstudio-shot-block${shot.id === state.selectedShotId ? " is-selected" : ""}`);
+    block.dataset.shotId = shot.id;
+    block.role = "listitem";
+    block.ariaLabel = `Shot ${index + 1}. Drag to reorder. Press Alt plus Left or Right Arrow to move it.`;
+    block.tabIndex = 0;
+    block.title = "Drag to reorder · Alt + Left/Right Arrow also moves the shot";
+    block.style.left = `${start * scale}px`;
+    block.style.width = `${Math.max(30, (end - start) * scale - 3)}px`;
+    const header = el("div", "psvstudio-shot-block-header");
+    header.append(el("strong", "", `Shot ${index + 1}`), el("span", "psvstudio-shot-duration", `${(end - start).toFixed(2)}s`));
+    block.append(
+      trimHandle(project, index, "left", track, scale),
+      header,
+      el("span", "psvstudio-shot-range", `${start.toFixed(2)}–${end.toFixed(2)}s`),
+      el("span", "psvstudio-shot-summary", shot.action || shot.composition || "Empty shot"),
+      el("span", "psvstudio-shot-camera", shot.camera?.type || "No camera movement"),
+      trimHandle(project, index, "right", track, scale),
+    );
+    block.addEventListener("click", clickEvent => {
+      if (clickEvent.target.closest(".psvstudio-trim-handle")) return;
+      state.selectedShotId = shot.id;
+      renderTimeline();
+      renderInspector();
+    });
+    block.addEventListener("keydown", keyEvent => {
+      if (["Enter", " "].includes(keyEvent.key)) {
+        keyEvent.preventDefault();
+        state.selectedShotId = shot.id;
+        renderTimeline();
+        renderInspector();
+        return;
+      }
+      if (!keyEvent.altKey || !["ArrowLeft", "ArrowRight"].includes(keyEvent.key)) return;
+      const destination = index + (keyEvent.key === "ArrowLeft" ? -1 : 1);
+      if (destination < 0 || destination >= project.document.shots.length) return;
+      keyEvent.preventDefault();
+      state.shotDrag = { projectId: project.id, id: shot.id, durations: captureShotDurations(project) };
+      reorderShot(project, keyEvent.key === "ArrowLeft" ? index - 1 : index + 1);
+      state.shotDrag = null;
+      renderBriefCard();
+      renderTimeline();
+      renderInspector();
+    });
+    block.addEventListener("pointerdown", pointerEvent => beginShotPointerDrag(pointerEvent, project, shot, block, track));
+    track.append(block);
+  });
+
+  timeline.append(ruler, track);
+  viewport.append(timeline);
+  viewport.scrollLeft = previousScroll;
+}
+
+function renderMediaLane() {
+  const lane = state.panel?.querySelector("#psvstudio-media-lane");
+  const project = activeProject();
+  if (!lane) return;
+  lane.replaceChildren();
+  lane.append(el("span", "psvstudio-media-lane-label", "Media"));
+  const references = project?.document?.references || [];
+  if (!references.length) {
+    lane.append(el("span", "psvstudio-media-lane-empty", project ? "Drop media anywhere on this screen" : "Create a project or drop media anywhere"));
+    return;
+  }
+  references.forEach((reference, index) => {
+    ensureReferenceDimensions(project, reference);
+    const card = el("div", "psvstudio-media-chip");
+    card.dataset.referenceId = reference.id;
+    card.dataset.referenceIndex = String(index);
+    card.draggable = true;
+    card.tabIndex = 0;
+    card.title = "Drag to change reference order · Alt + Left/Right Arrow also moves it";
+    card.ariaLabel = `${referenceDisplayLabel(references, reference)}: ${reference.name || reference.path || "Media"}. Drag to reorder.`;
+    const url = mediaInputUrl(reference);
+    if (reference.kind === "image" && url) {
+      const thumbnail = document.createElement("img");
+      thumbnail.src = url;
+      thumbnail.alt = "";
+      thumbnail.loading = "lazy";
+      card.append(thumbnail);
+    } else {
+      card.append(el("span", "psvstudio-media-kind", reference.kind === "video" ? "VID" : reference.kind === "audio" ? "AUD" : "IMG"));
+    }
+    const details = el("span", "psvstudio-media-chip-details");
+    const roleOptions = referenceRoleOptions(reference.kind);
+    const currentRole = (reference.roles || [])[0] || roleOptions[0].value;
+    const role = selectInput(roleOptions, currentRole, value => setReferenceRole(project, reference, value));
+    role.className = "psvstudio-media-role";
+    const displayLabel = referenceDisplayLabel(references, reference);
+    role.ariaLabel = `Role for ${displayLabel}`;
+    role.title = "How this reference conditions MiniMax H3";
+    const sourceSize = minimaxCanvasDimensions(reference.source_width, reference.source_height)
+      ? ` · ${reference.source_width}×${reference.source_height}`
+      : "";
+    const sourceName = reference.name || reference.path || "Media";
+    details.append(
+      el("strong", "", displayLabel),
+      el("small", "", `${sourceName}${sourceSize}`),
+      role,
+    );
+    const remove = button("×", () => {
+      project.document.references = references.filter(item => item.id !== reference.id);
+      project.document.references.forEach(item => { item.label = ""; });
+      invalidateReferenceSemantics(project);
+      if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
+      markProjectChanged({ render: true });
+      setStatus(`${displayLabel} removed from project references.`, "ready");
+    }, "psvstudio-media-remove");
+    remove.title = `Remove ${displayLabel}`;
+    remove.ariaLabel = remove.title;
+    card.append(details, remove);
+    card.addEventListener("pointerdown", event => {
+      if (event.target.closest("select,button,input,textarea")) card.draggable = false;
+    });
+    const restoreDrag = () => { card.draggable = true; };
+    card.addEventListener("pointerup", restoreDrag);
+    card.addEventListener("pointercancel", restoreDrag);
+    card.addEventListener("focusout", restoreDrag);
+    card.addEventListener("dragstart", event => {
+      state.mediaDragId = reference.id;
+      card.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("application/x-promptstudio-video-reference", reference.id);
+    });
+    card.addEventListener("dragend", () => {
+      state.mediaDragId = "";
+      card.classList.remove("is-dragging");
+      clearMediaDropMarkers(lane);
+    });
+    card.addEventListener("keydown", event => {
+      if (!event.altKey || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      const direction = event.key === "ArrowLeft" ? -1 : 1;
+      const targetIndex = index + direction;
+      if (targetIndex < 0 || targetIndex >= references.length) return;
+      event.preventDefault();
+      moveReference(project, reference.id, direction < 0 ? index - 1 : index + 2);
+    });
+    lane.append(card);
+  });
+  lane.addEventListener("dragover", event => {
+    if (!state.mediaDragId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    mediaDropDestination(lane, event.clientX);
+  });
+  lane.addEventListener("dragleave", event => {
+    if (!lane.contains(event.relatedTarget)) clearMediaDropMarkers(lane);
+  });
+  lane.addEventListener("drop", event => {
+    if (!state.mediaDragId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const destination = mediaDropDestination(lane, event.clientX);
+    const referenceId = state.mediaDragId;
+    clearMediaDropMarkers(lane);
+    moveReference(project, referenceId, destination);
+  });
+}
+
+function inspectorDetails(title, open = false) {
+  const details = el("details", "psvstudio-inspector-section");
+  details.open = open;
+  details.append(el("summary", "", title));
+  const body = el("div", "psvstudio-inspector-section-body");
+  details.append(body);
+  return { details, body };
+}
+
+function appendShotTextField(body, label, shot, name, rows = 3) {
+  body.append(field(label, textArea(shot[name] || "", value => {
+    shot[name] = value;
+    markProjectChanged();
+  }, rows, PLACEHOLDERS[name] || "")));
+}
+
+function renderDialogueEditor(body, shot) {
+  (shot.dialogue || []).forEach((event, index) => {
+    const card = el("div", "psvstudio-inspector-section-body");
+    const speakerRow = el("div", "psvstudio-field-row");
+    speakerRow.append(
+      field("Speaker", textInput(event.speaker, value => { event.speaker = value; markProjectChanged(); }, "text", PLACEHOLDERS.speaker)),
+      field("Speaker ID", textInput(event.speaker_id, value => { event.speaker_id = value.toUpperCase(); markProjectChanged(); }, "text", PLACEHOLDERS.speakerId)),
+    );
+    const exact = textArea(event.text, value => { event.text = value; markProjectChanged(); }, 3, PLACEHOLDERS.dialogue);
+    const remove = button("Remove line", () => {
+      shot.dialogue.splice(index, 1);
+      markProjectChanged({ render: true });
+    }, "psvstudio-button psvstudio-button-danger");
+    const flags = el("div", "psvstudio-field-row");
+    flags.append(
+      checkControl("Voiceover", event.voiceover, value => { event.voiceover = value; markProjectChanged(); }),
+      checkControl("Off-screen", event.offscreen, value => { event.offscreen = value; markProjectChanged(); }),
+      checkControl("Crosses cut", event.crosses_cut, value => { event.crosses_cut = value; markProjectChanged(); }),
+      checkControl("Cut off", event.cutoff, value => { event.cutoff = value; markProjectChanged(); }),
+    );
+    card.append(
+      speakerRow,
+      field("Language", textInput(event.language, value => { event.language = value; markProjectChanged(); }, "text", PLACEHOLDERS.language)),
+      field("Exact dialogue", exact),
+      field("Delivery", textInput(event.delivery, value => { event.delivery = value; markProjectChanged(); }, "text", PLACEHOLDERS.delivery)),
+      flags,
+      remove,
+    );
+    body.append(card);
+  });
+  body.append(button("Add dialogue", addDialogue));
+}
+
+function renderInspector() {
+  const content = state.panel?.querySelector("#psvstudio-inspector-content");
+  const project = activeProject();
+  const shot = selectedShot(project);
+  if (!content) return;
+  content.replaceChildren();
+  if (!project || !shot) {
+    content.append(el("div", "psvstudio-empty", "Select a project and shot to edit it."));
+    return;
+  }
+  const index = project.document.shots.indexOf(shot);
+  const heading = state.panel.querySelector("#psvstudio-inspector-title");
+  if (heading) heading.textContent = `Shot ${index + 1}`;
+  const directorActions = el("div", "psvstudio-inspector-director-actions");
+  directorActions.append(
+    button("Ask Director about this shot", () => openDirector("shot"), "psvstudio-button psvstudio-button-primary"),
+    el("small", "psvstudio-help", "Advice is conversational; document changes always require approval."),
+  );
+  content.append(directorActions);
+
+  const essentials = inspectorDetails("Essentials", true);
+  if (index > 0) {
+    const start = textInput(shot.start, value => {
+      if (!Number.isFinite(value)) return;
+      const previous = Number(project.document.shots[index - 1].start) + 1 / 24;
+      const next = Number(project.document.shots[index + 1]?.start ?? project.document.duration_seconds) - 1 / 24;
+      shot.start = Math.max(previous, Math.min(next, Math.round(value * 24) / 24));
+      markProjectChanged({ render: true });
+    }, "number", PLACEHOLDERS.cutTime);
+    start.step = String(1 / 24);
+    essentials.body.append(field("Cut time", start));
+  }
+  appendShotTextField(essentials.body, "Action and state changes", shot, "action", 4);
+  appendShotTextField(essentials.body, "Subjects and positions", shot, "subjects");
+  appendShotTextField(essentials.body, "Environment", shot, "environment");
+  content.append(essentials.details);
+
+  const look = inspectorDetails("Composition and look", true);
+  appendShotTextField(look.body, "Composition and framing", shot, "composition");
+  appendShotTextField(look.body, "Lighting", shot, "lighting");
+  if (index > 0) look.body.append(field("Transition", textInput(shot.transition, value => { shot.transition = value; markProjectChanged(); }, "text", PLACEHOLDERS.transition)));
+  content.append(look.details);
+
+  const cameraSection = inspectorDetails("Camera", true);
+  const camera = shot.camera ||= { type: "Static Shot", amplitude: "default", speed: "default", target: "" };
+  cameraSection.body.append(
+    field("Movement", selectInput(state.config.camera_types, camera.type, value => { camera.type = value; markProjectChanged({ render: true }); })),
+    field("Strength", selectInput(["default", "small", "large"], camera.amplitude, value => { camera.amplitude = value; markProjectChanged(); })),
+    field("Speed", selectInput(["default", "slow", "fast"], camera.speed, value => { camera.speed = value; markProjectChanged(); })),
+    field("Target or reveal", textInput(camera.target, value => { camera.target = value; markProjectChanged(); }, "text", PLACEHOLDERS.cameraTarget)),
+  );
+  content.append(cameraSection.details);
+
+  const dialogue = inspectorDetails("Dialogue and voice");
+  renderDialogueEditor(dialogue.body, shot);
+  content.append(dialogue.details);
+
+  const sound = inspectorDetails("Sound and exact text");
+  sound.body.append(
+    field("Visible text", textArea((shot.visible_text || []).join("\n"), value => {
+      shot.visible_text = value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+      markProjectChanged();
+    }, 3, PLACEHOLDERS.visibleText), "One exact item per line."),
+    field("Synchronized sounds", textArea((shot.sounds || []).join("\n"), value => {
+      shot.sounds = value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+      markProjectChanged();
+    }, 3, PLACEHOLDERS.sounds), "One sound event per line."),
+  );
+  content.append(sound.details);
+
+  const projectSection = inspectorDetails("Whole production", true);
+  projectSection.body.append(
+    field("Visual style", textArea(project.document.style, value => { project.document.style = value; markProjectChanged(); }, 2, PLACEHOLDERS.style)),
+    field("Overall soundscape", textArea(project.document.overall_soundscape, value => { project.document.overall_soundscape = value; markProjectChanged(); }, 3, PLACEHOLDERS.soundscape)),
+    field("Non-diegetic music", textArea(project.document.non_diegetic_music, value => { project.document.non_diegetic_music = value; markProjectChanged(); }, 2, PLACEHOLDERS.music)),
+    checkControl("Complete silence", project.document.complete_silence, value => { project.document.complete_silence = value; markProjectChanged(); }),
+    field("Mode override", selectInput(state.config.modes.map(value => ({ value, label: value === "auto" ? "Automatic (recommended)" : value.toUpperCase() })), project.document.mode, value => {
+      project.document.mode = value;
+      markProjectChanged({ render: true });
+    }), "Automatic selects the correct MiniMax route from your media roles."),
+  );
+  content.append(projectSection.details);
+
+  if (project.document.shots.length > 1) content.append(button("Remove selected shot", removeSelectedShot, "psvstudio-button psvstudio-button-danger"));
+}
+
+function renderGenerations() {
+  const list = state.panel?.querySelector("#psvstudio-generation-list");
+  const project = activeProject();
+  if (!list) return;
+  list.replaceChildren();
+  if (!project?.generations?.length) {
+    list.append(el("div", "psvstudio-empty", "Generated videos and immutable replay snapshots will appear here."));
+    return;
+  }
+  for (const generation of project.generations) {
+    const card = el("article", "psvstudio-generation-card");
+    const media = el("div", "psvstudio-generation-media");
+    const output = generation.outputs?.[0];
+    if (output) {
+      const video = document.createElement("video");
+      video.controls = true;
+      video.preload = "metadata";
+      video.src = outputUrl(output);
+      media.append(video);
+    } else {
+      media.append(el("span", "", generation.status === "error" ? "Generation failed" : generation.status === "queued" ? "Waiting in queue…" : "Generating video…"));
+    }
+    const body = el("div", "psvstudio-generation-body");
+    const head = el("div", "psvstudio-generation-head");
+    head.append(
+      el("strong", "", generation.workflow_name || "Video workflow"),
+      el("span", "psvstudio-status-chip", generation.status),
+    );
+    head.lastElementChild.dataset.status = generation.status;
+    body.append(head, el("small", "psvstudio-help", `${String(generation.resolved_mode || "").toUpperCase()} · ${Number(generation.effective_duration || 0).toFixed(2)}s · ${generation.frame_count || 0} frames`));
+    if (["queued", "generating"].includes(generation.status)) {
+      const progress = state.generationProgress.get(String(generation.prompt_id)) || {};
+      const percent = Number.isFinite(progress.value) && Number.isFinite(progress.max) && progress.max > 0
+        ? Math.max(2, Math.min(100, progress.value / progress.max * 100))
+        : 12;
+      const bar = el("div", "psvstudio-progress");
+      const fill = el("span");
+      fill.style.setProperty("--progress", `${percent}%`);
+      bar.append(fill);
+      body.append(bar);
+    }
+    if (generation.error) body.append(el("div", "psvstudio-help", generation.error));
+    const actions = el("div", "psvstudio-inline");
+    actions.append(button("Replay exact", () => replayGeneration(generation)));
+    if (generation.compiled_prompt) actions.append(button("View prompt", () => showCompiledPrompt(generation.compiled_prompt)));
+    body.append(actions);
+    card.append(media, body);
+    list.append(card);
+  }
+}
+
+function showCompiledPrompt(prompt) {
+  const dialog = el("dialog", "psvstudio-prompt-dialog");
+  const title = el("h2", "", "Compiled MiniMax prompt");
+  const copy = document.createElement("textarea");
+  copy.readOnly = true;
+  copy.value = prompt;
+  copy.rows = 18;
+  const actions = el("div", "psvstudio-inline");
+  actions.append(
+    button("Copy", async () => {
+      await navigator.clipboard.writeText(prompt);
+      setStatus("Compiled prompt copied.", "ready");
+    }),
+    button("Close", () => dialog.close(), "psvstudio-button psvstudio-button-primary"),
+  );
+  dialog.append(title, copy, actions);
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  dialog.showModal();
+}
+
+async function compilePreview() {
+  const project = activeProject();
+  if (!project) return;
+  try {
+    const response = await api.fetchApi("/promptstudio-video/document/compile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document: project.document }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The prompt could not be compiled.");
+    showCompiledPrompt(data.compiled_prompt);
+  } catch (error) {
+    setStatus(error.message || String(error), "error");
+  }
+}
+
+function renderHeader() {
+  const project = activeProject();
+  const title = state.panel?.querySelector("#psvstudio-project-title");
+  const generate = state.panel?.querySelector("#psvstudio-generate");
+  const duplicate = state.panel?.querySelector("#psvstudio-duplicate");
+  const preview = state.panel?.querySelector("#psvstudio-compile-preview");
+  if (title) {
+    title.disabled = !project;
+    title.value = project?.name || "Prompt Studio Video";
+  }
+  if (generate) generate.disabled = !project || !state.workflows.length;
+  if (duplicate) duplicate.disabled = !project;
+  if (preview) preview.disabled = !project;
+  renderWorkflowSelect();
+}
+
+function renderAll() {
+  if (!state.panel) return;
+  state.panel.dataset.drawer = state.drawer;
+  renderProjectList();
+  renderHeader();
+  renderPreview();
+  renderBriefCard();
+  renderTimeline();
+  renderMediaLane();
+  renderInspector();
+  renderGenerations();
+}
+
+function buildPanel() {
+  if (state.panel) return state.panel;
+  const panel = el("section", "psvstudio-app");
+  panel.hidden = true;
+  panel.innerHTML = `
+    <aside class="psvstudio-sidebar">
+      <div class="psvstudio-brand">
+        <img class="psvstudio-brand-mark" src="./prompt-studio-video-icon.svg" alt="" aria-hidden="true">
+        <div><strong>Prompt Studio Video</strong><small>MiniMax H3 Director</small></div>
+      </div>
+      <div class="psvstudio-sidebar-header">
+        <h2>Projects</h2>
+        <button id="psvstudio-new-project" class="psvstudio-button psvstudio-button-primary" type="button">New</button>
+      </div>
+      <div id="psvstudio-project-list" class="psvstudio-project-list"></div>
+    </aside>
+    <main class="psvstudio-main">
+      <header class="psvstudio-topbar">
+        <button id="psvstudio-mobile-projects" class="psvstudio-button psvstudio-icon-button" type="button" title="Projects" aria-label="Projects">☰</button>
+        <input id="psvstudio-project-title" class="psvstudio-title-field" aria-label="Project name" placeholder="${PLACEHOLDERS.projectTitle}" />
+        <span id="psvstudio-save-state" class="psvstudio-save-state">Saved</span>
+        <span class="psvstudio-topbar-spacer"></span>
+        <select id="psvstudio-workflow" class="psvstudio-workflow-select" aria-label="Video workflow"></select>
+        <button id="psvstudio-refresh-workflows" class="psvstudio-button psvstudio-icon-button" type="button" title="Refresh [PSV] workflows" aria-label="Refresh [PSV] workflows">↻</button>
+        <label class="psvstudio-inline psvstudio-help"><input id="psvstudio-new-seed" type="checkbox" checked /> New seed</label>
+        <button id="psvstudio-compile-preview" class="psvstudio-button" type="button">Prompt</button>
+        <button id="psvstudio-duplicate" class="psvstudio-button" type="button">Duplicate</button>
+        <button id="psvstudio-mobile-inspector" class="psvstudio-button psvstudio-icon-button" type="button" title="Shot controls" aria-label="Shot controls">☷</button>
+      </header>
+      <div class="psvstudio-workspace">
+        <div class="psvstudio-editor-scroll">
+          <section class="psvstudio-stage">
+            <div id="psvstudio-preview" class="psvstudio-preview"></div>
+            <div id="psvstudio-brief-card" class="psvstudio-brief-card"></div>
+          </section>
+          <section class="psvstudio-generations">
+            <div class="psvstudio-section-heading"><h2>Generations</h2><small class="psvstudio-help">Each render keeps an exact workflow snapshot.</small></div>
+            <div id="psvstudio-generation-list" class="psvstudio-generation-list"></div>
+          </section>
+        </div>
+        <section class="psvstudio-timeline-card">
+          <div class="psvstudio-section-heading psvstudio-timeline-heading">
+            <div><h2>Timeline</h2><small class="psvstudio-help">Drop media anywhere · drag media to renumber references · drag shots to reorder · 24 fps snap</small></div>
+            <div class="psvstudio-timeline-tools">
+              <label class="psvstudio-zoom-control" title="Timeline zoom"><span>−</span><input id="psvstudio-timeline-zoom" type="range" min="36" max="160" step="4" value="80" aria-label="Timeline zoom" /><span>+</span></label>
+              <button id="psvstudio-fit-timeline" class="psvstudio-button" type="button">Fit</button>
+              <button id="psvstudio-add-media" class="psvstudio-button" type="button">Add media</button>
+              <button id="psvstudio-add-shot" class="psvstudio-button" type="button">Add shot</button>
+            </div>
+          </div>
+          <div id="psvstudio-shot-list" class="psvstudio-timeline-viewport"></div>
+          <div id="psvstudio-media-lane" class="psvstudio-media-lane" aria-label="Project media"></div>
+          <input id="psvstudio-media-input" class="psvstudio-sr-only" type="file" accept="image/*,video/*,audio/*" multiple />
+        </section>
+      </div>
+      <footer class="psvstudio-action-footer">
+        <div id="psvstudio-status" class="psvstudio-status" role="status" aria-live="polite">Loading Video Studio…</div>
+        <button id="psvstudio-generate" class="psvstudio-button psvstudio-button-primary" type="button">Generate</button>
+      </footer>
+    </main>
+    <aside class="psvstudio-inspector">
+      <div class="psvstudio-inspector-header"><h2 id="psvstudio-inspector-title">Shot controls</h2><button id="psvstudio-close-inspector" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close controls">×</button></div>
+      <div id="psvstudio-inspector-content" class="psvstudio-inspector-content"></div>
+    </aside>`;
+
+  panel.querySelector("#psvstudio-new-project").addEventListener("click", newProject);
+  panel.querySelector("#psvstudio-add-shot").addEventListener("click", addShot);
+  panel.querySelector("#psvstudio-add-media").addEventListener("click", () => panel.querySelector("#psvstudio-media-input").click());
+  panel.querySelector("#psvstudio-media-input").addEventListener("change", async event => {
+    await addMediaFiles(event.target.files);
+    event.target.value = "";
+  });
+  panel.querySelector("#psvstudio-fit-timeline").addEventListener("click", fitTimeline);
+  panel.querySelector("#psvstudio-timeline-zoom").addEventListener("input", event => {
+    state.timelineZoom = Number(event.target.value) || 80;
+    renderTimeline();
+  });
+  panel.querySelector("#psvstudio-generate").addEventListener("click", generateProject);
+  panel.querySelector("#psvstudio-duplicate").addEventListener("click", duplicateProject);
+  panel.querySelector("#psvstudio-compile-preview").addEventListener("click", compilePreview);
+  panel.querySelector("#psvstudio-refresh-workflows").addEventListener("click", () => refreshWorkflows());
+  panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
+    const project = activeProject();
+    if (!project) return;
+    project.workflow_id = event.target.value;
+    markProjectChanged();
+  });
+  panel.querySelector("#psvstudio-project-title").addEventListener("input", event => {
+    const project = activeProject();
+    if (!project) return;
+    project.name = event.target.value;
+    markProjectChanged();
+    renderProjectList();
+  });
+  panel.querySelector("#psvstudio-mobile-projects").addEventListener("click", () => {
+    state.drawer = state.drawer === "projects" ? "" : "projects";
+    panel.dataset.drawer = state.drawer;
+  });
+  panel.querySelector("#psvstudio-mobile-inspector").addEventListener("click", () => {
+    state.drawer = state.drawer === "inspector" ? "" : "inspector";
+    panel.dataset.drawer = state.drawer;
+  });
+  panel.querySelector("#psvstudio-close-inspector").addEventListener("click", () => {
+    state.drawer = "";
+    panel.dataset.drawer = "";
+  });
+  state.panel = panel;
+  document.body.append(panel);
+  installMediaDrop(document);
+  return panel;
+}
+
+function setupProgressEvents() {
+  const promptId = event => String(event?.detail?.prompt_id || event?.detail?.promptId || "");
+  api.addEventListener("execution_start", event => {
+    const id = promptId(event);
+    if (!generationByPromptId(id)) return;
+    touchGeneration(id);
+    updateGeneration(id, { status: "generating" });
+    state.generationProgress.set(id, { phase: "generating" });
+  });
+  api.addEventListener("progress", event => {
+    const id = promptId(event);
+    if (!generationByPromptId(id)) return;
+    touchGeneration(id);
+    state.generationProgress.set(id, {
+      phase: "generating",
+      value: Number(event.detail?.value),
+      max: Number(event.detail?.max),
+    });
+    renderGenerations();
+  });
+  for (const eventName of ["execution_error", "execution_interrupted"]) {
+    api.addEventListener(eventName, event => {
+      const id = promptId(event);
+      failGeneration(id, executionFailureMessage(eventName, event?.detail));
+    });
+  }
+  api.addEventListener("executing", event => {
+    const id = promptId(event);
+    if (generationByPromptId(id)) touchGeneration(id);
+  });
+  api.addEventListener("progress_state", event => {
+    const id = promptId(event);
+    if (generationByPromptId(id)) touchGeneration(id);
+  });
+  api.addEventListener("reconnecting", () => setApiConnected(false));
+  api.addEventListener("reconnected", () => setApiConnected(true));
+  api.addEventListener("status", event => setApiConnected(event.detail !== null));
+  setApiConnected(api.socket ? api.socket.readyState === WebSocket.OPEN : true);
+}
+
+async function attachStandalone(popup) {
+  if (!popup || popup.closed) return false;
+  try {
+    if (popup.location.origin !== window.location.origin) return false;
+  } catch (_) {
+    return false;
+  }
+  const mount = popup.document.querySelector("#promptstudio-video-mount");
+  if (!mount || !state.panel) return false;
+  state.popup = popup;
+  mount.replaceChildren(state.panel);
+  state.panel.hidden = false;
+  installMediaDrop(popup.document);
+  renderAll();
+  popup.addEventListener("beforeunload", () => {
+    if (state.panel?.ownerDocument !== document) document.body.append(state.panel);
+    state.panel.hidden = true;
+    clearMediaDrag(popup.document);
+    state.popup = null;
+    persistProjects({ immediate: true });
+  }, { once: true });
+  return true;
+}
+
+function setupStandaloneBridge() {
+  globalThis.__promptstudioVideoStudioHost = { attach: attachStandalone };
+  if (typeof BroadcastChannel !== "function") return;
+  const channel = new BroadcastChannel(CHANNEL_NAME);
+  channel.addEventListener("message", () => {
+    // Direct pages fall back to a private hidden ComfyUI host. Opened pages attach through window.opener.
+  });
+}
+
+function resumeGenerationPolling() {
+  for (const project of state.projects) {
+    for (const generation of project.generations || []) {
+      if (["queued", "generating"].includes(generation.status) && generation.prompt_id) pollGeneration(generation.prompt_id);
+    }
+  }
+}
+
+app.registerExtension({
+  name: EXTENSION_NAME,
+  async setup() {
+    buildPanel();
+    setupProgressEvents();
+    try {
+      await loadConfig();
+      await Promise.all([loadProjects(), loadWorkflowCache()]);
+      state.ready = true;
+      renderAll();
+      await refreshWorkflows({ announce: false });
+      if (!state.projects.length) setStatus("Create a video project to begin.", "ready");
+      else if (!state.workflows.length) setStatus("No [PSV] workflow found. Save the working workflow with a [PSV] filename prefix, then refresh.", "warning");
+      else setStatus("Video Studio is ready.", "ready");
+      resumeGenerationPolling();
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    }
+    setupStandaloneBridge();
+  },
+});

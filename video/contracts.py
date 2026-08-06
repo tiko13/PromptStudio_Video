@@ -15,6 +15,10 @@ FRAME_GRID = 17
 FRAME_REMAINDER = 5
 MIN_FRAME_COUNT = 5
 MAX_FRAME_COUNT = 3600
+CANVAS_MULTIPLE = 32
+DEFAULT_CANVAS_MEGAPIXELS = (768 * 1344) / 1_000_000
+MIN_CANVAS_MEGAPIXELS = 0.1
+MAX_CANVAS_MEGAPIXELS = 4.0
 
 BASE_MODES = {"t2va", "i2va", "fl2va", "l2va"}
 MODES = {"auto", *BASE_MODES, "ref2va"}
@@ -98,6 +102,36 @@ def _identifier(value, prefix):
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
+def _canonical_reference_tokens(value):
+    """Normalize legacy labels to MiniMax's guide-exact reference grammar."""
+    value = re.sub(
+        r"<\s*(Picture|Video|Audio|Subject|Shot)\s+(\d+)\s*>",
+        lambda match: (
+            f"[Shot {match.group(2)}]"
+            if match.group(1).casefold() == "shot"
+            else f"<{match.group(1).title()} {match.group(2)}>"
+        ),
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"<\s*(Picture|Video|Audio|Subject|Shot)\s*(\d+)\s*>",
+        lambda match: (
+            f"[Shot {match.group(2)}]"
+            if match.group(1).casefold() == "shot"
+            else f"<{match.group(1).title()} {match.group(2)}>"
+        ),
+        value,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\[\s*Shot\s+(\d+)\s*\]",
+        lambda match: f"[Shot {match.group(1)}]",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
 def align_frame_count(frame_count):
     """Snap upward to MiniMax H3's 17k+5 temporal grid."""
     count = max(MIN_FRAME_COUNT, int(round(_number(frame_count, MIN_FRAME_COUNT))))
@@ -124,6 +158,29 @@ def effective_duration(document_or_seconds):
     return frame_count_for_duration(seconds) / FPS
 
 
+def adapt_canvas(width, height, target_megapixels=DEFAULT_CANVAS_MEGAPIXELS):
+    """Preserve a source ratio near the Studio's 1 MP target on MiniMax's grid."""
+    width = _number(width)
+    height = _number(height)
+    if width <= 0 or height <= 0:
+        raise PromptDocumentError("Canvas source dimensions must be positive")
+    target_megapixels = min(
+        MAX_CANVAS_MEGAPIXELS,
+        max(MIN_CANVAS_MEGAPIXELS, _number(target_megapixels, DEFAULT_CANVAS_MEGAPIXELS)),
+    )
+    scale = math.sqrt((target_megapixels * 1_000_000) / (width * height))
+    nominal_width = width * scale
+    nominal_height = height * scale
+    return (
+        max(CANVAS_MULTIPLE, round(nominal_width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+        max(CANVAS_MULTIPLE, round(nominal_height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+    )
+
+
+def _canvas_dimension(value, default):
+    return max(CANVAS_MULTIPLE, round(_number(value, default) / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+
+
 def _normalize_reference(reference, index):
     if not isinstance(reference, dict):
         raise PromptDocumentError(f"Reference {index + 1} must be an object")
@@ -148,7 +205,7 @@ def _normalize_reference(reference, index):
         "name": _text(reference.get("name") or reference.get("path"), f"Reference {index + 1}"),
         "roles": list(dict.fromkeys(roles)),
         "prompt": _text(reference.get("prompt")),
-        "label": _text(reference.get("label")),
+        "label": _canonical_reference_tokens(_text(reference.get("label"))),
         "trim_start": max(0.0, _number(reference.get("trim_start"), 0.0)),
         "trim_end": (
             max(0.0, _number(reference.get("trim_end")))
@@ -156,6 +213,8 @@ def _normalize_reference(reference, index):
             else None
         ),
         "use_embedded_audio": bool(reference.get("use_embedded_audio", False)),
+        "source_width": max(0, int(_number(reference.get("source_width"), 0))),
+        "source_height": max(0, int(_number(reference.get("source_height"), 0))),
     }
 
 
@@ -247,8 +306,14 @@ def resolve_mode(document):
 def _normalize_subject_definition(item, index):
     if not isinstance(item, dict):
         raise PromptDocumentError(f"Subject definition {index + 1} must be an object")
+    raw_label = _text(item.get("label"), f"Subject {index + 1}").strip("<>")
+    match = re.fullmatch(r"(Subject|Picture|Video|Audio)\s*(\d+)", raw_label, re.IGNORECASE)
+    if not match:
+        raise PromptDocumentError(
+            f"Subject definition {index + 1} must use a Subject, Picture, Video, or Audio label"
+        )
     return {
-        "label": _text(item.get("label"), f"<Subject {index + 1}>").strip("<>"),
+        "label": f"{match.group(1).title()} {match.group(2)}",
         "text": _text(item.get("text")),
     }
 
@@ -260,8 +325,8 @@ def _normalize_retention(item, index):
     if relationship not in VISUAL_RETENTION | AUDIO_RETENTION:
         raise PromptDocumentError(f"Retention entry {index + 1} has an invalid relationship")
     return {
-        "label": _text(item.get("label")),
-        "where": _text(item.get("where")),
+        "label": _canonical_reference_tokens(_text(item.get("label"))),
+        "where": _canonical_reference_tokens(_text(item.get("where"))),
         "relationship": relationship,
         "detail": _text(item.get("detail")),
     }
@@ -291,8 +356,7 @@ def normalize_document(value):
     label_names = {"image": "Picture", "video": "Video", "audio": "Audio"}
     for reference in references:
         label_counts[reference["kind"]] += 1
-        if not reference["label"]:
-            reference["label"] = f"<{label_names[reference['kind']]} {label_counts[reference['kind']]}>"
+        reference["label"] = f"<{label_names[reference['kind']]} {label_counts[reference['kind']]}>"
     shots = [
         _normalize_shot(shot, index)
         for index, shot in enumerate(value.get("shots") or [{}])
@@ -312,9 +376,18 @@ def normalize_document(value):
         "version": DOCUMENT_VERSION,
         "mode": _text(value.get("mode"), "auto").lower(),
         "duration_seconds": duration,
-        "width": max(32, int(_number(value.get("width"), 1344)) // 32 * 32),
-        "height": max(32, int(_number(value.get("height"), 768)) // 32 * 32),
+        "width": _canvas_dimension(value.get("width"), 1344),
+        "height": _canvas_dimension(value.get("height"), 768),
+        "target_megapixels": min(
+            MAX_CANVAS_MEGAPIXELS,
+            max(
+                MIN_CANVAS_MEGAPIXELS,
+                _number(value.get("target_megapixels"), DEFAULT_CANVAS_MEGAPIXELS),
+            ),
+        ),
+        "canvas_reference_id": _text(value.get("canvas_reference_id")),
         "ref_image_size": _text(value.get("ref_image_size"), "match").lower(),
+        "main_description": _text(value.get("main_description")),
         "style": _text(value.get("style"), "Live-action, cinematic"),
         "shots": shots,
         "references": references,
@@ -337,6 +410,20 @@ def normalize_document(value):
     }
     if document["ref_image_size"] not in {"match", "max"}:
         raise PromptDocumentError("Reference image size must be 'match' or 'max'")
+    reference_ids = {reference["id"] for reference in references}
+    if document["canvas_reference_id"] not in reference_ids:
+        document["canvas_reference_id"] = ""
+    elif document["canvas_reference_id"]:
+        canvas_reference = next(
+            reference for reference in references
+            if reference["id"] == document["canvas_reference_id"]
+        )
+        if canvas_reference["source_width"] and canvas_reference["source_height"]:
+            document["width"], document["height"] = adapt_canvas(
+                canvas_reference["source_width"],
+                canvas_reference["source_height"],
+                document["target_megapixels"],
+            )
     document["resolved_mode"] = resolve_mode(document)
     roles = {role for reference in references for role in reference["roles"]}
     first_count = sum("first_frame" in reference["roles"] for reference in references)
@@ -376,6 +463,7 @@ def default_document():
         "duration_seconds": 5,
         "width": 1344,
         "height": 768,
+        "main_description": "",
         "style": "Live-action, cinematic",
         "shots": [{
             "id": "shot-1",

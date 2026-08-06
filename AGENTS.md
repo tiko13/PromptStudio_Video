@@ -21,6 +21,17 @@ only receive capability detection, settings, and navigation integration.
   prompt deterministically from that document.
 - Preserve dialogue, lyrics, and visible text verbatim.
 
+## Authoritative prompting guide
+
+- The MiniMax H3 video prompting guide is:
+  `https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md`
+- Always read and adhere to this guide when designing or changing prompt
+  building, compilation, generation, refinement, editor fields, examples,
+  placeholders, or any other prompt-related behavior.
+- Treat the guide as the source of truth for task modes, prompt structure,
+  timelines and cuts, camera motion, dialogue and voiceover, visible text,
+  soundscape, music, and reference-frame alignment.
+
 ## Checks
 
 - Python syntax:
