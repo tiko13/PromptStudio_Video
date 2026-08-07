@@ -500,6 +500,7 @@ function renderDirectorAttachments() {
   container.classList.toggle("is-empty", !session.draft_attachments.length);
   if (!session.draft_attachments.length) {
     container.append(el("small", "", "Drop or paste images here, or use Add image. Choose whether each image is visual context only or a MiniMax reference."));
+    renderDirectorReferenceGuide();
     return;
   }
   for (const attachment of session.draft_attachments) {
@@ -528,6 +529,85 @@ function renderDirectorAttachments() {
     card.append(image, details, remove);
     container.append(card);
   }
+  renderDirectorReferenceGuide();
+}
+
+function insertDirectorReferenceToken(token) {
+  const input = state.directorDialog?.querySelector("#psvstudio-director-input");
+  if (!input) return;
+  const start = Number.isFinite(input.selectionStart) ? input.selectionStart : input.value.length;
+  const end = Number.isFinite(input.selectionEnd) ? input.selectionEnd : start;
+  const prefix = start > 0 && !/\s$/.test(input.value.slice(0, start)) ? " " : "";
+  const suffix = end < input.value.length && !/^\s/.test(input.value.slice(end)) ? " " : "";
+  input.setRangeText(`${prefix}${token}${suffix}`, start, end, "end");
+  input.focus();
+}
+
+function renderDirectorReferenceGuide() {
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  const container = dialog?.querySelector("#psvstudio-director-reference-list");
+  const guidance = dialog?.querySelector("#psvstudio-director-reference-guidance");
+  if (!dialog || !project || !container || !guidance) return;
+  const references = project.document.references || [];
+  const draftAttachments = directorSession(project.id).draft_attachments || [];
+  const items = references.map(reference => {
+    const draft = draftAttachments.find(attachment =>
+      attachment.reference_id === reference.id
+      || (reference.kind === "image" && attachment.path === reference.path));
+    return {
+      token: `<${referenceDisplayLabel(references, reference)}>`,
+      path: reference.path,
+      kind: reference.kind,
+      name: reference.name || reference.path || "Media",
+      role: draft?.usage || (reference.roles || [])[0] || "reference",
+    };
+  });
+  for (const attachment of draftAttachments) {
+    if (attachment.usage === "describe") continue;
+    const committed = references.some(reference =>
+      reference.id === attachment.reference_id
+      || (reference.kind === "image" && reference.path === attachment.path));
+    if (committed) continue;
+    items.push({
+      token: `<${directorAttachmentDisplayLabel(project, attachment, draftAttachments)}>`,
+      path: attachment.path,
+      kind: "image",
+      name: attachment.name || attachment.path || "Image",
+      role: attachment.usage,
+    });
+  }
+
+  container.replaceChildren();
+  if (!items.length) {
+    container.append(el("div", "psvstudio-director-reference-empty", "No named references yet. Add an image and choose a reference role."));
+    guidance.textContent = "Natural descriptive language is enough when no MiniMax reference is active.";
+    return;
+  }
+  for (const item of items) {
+    const card = button("", () => insertDirectorReferenceToken(item.token), "psvstudio-director-reference-card");
+    card.title = `Insert ${item.token} into the Director instruction`;
+    card.setAttribute("aria-label", `${item.token}, ${item.name}. Insert reference label.`);
+    const url = mediaInputUrl({ path: item.path });
+    if (item.kind === "image" && url) {
+      const thumbnail = dialog.ownerDocument.createElement("img");
+      thumbnail.src = url;
+      thumbnail.alt = "";
+      thumbnail.loading = "lazy";
+      card.append(thumbnail);
+    } else {
+      card.append(el("span", "psvstudio-director-reference-kind", item.kind === "video" ? "VID" : "AUD"));
+    }
+    const roleOptions = item.kind === "image" ? DIRECTOR_IMAGE_USAGES : referenceRoleOptions(item.kind);
+    const roleLabel = roleOptions.find(option => option.value === item.role)?.label || item.role;
+    const details = el("span", "psvstudio-director-reference-details");
+    details.append(el("strong", "", item.token), el("small", "", item.name), el("em", "", roleLabel));
+    card.append(details);
+    container.append(card);
+  }
+  guidance.textContent = items.length === 1
+    ? `One reference is unambiguous: natural wording works, or click ${items[0].token} to insert its exact label.`
+    : "Multiple references are active. Use the exact labels below so the Director knows which subject, scene, style, or frame you mean.";
 }
 
 function directorImageFile(file) {
@@ -647,6 +727,11 @@ function renderDirectorDialog() {
   input.placeholder = projectScope
     ? "Ask about the whole video or request a multi-shot composition…"
     : "Ask about this shot or request a concrete revision…";
+  if ((project.document.references || []).length > 1) {
+    input.placeholder = projectScope
+      ? "Describe the whole video using exact labels such as <Picture 1> and <Picture 2>."
+      : "Revise this shot using exact labels such as <Picture 1> and <Picture 2>.";
+  }
   const history = dialog.querySelector("#psvstudio-director-history");
   history.replaceChildren();
   const session = directorSession(project.id);
@@ -793,12 +878,20 @@ function ensureDirectorDialog() {
   dialog.className = "psvstudio-director-dialog";
   dialog.innerHTML = `
     <header><div class="psvstudio-director-heading"><h2 id="psvstudio-director-title">Director</h2><small id="psvstudio-director-subtitle">Context-efficient selected-shot consultation</small></div><div class="psvstudio-director-header-actions"><button id="psvstudio-director-clear" class="psvstudio-button" type="button">Clear</button><button id="psvstudio-director-close" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close Director">×</button></div></header>
-    <div id="psvstudio-director-history" class="psvstudio-director-history"></div>
+    <div class="psvstudio-director-workspace">
+      <aside class="psvstudio-director-reference-guide" aria-label="Named Director references">
+        <div><strong>Named media</strong><small id="psvstudio-director-reference-guidance"></small></div>
+        <div id="psvstudio-director-reference-list" class="psvstudio-director-reference-list"></div>
+      </aside>
+      <div class="psvstudio-director-conversation">
+        <div id="psvstudio-director-history" class="psvstudio-director-history"></div>
     <div class="psvstudio-director-composer">
       <div id="psvstudio-director-attachments" class="psvstudio-director-attachments is-empty"></div>
       <textarea id="psvstudio-director-input" rows="3" placeholder="Ask about this shot or request a concrete revision…"></textarea>
       <div class="psvstudio-director-composer-actions"><small id="psvstudio-director-status">Only the selected shot is in write scope.</small><div class="psvstudio-inline"><button id="psvstudio-director-add-image" class="psvstudio-button" type="button">Add image</button><button id="psvstudio-director-send" class="psvstudio-button psvstudio-button-primary" type="button">Ask Director</button></div></div>
       <input id="psvstudio-director-image-input" class="psvstudio-sr-only" type="file" accept="image/*" multiple />
+      </div>
+    </div>
     </div>
     <details class="psvstudio-director-settings"><summary>Local LLM and context settings</summary><div class="psvstudio-director-settings-grid">
       <label><span>Provider</span><select id="psvstudio-director-provider"><option value="koboldcpp">KoboldCpp</option><option value="ollama">Ollama</option></select></label>

@@ -64,6 +64,8 @@ class DirectorTests(unittest.TestCase):
             self.assertNotIn("shoulder-length wavy black hair", system_message)
             self.assertNotIn("teal linen blouse", system_message)
             self.assertIn("observed_visual_facts", system_message)
+            self.assertIn("When exactly one compatible reference exists", system_message)
+            self.assertIn("When multiple compatible references exist, never guess", system_message)
 
     def test_vision_grounding_contract_is_reference_role_focused(self):
         self.assertIn("Follow assigned_usage strictly", VISION_GROUNDING_SYSTEM_MESSAGE)
@@ -225,6 +227,112 @@ class DirectorTests(unittest.TestCase):
         }
 
         self.assertFalse(_preserve_reference_only_request(request))
+
+    def test_reference_story_request_is_not_misclassified_as_reference_assignment(self):
+        request = {
+            "attachments": [{"path": "woman.png", "usage": "subject"}],
+            "messages": [{
+                "role": "user",
+                "content": "Create a single continuous shot of the girl from the reference picture dancing joyfully in the rain.",
+            }],
+        }
+
+        self.assertFalse(_preserve_reference_only_request(request))
+
+    def test_reference_definition_with_empty_where_is_grounded_into_single_shot(self):
+        value = director_document()
+        value["shots"] = [value["shots"][0]]
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "woman.png",
+            "name": "Woman", "roles": ["subject"],
+        }]
+        document = normalize_document(value)
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Create the rain dance",
+            "operations": [
+                {"op": "update_project", "fields": {
+                    "task_types": ["reference generation"],
+                    "subject_definitions": [{
+                        "label": "Subject 1",
+                        "text": "is the blonde woman in <Picture 1>, wearing a white dress.",
+                    }],
+                    "summary": "The video follows <Subject 1> dancing in the rain.",
+                    "retention_analysis": [{
+                        "label": "<Subject 1>", "where": "",
+                        "relationship": "fully_preserved",
+                        "detail": "Her blonde hair and white dress remain consistent.",
+                    }],
+                }},
+                {"op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "subjects": "The girl stands in the rain.",
+                    "action": "She spins and smiles brightly.",
+                }},
+            ],
+        }
+
+        result = preview_changeset(document, proposal)
+
+        self.assertIn("<Subject 1>", result["document"]["shots"][0]["subjects"])
+        self.assertIn("<Subject 1>", result["compiled_prompt"])
+
+    def test_director_synthesizes_grounded_reference_package_when_model_omits_it(self):
+        value = director_document()
+        value["shots"] = [value["shots"][0]]
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "woman.png",
+            "name": "Woman", "roles": ["subject"],
+        }]
+        document = normalize_document(value)
+        response = (
+            "Create a single continuous rain-dance shot.\n"
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Create the rain dance","operations":['
+            '{"op":"update_project","fields":{"main_description":"A girl dances joyfully in the rain."}},'
+            '{"op":"update_shot","shot_id":"shot-1","fields":{'
+            '"composition":"A full-body continuous shot.","subjects":"The girl stands in rainfall.",'
+            '"environment":"A rain-soaked open space.","lighting":"Soft overcast daylight.",'
+            '"action":"She spins and smiles brightly.","sounds":["Rainfall and splashing footsteps."]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        attachments = [{
+            "id": "attachment-1", "path": "woman.png", "name": "Woman",
+            "usage": "subject", "reference_id": "reference-1",
+            "source_width": 768, "source_height": 1024,
+        }]
+        observations = [{
+            "index": 1,
+            "attachment_id": "attachment-1",
+            "source_name": "Woman",
+            "usage": "subject",
+            "observations": "A girl with long blonde hair wears a bright yellow raincoat and black boots.",
+        }]
+        with patch("video.director.load_vision_images", return_value=(attachments, [{}])), patch(
+            "video.director._ground_vision_images", return_value=observations
+        ), patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "thinking_mode": "High",
+                "messages": [{
+                    "role": "user",
+                    "content": "Create a single continuous shot of the girl dancing in the rain.",
+                }],
+                "attachments": [{"path": "woman.png", "usage": "subject"}],
+            })
+
+        self.assertIsNotNone(result["proposal"], result["proposal_error"])
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            result["proposal"]["base_document_hash"],
+            document_fingerprint(document),
+        )
+        preview = preview_changeset(document, result["proposal"])
+        self.assertEqual(preview["document"]["subject_definitions"][0]["label"], "Subject 1")
+        self.assertIn("long blonde hair", preview["document"]["subject_definitions"][0]["text"])
+        self.assertIn("<Picture 1>", preview["document"]["subject_definitions"][0]["text"])
+        self.assertIn("<Subject 1>", preview["document"]["shots"][0]["subjects"])
 
     def test_context_keeps_selected_neighbors_and_bounds_history(self):
         messages = []

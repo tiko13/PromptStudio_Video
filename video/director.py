@@ -68,6 +68,8 @@ Allowed shot fields: composition, subjects, environment, lighting, action, trans
 
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context. When a referenced image supplies a person, object, scene, style, action, pose, or camera treatment, define reusable visible content as <Subject N> sourced from its <Picture N>, add it to summary and retention_analysis, and use <Subject N> naturally in every affected shot. A Picture used only as the source of a Subject does not get a separate Picture definition or retention line. A storyboard or concrete keyframe may be defined directly as <Picture N>. Every source reference must be represented in subject_definitions, and every defined label must have one retention_analysis entry and appear in the summary and applicable shot/audio fields.
 
+When exactly one compatible reference exists, resolve natural phrases such as "the girl from the reference" to that supplied source and still emit its canonical Subject and Picture tokens. When multiple compatible references exist, never guess which one words such as "the girl," "the image," or "the reference" mean; follow the exact <Picture N>, <Video N>, or <Audio N> labels in the request and keep each assignment distinct.
+
 Reference project fields use these shapes: task_types is a string array; subject_definitions is an array of objects with label and text; summary is a string; retention_analysis is an array of objects with label, where, relationship, and detail. For visual retention, relationship must be exactly fully_preserved, partially_preserved, attribute_transfer, or weak_reference. For audio retention, relationship must be exactly fully_copy, partially_copy, reference, or weak_reference. A subject definition must copy concrete facts from the matching attached image's observed_visual_facts in the current production context and cite its source token. Never invent, generalize, or replace those grounded facts. Never write placeholders or stand-ins such as "observed traits," "visible traits," "identity traits," "specific traits," or "concrete traits." Repeat the actual grounded features in the affected shot fields and retention detail.
 
 When images are attached, inspect only visible details and follow each attachment's usage. An image marked describe is visual context only: transfer useful visible details into descriptive shot fields without claiming it is a MiniMax reference. Other usages correspond to project reference roles and include a canonical token when committed. Clearly separate observation from inference. If the request only assigns or repairs a reference role, preserve the existing action, environment, lighting, composition, camera, sounds, dialogue, and visible text while adding reference labels and observed traits. Do not replace the established story or action. Do not change timing, duration, shot order, IDs, references, dialogue, lyrics, speaker IDs, or visible text. Preserve established subjects, screen direction, props, wardrobe, environment, and action state. Treat dialogue and visible text in the context as immutable exact strings. Keep proposed prose concrete, audiovisual, and feasible within the selected shot's time budget. Do not reproduce the whole document or compiled MiniMax prompt."""
@@ -93,6 +95,8 @@ Allowed project fields: main_description, style, overall_soundscape, non_diegeti
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context and preserve them verbatim. When the project resolves to REF2VA, always populate all six guide sections through the structured document: task_types and summary, subject_definitions, retention_analysis, detailed shot fields, overall_soundscape, and non_diegetic_music. For generation tasks, make the compiled detailed description approximately 350–500 English words by giving every shot concrete composition, subject appearance and position, environment, lighting, action/state changes, camera movement, and synchronized sound.
 
 For each image/video visual reference used as a person, object, scene, style, action, pose, or camera treatment, define one reusable <Subject N> and cite its source token in the definition. A source image used only to define a Subject is cited inside that Subject definition, not defined separately. Define a <Picture N> directly only for a storyboard or concrete keyframe/composition anchor. Define editing/continuation sources as <Video N> and audio sources as <Audio N>. Every source reference must be represented in subject_definitions; every defined label must appear in summary, have exactly one retention_analysis entry, and be used naturally in every applicable shot or audio section. With multiple references, keep their numbering and meanings distinct. With multiple shots, repeat the same Subject labels and concrete identity traits wherever they reappear.
+
+When exactly one compatible reference exists, resolve natural phrases such as "the girl from the reference" to that supplied source and still emit its canonical Subject and Picture tokens. When multiple compatible references exist, never guess which one words such as "the girl," "the image," or "the reference" mean; follow the exact <Picture N>, <Video N>, or <Audio N> labels in the request and keep each assignment distinct.
 
 Reference project fields use these shapes: task_types is a string array; subject_definitions is an array of objects with label and text; summary is a string; retention_analysis is an array of objects with label, where, relationship, and detail. For visual retention, relationship must be exactly fully_preserved, partially_preserved, attribute_transfer, or weak_reference. For audio retention, relationship must be exactly fully_copy, partially_copy, reference, or weak_reference. A subject definition must copy concrete facts from the matching attached image's observed_visual_facts in the current production context and cite its source token. Never invent, generalize, or replace those grounded facts. Never write placeholders or stand-ins such as "observed traits," "visible traits," "identity traits," "specific traits," or "concrete traits." Repeat the actual grounded features in every affected shot and retention detail.
 
@@ -1156,6 +1160,176 @@ def _enrich_reference_definition_placeholders(proposal, message):
     return proposal
 
 
+def _reference_observations_by_id(document, data):
+    """Map committed reference ids to facts from the dedicated vision pass."""
+    attachments = normalize_attachments(data.get("attachments"))
+    observations = data.get("_vision_observations")
+    observations = observations if isinstance(observations, list) else []
+    by_attachment_id = {
+        _text(item.get("attachment_id"), 100): _text(
+            item.get("observations"), VISION_GROUNDING_MAX_CHARS
+        )
+        for item in observations
+        if isinstance(item, dict) and _text(item.get("observations"), VISION_GROUNDING_MAX_CHARS)
+    }
+    result = {}
+    for index, attachment in enumerate(attachments):
+        if attachment["usage"] == "describe":
+            continue
+        reference = next(
+            (
+                item for item in document.get("references") or []
+                if item["id"] == attachment["reference_id"]
+                or (not attachment["reference_id"] and item["path"] == attachment["path"])
+            ),
+            None,
+        )
+        if not reference:
+            continue
+        facts = by_attachment_id.get(attachment["id"], "")
+        if not facts and index < len(observations) and isinstance(observations[index], dict):
+            facts = _text(observations[index].get("observations"), VISION_GROUNDING_MAX_CHARS)
+        if facts:
+            result[reference["id"]] = facts
+    return result
+
+
+def _derived_reference_label(reference):
+    source_token = _text(reference.get("label"), 80)
+    roles = set(reference.get("roles") or [])
+    derived_roles = {"subject", "scene", "style", "action", "pose", "camera"}
+    if reference.get("kind") != "image" or not roles & derived_roles:
+        return source_token.strip("<>")
+    ordinal = re.search(r"(\d+)", source_token)
+    return f"Subject {ordinal.group(1)}" if ordinal else source_token.strip("<>")
+
+
+def _reference_role_description(reference):
+    roles = set(reference.get("roles") or [])
+    if "subject" in roles:
+        return "referenced subject"
+    if "scene" in roles:
+        return "referenced scene"
+    if "style" in roles:
+        return "referenced visual style"
+    if roles & {"action", "pose"}:
+        return "referenced action and pose"
+    if "camera" in roles:
+        return "referenced camera treatment"
+    if roles & {"storyboard", "first_frame", "last_frame"}:
+        return "referenced visual anchor"
+    if reference.get("kind") == "video":
+        return "referenced video source"
+    if reference.get("kind") == "audio":
+        return "referenced audio source"
+    return "referenced source"
+
+
+def _complete_grounded_reference_semantics(document, proposal, data):
+    """Complete an otherwise applicable REF2VA proposal from committed, grounded inputs.
+
+    The model remains responsible for the production prose. This repair only restores
+    the structural reference package that the compiler requires, using source tokens,
+    assigned roles, and facts produced by the separate vision pass.
+    """
+    if document.get("resolved_mode") != "ref2va" or not document.get("references"):
+        return proposal
+    proposal = copy.deepcopy(proposal)
+    semantic = {
+        "task_types": copy.deepcopy(document.get("task_types") or []),
+        "subject_definitions": copy.deepcopy(document.get("subject_definitions") or []),
+        "summary": _text(document.get("summary"), 8_000),
+        "retention_analysis": copy.deepcopy(document.get("retention_analysis") or []),
+    }
+    for operation in proposal.get("operations") or []:
+        if operation.get("op") != "update_project":
+            continue
+        fields = operation.get("fields") or {}
+        for name in semantic:
+            if name in fields:
+                semantic[name] = copy.deepcopy(fields[name])
+
+    facts_by_id = _reference_observations_by_id(document, data)
+    required_tokens = []
+    for reference in document["references"]:
+        source_token = _text(reference.get("label"), 80)
+        label = _derived_reference_label(reference)
+        token = f"<{label.strip('<>')}>"
+        required_tokens.append(token)
+        definition = next(
+            (
+                item for item in semantic["subject_definitions"]
+                if source_token.casefold() in _text(item.get("text"), 8_000).casefold()
+                or f"<{_text(item.get('label'), 80).strip('<>')}>".casefold()
+                in {source_token.casefold(), token.casefold()}
+            ),
+            None,
+        )
+        facts = facts_by_id.get(reference["id"], "")
+        if not facts:
+            facts = _text(reference.get("prompt"), VISION_GROUNDING_MAX_CHARS)
+        role_description = _reference_role_description(reference)
+        if definition is None:
+            detail = f": {facts.rstrip(' .')}" if facts else ""
+            definition = {
+                "label": label,
+                "text": f"is the {role_description} sourced from {source_token}{detail}.",
+            }
+            semantic["subject_definitions"].append(definition)
+        else:
+            definition["label"] = label
+            definition_text = _text(definition.get("text"), 8_000).rstrip()
+            if source_token.casefold() not in definition_text.casefold():
+                definition_text = f"{definition_text} Source reference: {source_token}.".strip()
+            definition["text"] = definition_text
+
+        retention = next(
+            (
+                item for item in semantic["retention_analysis"]
+                if _text(item.get("label"), 80).casefold()
+                in {source_token.casefold(), token.casefold()}
+            ),
+            None,
+        )
+        roles = set(reference.get("roles") or [])
+        if reference.get("kind") == "audio":
+            relationship = "fully_copy" if "audio_copy" in roles else "reference"
+        elif roles & {"style", "action", "pose", "camera"} and "subject" not in roles:
+            relationship = "attribute_transfer"
+        else:
+            relationship = "fully_preserved"
+        if retention is None:
+            retention = {
+                "label": token,
+                "where": "throughout the video",
+                "relationship": relationship,
+                "detail": facts or f"The assigned {role_description} remains consistent.",
+            }
+            semantic["retention_analysis"].append(retention)
+        else:
+            retention["label"] = token
+            if not _text(retention.get("where"), 2_000):
+                retention["where"] = "throughout the video"
+            if not _text(retention.get("detail"), 8_000):
+                retention["detail"] = facts or f"The assigned {role_description} remains consistent."
+
+    for task in document.get("task_types") or ["reference generation"]:
+        if task not in semantic["task_types"]:
+            semantic["task_types"].append(task)
+    if not semantic["summary"]:
+        semantic["summary"] = "The target video uses " + ", ".join(required_tokens) + "."
+    semantic_updates = [
+        operation for operation in proposal.get("operations") or []
+        if operation.get("op") == "update_project"
+        and set(operation.get("fields") or {}) & (PROJECT_REFERENCE_FIELDS | {"summary"})
+    ]
+    if semantic_updates:
+        semantic_updates[-1]["fields"].update(semantic)
+    else:
+        proposal["operations"].append({"op": "update_project", "fields": semantic})
+    return proposal
+
+
 def _ground_reference_definitions(document):
     """Repeat concrete reference traits in every shot named by retention analysis."""
     references = {item["label"].casefold(): item for item in document.get("references") or []}
@@ -1208,6 +1382,15 @@ def _ground_reference_definitions(document):
                 index for index, shot in enumerate(document.get("shots") or [])
                 if token.casefold() in json.dumps(shot, ensure_ascii=False).casefold()
             }
+        if not shot_indexes:
+            shot_indexes = set(range(len(document.get("shots") or [])))
+        retention_item = retention.get(token.casefold())
+        if retention_item is not None and not re.search(
+            r"\[\s*Shot\s+\d+\s*\]", _text(retention_item.get("where"), 2_000), re.IGNORECASE
+        ):
+            retention_item["where"] = "appears in " + " and ".join(
+                f"[Shot {index + 1}]" for index in sorted(shot_indexes)
+            )
         sentence = f"{token} {text}".strip()
         for index in sorted(shot_indexes):
             if not 0 <= index < len(document.get("shots") or []):
@@ -1593,7 +1776,12 @@ def _preserve_reference_only_request(data):
     explicit_preservation = re.search(r"\b(preserve|keep|retain|do not change|don't change)\b", content, re.IGNORECASE)
     simple_assignment = (
         len(content) <= 180
-        and re.search(r"\b(reference|identity)\b", content, re.IGNORECASE)
+        and re.search(
+            r"(?:\b(?:use|set|assign|treat|make)\b.{0,80}\b(?:as|the)\b.{0,40}\b(?:reference|identity)\b|"
+            r"\b(?:identity|subject|scene|style)\s+reference\b)",
+            content,
+            re.IGNORECASE,
+        )
         and not re.search(
             r"\b(add|remove|split|replace|rewrite|change)\s+(?:the\s+)?(action|story|scene|shot|timing|camera|sound|music)\b",
             content,
@@ -1799,6 +1987,9 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             parsed["proposal"], parsed.get("message", "")
         )
         if request_data:
+            parsed["proposal"] = _complete_grounded_reference_semantics(
+                document, parsed["proposal"], request_data
+            )
             parsed["proposal"] = _restrict_reference_only_proposal(
                 document, parsed["proposal"], request_data
             )
