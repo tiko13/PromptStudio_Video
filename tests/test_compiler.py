@@ -32,6 +32,12 @@ def base_document(**overrides):
 
 
 class CompilerTests(unittest.TestCase):
+    def test_manual_prompt_override_is_exact_and_can_be_ignored_for_rebuild(self):
+        value = base_document(prompt_override="CUSTOM PROMPT\n\nwith exact formatting")
+        self.assertEqual(compile_prompt(value), "CUSTOM PROMPT\n\nwith exact formatting")
+        rebuilt = compile_prompt(value, use_override=False)
+        self.assertTrue(rebuilt.startswith("integrated_multimodal_description:"))
+
     def test_t2va_has_three_core_fields_and_no_alignment_instruction(self):
         prompt = compile_prompt(base_document())
         self.assertTrue(prompt.startswith("integrated_multimodal_description: [Shot 1]"))
@@ -246,6 +252,12 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("says in an off-screen voiceover", prompt)
         self.assertIn("<cutoff></d>", prompt)
         self.assertIn("lips remain completely closed", prompt)
+
+    def test_singing_uses_the_dialogue_block_and_singing_verb(self):
+        value = base_document()
+        value["shots"][0]["dialogue"][0].update({"performance": "singing", "text": "Keep the light on!"})
+        prompt = compile_prompt(value)
+        self.assertIn("(S1) sings: <d>[English] Keep the light on!</d>", prompt)
 
     def test_shot_steps_compile_in_their_exact_chronological_order(self):
         value = base_document()

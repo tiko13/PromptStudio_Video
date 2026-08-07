@@ -55,6 +55,10 @@ const PLACEHOLDERS = Object.freeze({
   delivery: "in a quiet, breathy voice at a restrained pace",
   visibleText: "Next stop: Central Station",
   sounds: "Rain ticks against the window\nPaper rustles softly in her hands",
+  referenceSummary: "The target video uses <Subject 1> consistently throughout [Shot 1].",
+  subjectDefinition: "is the person sourced from <Picture 1>, preserving their concrete visible appearance and clothing.",
+  retentionWhere: "appears in [Shot 1]",
+  retentionDetail: "The defined appearance and assigned role remain consistent.",
   style: "Live-action, cinematic",
   soundscape: "The train wheels produce a steady metallic rhythm beneath a low ventilation hum. Rain ticks against the window while paper rustles softly.",
   music: "Sparse piano notes at a slow tempo, joined by sustained low strings that gradually decrease in volume.",
@@ -98,6 +102,8 @@ const state = {
   shotEditorDraft: null,
   shotEditorOriginal: null,
   shotEditorShotId: "",
+  shotEditorExpandedStepIds: new Set(),
+  shotEditorRevealStepId: "",
   mediaDragId: "",
   mediaDropDocuments: new WeakSet(),
   mediaDropDepth: new WeakMap(),
@@ -351,7 +357,7 @@ function directorSession(projectId = state.activeProjectId, scope = state.direct
   const normalizedScope = scope === "project" ? "project" : "shot";
   const id = directorSessionId(projectId, normalizedScope);
   if (!sessions[id] || !Array.isArray(sessions[id].messages)) {
-    sessions[id] = { scope: normalizedScope, messages: [], draft_attachments: [], updated_at: Date.now() };
+    sessions[id] = { scope: normalizedScope, messages: [], draft_attachments: [], pending_plan: null, updated_at: Date.now() };
   }
   sessions[id].scope = normalizedScope;
   if (!Array.isArray(sessions[id].draft_attachments)) sessions[id].draft_attachments = [];
@@ -382,6 +388,7 @@ function persistDirectorSessions() {
         scope: session?.scope === "project" ? "project" : "shot",
         updated_at: Number(session?.updated_at || Date.now()),
         last_context_usage: session?.last_context_usage || null,
+        pending_plan: session?.pending_plan || null,
         messages: Array.isArray(session?.messages) ? session.messages : [],
       }]),
   );
@@ -449,6 +456,9 @@ function ensureDirectorVariants(message) {
       proposal: variant.proposal || null,
       proposal_error: String(variant.proposal_error || ""),
       proposal_state: String(variant.proposal_state || ""),
+      status: String(variant.status || "ready"),
+      clarification: variant.clarification || null,
+      pending_plan: variant.pending_plan || null,
       context_usage: variant.context_usage || null,
       created_at: Number(variant.created_at || message.created_at || Date.now()),
     }));
@@ -459,6 +469,9 @@ function ensureDirectorVariants(message) {
       proposal: message.proposal || null,
       proposal_error: String(message.proposal_error || ""),
       proposal_state: String(message.proposal_state || ""),
+      status: String(message.status || "ready"),
+      clarification: message.clarification || null,
+      pending_plan: message.pending_plan || null,
       context_usage: message.context_usage || null,
       created_at: Number(message.created_at || Date.now()),
     });
@@ -479,6 +492,9 @@ function syncDirectorVariant(message, index) {
   message.proposal = variant.proposal || null;
   message.proposal_error = variant.proposal_error || "";
   message.proposal_state = variant.proposal_state || "";
+  message.status = variant.status || "ready";
+  message.clarification = variant.clarification || null;
+  message.pending_plan = variant.pending_plan || null;
   message.context_usage = variant.context_usage || null;
   return variant;
 }
@@ -498,6 +514,60 @@ function directorAttachmentMetadata(attachments) {
     source_width: Number(attachment.source_width || 0),
     source_height: Number(attachment.source_height || 0),
   }));
+}
+
+function directorRequestAttachments(project, draftAttachments) {
+  const result = directorAttachmentMetadata(draftAttachments);
+  const paths = new Set(result.map(item => item.path));
+  for (const reference of project?.document?.references || []) {
+    if (result.length >= DIRECTOR_MAX_IMAGES) break;
+    if (reference.kind !== "image" || !reference.path || paths.has(reference.path)) continue;
+    const usage = (reference.roles || [])[0] || "describe";
+    const needsSubjectCandidates = usage === "subject" && !reference.subject_candidates?.length;
+    if (reference.observed_visual_facts && !needsSubjectCandidates) continue;
+    result.push({
+      id: `project-grounding-${reference.id}`,
+      path: reference.path,
+      name: reference.name || reference.path,
+      usage,
+      reference_id: reference.id,
+      source_width: Number(reference.source_width || 0),
+      source_height: Number(reference.source_height || 0),
+    });
+    paths.add(reference.path);
+  }
+  return result;
+}
+
+function cacheDirectorVisionObservations(project, attachments, observations) {
+  let changed = false;
+  for (const observation of observations || []) {
+    const attachment = attachments.find(item => item.id === observation.attachment_id)
+      || attachments[Number(observation.index || 0) - 1];
+    if (!attachment || attachment.usage === "describe") continue;
+    const reference = (project.document.references || []).find(item =>
+      item.id === attachment.reference_id || (item.kind === "image" && item.path === attachment.path));
+    if (!reference) continue;
+    const facts = String(observation.observations || "").trim();
+    const candidates = Array.isArray(observation.subject_candidates)
+      ? observation.subject_candidates.map(item => ({
+          name: String(item?.name || "").trim(),
+          location: String(item?.location || "").trim(),
+          visual_selectors: Array.isArray(item?.visual_selectors)
+            ? item.visual_selectors.map(value => String(value || "").trim()).filter(Boolean).slice(0, 16)
+            : [],
+        })).filter(item => item.name)
+      : [];
+    if (facts && reference.observed_visual_facts !== facts) {
+      reference.observed_visual_facts = facts;
+      changed = true;
+    }
+    if (JSON.stringify(reference.subject_candidates || []) !== JSON.stringify(candidates)) {
+      reference.subject_candidates = candidates;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function renderDirectorAttachments() {
@@ -693,6 +763,8 @@ function commitDirectorImageReferences(project, attachments) {
       }
     }
     if (reference.roles?.length !== 1 || reference.roles[0] !== attachment.usage) {
+      reference.observed_visual_facts = "";
+      reference.subject_candidates = [];
       reference.roles = [attachment.usage];
       changed = true;
     }
@@ -745,6 +817,9 @@ function renderDirectorDialog() {
   const history = dialog.querySelector("#psvstudio-director-history");
   history.replaceChildren();
   const session = directorSession(project.id);
+  if (session.pending_plan) {
+    input.placeholder = "Answer the Director's clarification to continue the pending plan…";
+  }
   if (!session.messages.length) {
     history.append(el("div", "psvstudio-director-empty", projectScope
       ? "Ask for a full-video critique, alternatives, or a multi-shot composition. Only approved proposals can change the project."
@@ -788,7 +863,24 @@ function renderDirectorDialog() {
       proposal.append(actions);
       card.append(proposal);
     }
-    if (message.proposal_error) card.append(el("small", "psvstudio-director-error", `Proposal omitted: ${message.proposal_error}`));
+    if (message.clarification) {
+      const clarification = el("section", "psvstudio-director-clarification");
+      clarification.append(el("strong", "", "Clarification needed"));
+      const choices = el("div", "psvstudio-inline");
+      for (const choice of message.clarification.choices || []) {
+        const choose = button(choice, () => {
+          input.value = choice;
+          input.focus();
+        }, "psvstudio-button");
+        choose.disabled = state.directorBusy;
+        choices.append(choose);
+      }
+      if (choices.childElementCount) clarification.append(choices);
+      clarification.append(el("small", "psvstudio-help", "Your answer continues the existing request; no proposal has been discarded or applied."));
+      card.append(clarification);
+    } else if (message.proposal_error) {
+      card.append(el("small", "psvstudio-director-error", `Proposal omitted: ${message.proposal_error}`));
+    }
     const canNavigateResponses = message.role === "assistant"
       && messageIndex === session.messages.length - 1
       && session.messages[messageIndex - 1]?.role === "user";
@@ -995,6 +1087,7 @@ async function requestDirectorResponse(project, shot, scope, attachments, messag
       scope: normalizedScope,
       selected_shot_id: projectScope ? "" : (shot?.id || ""),
       attachments,
+      pending_plan: directorSession(project.id, normalizedScope).pending_plan || null,
       messages: boundedDirectorMessages(messages),
     }),
   });
@@ -1068,7 +1161,7 @@ async function sendDirectorMessage() {
   const projectScope = directorScope === "project";
   if (!dialog || !project || (!projectScope && !shot) || state.directorBusy) return;
   const session = directorSession(project.id, directorScope);
-  const attachments = directorAttachmentMetadata(session.draft_attachments);
+  const attachments = directorRequestAttachments(project, session.draft_attachments);
   if (!text && !attachments.length) return;
   if (!text) text = projectScope
     ? "Inspect the attached image in the context of the entire video. Suggest concrete production improvements and propose multi-shot changes when useful."
@@ -1088,16 +1181,21 @@ async function sendDirectorMessage() {
   const projectId = project.id;
   try {
     const data = await requestDirectorResponse(project, shot, directorScope, attachments, session.messages);
+    const groundingChanged = cacheDirectorVisionObservations(project, attachments, data.vision_observations);
     const assistant = {
       id: makeId("director-message"), role: "assistant", text: String(data.message || "").trim() || "No response.",
       proposal: data.proposal || null, proposal_error: String(data.proposal_error || ""),
+      status: String(data.status || "ready"), clarification: data.clarification || null,
+      pending_plan: data.pending_plan || null,
       context_usage: data.context_usage || null, created_at: Date.now(),
     };
     ensureDirectorVariants(assistant);
     session.messages.push(assistant);
     session.last_context_usage = data.context_usage || null;
-    session.draft_attachments = [];
+    session.pending_plan = data.pending_plan || null;
+    if (data.status !== "needs_clarification") session.draft_attachments = [];
     session.updated_at = Date.now();
+    if (groundingChanged) markProjectChanged();
     persistDirectorSessions();
   } catch (error) {
     const assistant = { id: makeId("director-message"), role: "assistant", text: `Director request failed: ${error.message || String(error)}`, proposal_error: "", created_at: Date.now() };
@@ -1160,6 +1258,7 @@ async function regenerateDirectorResponse(messageId) {
       attachments,
       requestMessages,
     );
+    const groundingChanged = cacheDirectorVisionObservations(project, attachments, data.vision_observations);
     const variants = ensureDirectorVariants(message);
     variants.push({
       id: makeId("director-response"),
@@ -1167,14 +1266,21 @@ async function regenerateDirectorResponse(messageId) {
       proposal: data.proposal || null,
       proposal_error: String(data.proposal_error || ""),
       proposal_state: "",
+      status: String(data.status || "ready"),
+      clarification: data.clarification || null,
+      pending_plan: data.pending_plan || null,
       context_usage: data.context_usage || null,
       created_at: Date.now(),
     });
     syncDirectorVariant(message, variants.length - 1);
     message.created_at ||= Date.now();
     session.last_context_usage = data.context_usage || null;
-    const regeneratedPaths = new Set(attachments.map(attachment => attachment.path));
-    session.draft_attachments = session.draft_attachments.filter(attachment => !regeneratedPaths.has(attachment.path));
+    session.pending_plan = data.pending_plan || null;
+    if (data.status !== "needs_clarification") {
+      const regeneratedPaths = new Set(attachments.map(attachment => attachment.path));
+      session.draft_attachments = session.draft_attachments.filter(attachment => !regeneratedPaths.has(attachment.path));
+    }
+    if (groundingChanged) markProjectChanged();
     session.updated_at = Date.now();
   } catch (error) {
     failure = error.message || String(error);
@@ -1185,6 +1291,9 @@ async function regenerateDirectorResponse(messageId) {
       proposal: null,
       proposal_error: "",
       proposal_state: "",
+      status: "error",
+      clarification: null,
+      pending_plan: null,
       context_usage: null,
       created_at: Date.now(),
     });
@@ -1438,12 +1547,17 @@ function referenceRoleOptions(kind) {
 }
 
 function setReferenceRole(project, reference, role) {
+  const roleChanged = reference.roles?.length !== 1 || reference.roles[0] !== role;
   if (["first_frame", "last_frame"].includes(role)) {
     for (const item of project.document.references) {
       if (item.id === reference.id || !(item.roles || []).includes(role)) continue;
       item.roles = item.roles.filter(value => value !== role);
       if (!item.roles.length) item.roles = [item.kind === "audio" ? "audio_reference" : "subject"];
     }
+  }
+  if (roleChanged) {
+    reference.observed_visual_facts = "";
+    reference.subject_candidates = [];
   }
   reference.roles = [role];
   invalidateReferenceSemantics(project);
@@ -1497,18 +1611,27 @@ function clearMediaDropMarkers(lane) {
   lane?.querySelectorAll(".is-drop-before,.is-drop-after").forEach(card => card.classList.remove("is-drop-before", "is-drop-after"));
 }
 
-function mediaDropDestination(lane, clientX) {
+function mediaDropDestination(lane, clientY) {
   const cards = [...lane.querySelectorAll(".psvstudio-media-chip:not(.is-dragging)")];
   clearMediaDropMarkers(lane);
   for (const card of cards) {
     const bounds = card.getBoundingClientRect();
-    if (clientX < bounds.left + bounds.width / 2) {
+    if (clientY < bounds.top + bounds.height / 2) {
       card.classList.add("is-drop-before");
       return Number(card.dataset.referenceIndex);
     }
   }
   cards.at(-1)?.classList.add("is-drop-after");
   return (activeProject()?.document?.references || []).length;
+}
+
+function removeProjectReference(project, reference, displayLabel = "Media") {
+  project.document.references = (project.document.references || []).filter(item => item.id !== reference.id);
+  project.document.references.forEach(item => { item.label = ""; });
+  invalidateReferenceSemantics(project);
+  if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
+  markProjectChanged({ render: true });
+  setStatus(`${displayLabel} removed from project references.`, "ready");
 }
 
 function mediaLimit(project, kind) {
@@ -1744,7 +1867,7 @@ function newDialogueStep(shot = null) {
   const existing = ensureShotSteps(shot).filter(step => step.type === "dialogue");
   return {
     id: makeId("dialogue"), type: "dialogue", speaker: "The speaker",
-    speaker_id: `S${existing.length + 1}`, language: "English", text: "", delivery: "",
+    speaker_id: `S${existing.length + 1}`, language: "English", performance: "speech", text: "", delivery: "",
     voiceover: false, offscreen: false, crosses_cut: false, cutoff: false,
   };
 }
@@ -2483,6 +2606,14 @@ function latestOutput(project) {
   return null;
 }
 
+function enforceSingleVideoPlayback(video) {
+  video.addEventListener("play", () => {
+    for (const otherVideo of state.panel?.ownerDocument?.querySelectorAll("video") || []) {
+      if (otherVideo !== video) otherVideo.pause();
+    }
+  });
+}
+
 function renderPreview() {
   const preview = state.panel?.querySelector("#psvstudio-preview");
   const project = activeProject();
@@ -2496,12 +2627,14 @@ function renderPreview() {
     return;
   }
   preview.append(el("span", "psvstudio-mode-badge", localResolvedMode(project.document).toUpperCase()));
+  preview.append(button("Global settings", () => showGlobalSettings(project), "psvstudio-button psvstudio-global-settings-button"));
   const output = latestOutput(project);
   if (output) {
     const video = document.createElement("video");
     video.controls = true;
     video.preload = "metadata";
     video.src = outputUrl(output);
+    enforceSingleVideoPlayback(video);
     preview.append(video);
   } else {
     const empty = el("div", "psvstudio-preview-empty");
@@ -2513,35 +2646,172 @@ function renderPreview() {
   }
 }
 
-function renderBriefCard() {
-  const container = state.panel?.querySelector("#psvstudio-brief-card");
-  const project = activeProject();
-  if (!container) return;
-  container.replaceChildren();
-  if (!project) return;
-  container.append(el("h2", "", "Production brief"));
-  const brief = textArea(project.brief, value => {
-    project.brief = value;
-    project.document.main_description = value;
+function humanizePromptOption(value) {
+  return String(value || "").replaceAll("_", " ").replace(/\b\w/g, letter => letter.toUpperCase());
+}
+
+function derivedReferenceTaskTypes(document) {
+  const roles = new Set((document.references || []).flatMap(reference => reference.roles || []));
+  const tasks = [];
+  if ([...roles].some(role => ["first_frame", "last_frame"].includes(role))) tasks.push("keyframe completion");
+  if ([...roles].some(role => ["subject", "scene", "style", "action", "pose", "camera", "storyboard"].includes(role))) tasks.push("reference generation");
+  if (roles.has("video_edit")) tasks.push("video editing");
+  if (roles.has("video_continue")) tasks.push("video continuation");
+  if (roles.has("audio_copy")) tasks.push("audio reuse");
+  if (roles.has("audio_reference")) tasks.push("audio reference");
+  return tasks.length ? tasks : ["reference generation"];
+}
+
+function renderReferenceSemantics(project, refresh) {
+  const section = inspectorDetails("Reference prompt semantics", localResolvedMode(project.document) === "ref2va");
+  const references = project.document.references || [];
+  if (!references.length) {
+    section.body.append(el("small", "psvstudio-help", "Add media references to configure REF2VA source semantics here."));
+    return section.details;
+  }
+
+  section.body.append(el(
+    "div",
+    "psvstudio-semantic-intro",
+    "Manual REF2VA authoring: define every source, use every defined label in the summary and applicable shot or audio fields, and give every label one retention rule.",
+  ));
+  section.body.append(field(
+    "Reference image fit",
+    selectInput([
+      { value: "match", label: "Match generation size" },
+      { value: "max", label: "Use maximum reference size" },
+    ], project.document.ref_image_size || "match", value => {
+      project.document.ref_image_size = value;
+      markProjectChanged();
+    }),
+  ));
+
+  const sourceDetails = inspectorDetails("Source details");
+  references.forEach(reference => {
+    const card = el("div", "psvstudio-semantic-card");
+    card.append(el("strong", "", `${reference.label || referenceDisplayLabel(references, reference)} · ${reference.name || reference.path || "Media"}`));
+    card.append(field(
+      "Source description",
+      textArea(reference.prompt || "", value => {
+        reference.prompt = value;
+        markProjectChanged();
+      }, 2, "Concrete source facts or manual reference guidance."),
+      "Available to the Director and useful when maintaining source semantics manually.",
+    ));
+    if (reference.kind === "video") {
+      const trimStart = textInput(reference.trim_start ?? 0, (value, control) => {
+        reference.trim_start = control.value === "" ? 0 : Math.max(0, value);
+        markProjectChanged();
+      }, "number");
+      trimStart.min = "0";
+      trimStart.step = "0.01";
+      const trimEnd = textInput(reference.trim_end ?? "", (value, control) => {
+        reference.trim_end = control.value === "" ? null : Math.max(0, value);
+        markProjectChanged();
+      }, "number");
+      trimEnd.min = "0";
+      trimEnd.step = "0.01";
+      const trims = el("div", "psvstudio-field-row");
+      trims.append(field("Trim start (s)", trimStart), field("Trim end (s)", trimEnd, "Blank uses the source end."));
+      card.append(trims, checkControl("Use embedded audio", reference.use_embedded_audio, value => {
+        reference.use_embedded_audio = value;
+        markProjectChanged();
+      }));
+    }
+    sourceDetails.body.append(card);
+  });
+  section.body.append(sourceDetails.details);
+
+  const taskDetails = inspectorDetails("Task types", true);
+  const taskGrid = el("div", "psvstudio-semantic-checks");
+  for (const task of state.config.task_types || []) {
+    taskGrid.append(checkControl(humanizePromptOption(task), (project.document.task_types || []).includes(task), checked => {
+      const current = new Set(project.document.task_types || []);
+      if (checked) current.add(task);
+      else current.delete(task);
+      project.document.task_types = [...current];
+      markProjectChanged();
+    }));
+  }
+  taskDetails.body.append(taskGrid, button("Use media-role defaults", () => {
+    project.document.task_types = derivedReferenceTaskTypes(project.document);
     markProjectChanged();
-  }, 4, PLACEHOLDERS.brief);
-  container.append(field("Video overview", brief, "Planning synopsis for you and the Grand Director. It is not sent to MiniMax; the Director translates it into the required shot timeline."));
+    refresh();
+  }));
+  section.body.append(taskDetails.details);
 
-  const command = textArea("", () => {}, 2, PLACEHOLDERS.directorCommand);
-  const ask = button(
-    "Ask Grand Director",
-    () => openDirector("project", command.value.trim()),
-    "psvstudio-button psvstudio-button-primary psvstudio-director-launch-button",
-  );
-  ask.title = "Consult about the entire video and review any proposed multi-shot changes before applying them.";
-  const directorActions = el("div", "psvstudio-director-launch");
-  directorActions.append(
-    field("Grand Director instruction", command),
-    ask,
-    el("small", "psvstudio-help", `Full-video scope · ${project.document.shots.length} shot${project.document.shots.length === 1 ? "" : "s"} in context`),
-  );
-  container.append(directorActions);
+  section.body.append(field(
+    "Reference summary",
+    textArea(project.document.summary || "", value => {
+      project.document.summary = value;
+      markProjectChanged();
+    }, 3, PLACEHOLDERS.referenceSummary),
+    "Use every defined <Subject N>, <Picture N>, <Video N>, or <Audio N> label here.",
+  ));
 
+  const definitions = project.document.subject_definitions ||= [];
+  const definitionDetails = inspectorDetails("Subject and source definitions", true);
+  if (!definitions.length) definitionDetails.body.append(el("div", "psvstudio-empty", "No definitions yet. Every reference source must be represented."));
+  definitions.forEach((definition, index) => {
+    const card = el("div", "psvstudio-semantic-card");
+    const row = el("div", "psvstudio-field-row");
+    row.append(
+      field("Label", textInput(definition.label || "", value => { definition.label = value; markProjectChanged(); }, "text", `Subject ${index + 1}`)),
+      field("Definition", textArea(definition.text || "", value => { definition.text = value; markProjectChanged(); }, 3, PLACEHOLDERS.subjectDefinition)),
+    );
+    card.append(row, button("Remove definition", () => {
+      definitions.splice(index, 1);
+      markProjectChanged();
+      refresh();
+    }, "psvstudio-button psvstudio-button-danger"));
+    definitionDetails.body.append(card);
+  });
+  definitionDetails.body.append(button("Add definition", () => {
+    definitions.push({ label: `Subject ${definitions.length + 1}`, text: "" });
+    markProjectChanged();
+    refresh();
+  }));
+  section.body.append(definitionDetails.details);
+
+  const retention = project.document.retention_analysis ||= [];
+  const retentionDetails = inspectorDetails("Retention analysis", true);
+  const relationshipOptions = [
+    ...(state.config.visual_retention || []),
+    ...(state.config.audio_retention || []),
+  ].filter((value, index, values) => values.indexOf(value) === index)
+    .map(value => ({ value, label: humanizePromptOption(value) }));
+  if (!retention.length) retentionDetails.body.append(el("div", "psvstudio-empty", "No retention rules yet. Add exactly one for each defined label."));
+  retention.forEach((item, index) => {
+    const card = el("div", "psvstudio-semantic-card");
+    const identity = el("div", "psvstudio-field-row");
+    identity.append(
+      field("Label", textInput(item.label || "", value => { item.label = value; markProjectChanged(); }, "text", "<Subject 1>")),
+      field("Relationship", selectInput(relationshipOptions, item.relationship || "fully_preserved", value => { item.relationship = value; markProjectChanged(); })),
+    );
+    card.append(
+      identity,
+      field("Where retained", textInput(item.where || "", value => { item.where = value; markProjectChanged(); }, "text", PLACEHOLDERS.retentionWhere)),
+      field("Retention detail", textArea(item.detail || "", value => { item.detail = value; markProjectChanged(); }, 2, PLACEHOLDERS.retentionDetail)),
+      button("Remove retention rule", () => {
+        retention.splice(index, 1);
+        markProjectChanged();
+        refresh();
+      }, "psvstudio-button psvstudio-button-danger"),
+    );
+    retentionDetails.body.append(card);
+  });
+  retentionDetails.body.append(button("Add retention rule", () => {
+    const definition = definitions[retention.length];
+    const label = definition?.label ? `<${String(definition.label).replace(/[<>]/g, "")}>` : `<Subject ${retention.length + 1}>`;
+    retention.push({ label, where: "[Shot 1]", relationship: "fully_preserved", detail: "" });
+    markProjectChanged();
+    refresh();
+  }));
+  section.body.append(retentionDetails.details);
+  return section.details;
+}
+
+function appendGlobalSettings(container, project, refresh) {
   const sizeValue = `${project.document.width}x${project.document.height}`;
   const aspectOptions = state.config.aspect_presets.map(item => ({ value: `size:${item.width}x${item.height}`, label: item.label }));
   for (const reference of project.document.references || []) {
@@ -2643,7 +2913,74 @@ function renderBriefCard() {
       markProjectChanged({ render: true });
     }), "Automatic selects the correct MiniMax route from your media roles."),
   );
-  container.append(production.details);
+  container.append(production.details, renderReferenceSemantics(project, refresh));
+}
+
+function globalSettingsSummary(project) {
+  const mode = localResolvedMode(project.document).toUpperCase();
+  const duration = Number(project.document.duration_seconds || 0).toFixed(2);
+  return `${project.document.width}×${project.document.height} · ${duration}s · ${mode}`;
+}
+
+function appendProjectBrief(container, project) {
+  const section = inspectorDetails("Production brief", true);
+  const brief = textArea(project.brief, value => {
+    project.brief = value;
+    project.document.main_description = value;
+    markProjectChanged();
+  }, 4, PLACEHOLDERS.brief);
+  section.body.append(field("Video overview", brief, "Planning synopsis for you and the Grand Director. It is not sent to MiniMax; the Director translates it into the required shot timeline."));
+
+  const command = textArea("", () => {}, 2, PLACEHOLDERS.directorCommand);
+  const ask = button(
+    "Ask Grand Director",
+    () => openDirector("project", command.value.trim()),
+    "psvstudio-button psvstudio-button-primary psvstudio-director-launch-button",
+  );
+  ask.title = "Consult about the entire video and review any proposed multi-shot changes before applying them.";
+  const directorActions = el("div", "psvstudio-director-launch");
+  directorActions.append(
+    field("Grand Director instruction", command),
+    ask,
+    el("small", "psvstudio-help", `Full-video scope · ${project.document.shots.length} shot${project.document.shots.length === 1 ? "" : "s"} in context`),
+  );
+  section.body.append(directorActions);
+  container.append(section.details);
+}
+
+function showGlobalSettings(project = activeProject()) {
+  if (!project) return;
+  const dialog = el("dialog", "psvstudio-global-settings-dialog");
+  const render = () => {
+    if (!dialog.isConnected) return;
+    dialog.replaceChildren();
+    const header = el("header", "psvstudio-global-settings-header");
+    const heading = el("div", "psvstudio-global-settings-heading");
+    heading.append(
+      el("h2", "", "Global video settings"),
+      el("small", "", `${globalSettingsSummary(project)} · Production brief, style, audio, mode, and reference semantics`),
+    );
+    header.append(heading, button("Close", () => dialog.close()));
+    const body = el("div", "psvstudio-global-settings-body");
+    appendProjectBrief(body, project);
+    appendGlobalSettings(body, project, render);
+    const footer = el("footer", "psvstudio-global-settings-footer");
+    footer.append(
+      el("small", "psvstudio-help", "Changes save automatically and apply to the whole project."),
+      button("Done", () => dialog.close(), "psvstudio-button psvstudio-button-primary"),
+    );
+    dialog.append(header, body, footer);
+  };
+  dialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => {
+    dialog.remove();
+  }, { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  render();
+  dialog.showModal();
 }
 
 function documentDuration(project = activeProject()) {
@@ -2691,7 +3028,6 @@ function beginShotPointerDrag(event, project, shot, block, track) {
     reorderShot(project, insertIndex);
     state.shotDrag = null;
     clearTimelineDragArtifacts(track);
-    renderBriefCard();
     renderTimeline();
     renderInspector();
   };
@@ -2784,7 +3120,6 @@ function refreshTimelineGeometry(track, project, scale) {
 
 function finishBoundaryResize(project) {
   markProjectChanged();
-  renderBriefCard();
   renderTimeline();
   renderInspector();
 }
@@ -2852,13 +3187,15 @@ function renderTimeline() {
   const viewport = state.panel?.querySelector("#psvstudio-shot-list");
   const project = activeProject();
   const add = state.panel?.querySelector("#psvstudio-add-shot");
+  const director = state.panel?.querySelector("#psvstudio-grand-director");
   if (!viewport) return;
   const previousScroll = viewport.scrollLeft;
   viewport.replaceChildren();
   if (add) add.disabled = !project;
+  if (director) director.disabled = !project;
   if (!project) return;
   const duration = documentDuration(project);
-  const minimumWidth = Math.max(600, viewport.clientWidth - 28);
+  const minimumWidth = Math.max(420, viewport.clientWidth - 28);
   const scale = Math.max(state.timelineZoom, minimumWidth / duration);
   const timeline = el("div", "psvstudio-timeline");
   const ruler = el("div", "psvstudio-timeline-ruler");
@@ -2925,7 +3262,6 @@ function renderTimeline() {
       state.shotDrag = { projectId: project.id, id: shot.id, durations: captureShotDurations(project) };
       reorderShot(project, keyEvent.key === "ArrowLeft" ? index - 1 : index + 1);
       state.shotDrag = null;
-      renderBriefCard();
       renderTimeline();
       renderInspector();
     });
@@ -2943,10 +3279,9 @@ function renderMediaLane() {
   const project = activeProject();
   if (!lane) return;
   lane.replaceChildren();
-  lane.append(el("span", "psvstudio-media-lane-label", "Media"));
   const references = project?.document?.references || [];
   if (!references.length) {
-    lane.append(el("span", "psvstudio-media-lane-empty", project ? "Drop media or paste an image anywhere on this screen" : "Create a project, drop media, or paste an image anywhere"));
+    lane.append(el("span", "psvstudio-media-lane-empty", project ? "Drop media or paste an image" : "Create a project to add media"));
     return;
   }
   references.forEach((reference, index) => {
@@ -2956,42 +3291,52 @@ function renderMediaLane() {
     card.dataset.referenceIndex = String(index);
     card.draggable = true;
     card.tabIndex = 0;
-    card.title = "Drag to change reference order · Alt + Left/Right Arrow also moves it";
+    card.title = "Drag to change reference order · Alt + Up/Down Arrow also moves it";
     card.ariaLabel = `${referenceDisplayLabel(references, reference)}: ${reference.name || reference.path || "Media"}. Drag to reorder.`;
     const url = mediaInputUrl(reference);
+    const displayLabel = referenceDisplayLabel(references, reference);
+    const sourceName = reference.name || reference.path || "Media";
+    const thumbnailButton = button("", event => {
+      event.stopPropagation();
+      showMediaPreview(reference, displayLabel);
+    }, "psvstudio-media-thumbnail");
+    thumbnailButton.title = `Preview ${displayLabel}`;
+    thumbnailButton.ariaLabel = thumbnailButton.title;
+    thumbnailButton.draggable = false;
     if (reference.kind === "image" && url) {
       const thumbnail = document.createElement("img");
       thumbnail.src = url;
       thumbnail.alt = "";
       thumbnail.loading = "lazy";
-      card.append(thumbnail);
+      thumbnailButton.append(thumbnail);
+    } else if (reference.kind === "video" && url) {
+      const thumbnail = document.createElement("video");
+      thumbnail.src = url;
+      thumbnail.muted = true;
+      thumbnail.preload = "metadata";
+      thumbnail.tabIndex = -1;
+      thumbnailButton.append(thumbnail);
     } else {
-      card.append(el("span", "psvstudio-media-kind", reference.kind === "video" ? "VID" : reference.kind === "audio" ? "AUD" : "IMG"));
+      thumbnailButton.append(el("span", "psvstudio-media-kind", reference.kind === "video" ? "VID" : reference.kind === "audio" ? "AUD" : "IMG"));
     }
+    card.append(thumbnailButton);
     const details = el("span", "psvstudio-media-chip-details");
     const roleOptions = referenceRoleOptions(reference.kind);
     const currentRole = (reference.roles || [])[0] || roleOptions[0].value;
     const role = selectInput(roleOptions, currentRole, value => setReferenceRole(project, reference, value));
     role.className = "psvstudio-media-role";
-    const displayLabel = referenceDisplayLabel(references, reference);
     role.ariaLabel = `Role for ${displayLabel}`;
     role.title = "How this reference conditions MiniMax H3";
     const sourceSize = minimaxCanvasDimensions(reference.source_width, reference.source_height)
       ? ` · ${reference.source_width}×${reference.source_height}`
       : "";
-    const sourceName = reference.name || reference.path || "Media";
     details.append(
       el("strong", "", displayLabel),
       el("small", "", `${sourceName}${sourceSize}`),
       role,
     );
     const remove = button("×", () => {
-      project.document.references = references.filter(item => item.id !== reference.id);
-      project.document.references.forEach(item => { item.label = ""; });
-      invalidateReferenceSemantics(project);
-      if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
-      markProjectChanged({ render: true });
-      setStatus(`${displayLabel} removed from project references.`, "ready");
+      removeProjectReference(project, reference, displayLabel);
     }, "psvstudio-media-remove");
     remove.title = `Remove ${displayLabel}`;
     remove.ariaLabel = remove.title;
@@ -3015,8 +3360,8 @@ function renderMediaLane() {
       clearMediaDropMarkers(lane);
     });
     card.addEventListener("keydown", event => {
-      if (!event.altKey || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
-      const direction = event.key === "ArrowLeft" ? -1 : 1;
+      if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      const direction = event.key === "ArrowUp" ? -1 : 1;
       const targetIndex = index + direction;
       if (targetIndex < 0 || targetIndex >= references.length) return;
       event.preventDefault();
@@ -3028,7 +3373,7 @@ function renderMediaLane() {
     if (!state.mediaDragId) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
-    mediaDropDestination(lane, event.clientX);
+    mediaDropDestination(lane, event.clientY);
   });
   lane.addEventListener("dragleave", event => {
     if (!lane.contains(event.relatedTarget)) clearMediaDropMarkers(lane);
@@ -3037,11 +3382,186 @@ function renderMediaLane() {
     if (!state.mediaDragId) return;
     event.preventDefault();
     event.stopPropagation();
-    const destination = mediaDropDestination(lane, event.clientX);
+    const destination = mediaDropDestination(lane, event.clientY);
     const referenceId = state.mediaDragId;
     clearMediaDropMarkers(lane);
     moveReference(project, referenceId, destination);
   });
+}
+
+function showMediaPreview(reference, displayLabel = "Media") {
+  const dialog = el("dialog", "psvstudio-media-preview-dialog");
+  const header = el("header", "psvstudio-media-preview-header");
+  const heading = el("div", "psvstudio-media-preview-heading");
+  heading.append(
+    el("h2", "", displayLabel),
+    el("small", "", reference.name || reference.path || humanizePromptOption(reference.kind)),
+  );
+  header.append(heading, button("Close", () => dialog.close()));
+  const body = el("div", "psvstudio-media-preview-body");
+  const url = mediaInputUrl(reference);
+  if (!url) {
+    body.append(el("div", "psvstudio-empty", "This media source is not available for preview."));
+  } else if (reference.kind === "image") {
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = reference.name || displayLabel;
+    body.append(image);
+  } else if (reference.kind === "video") {
+    const video = document.createElement("video");
+    video.src = url;
+    video.controls = true;
+    video.preload = "metadata";
+    body.append(video);
+    enforceSingleVideoPlayback(video);
+  } else if (reference.kind === "audio") {
+    body.append(el("strong", "", reference.name || "Audio reference"));
+    const audio = document.createElement("audio");
+    audio.src = url;
+    audio.controls = true;
+    audio.preload = "metadata";
+    body.append(audio);
+  }
+  dialog.append(header, body);
+  dialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.showModal();
+}
+
+function showMediaLibrary(project = activeProject()) {
+  if (!project) return;
+  const dialog = el("dialog", "psvstudio-media-library-dialog");
+  const render = () => {
+    if (!dialog.isConnected) return;
+    dialog.replaceChildren();
+    const references = project.document.references || [];
+    const header = el("header", "psvstudio-media-library-header");
+    const heading = el("div", "psvstudio-media-library-heading");
+    heading.append(
+      el("h2", "", "Project media"),
+      el("small", "", `${references.length} item${references.length === 1 ? "" : "s"} · Preview, configure, reorder, or remove references`),
+    );
+    header.append(heading, button("Close", () => dialog.close()));
+    const list = el("div", "psvstudio-media-library-list");
+    if (!references.length) {
+      const empty = el("div", "psvstudio-empty", "No media has been added to this project yet.");
+      empty.append(button("Add media", () => {
+        dialog.close();
+        state.panel.querySelector("#psvstudio-media-input")?.click();
+      }, "psvstudio-button psvstudio-button-primary"));
+      list.append(empty);
+    }
+    references.forEach((reference, index) => {
+      ensureReferenceDimensions(project, reference);
+      const displayLabel = referenceDisplayLabel(references, reference);
+      const sourceName = reference.name || reference.path || "Media";
+      const url = mediaInputUrl(reference);
+      const card = el("article", "psvstudio-media-library-card");
+      const preview = button("", () => showMediaPreview(reference, displayLabel), "psvstudio-media-library-preview");
+      preview.title = `Preview ${displayLabel}`;
+      preview.ariaLabel = preview.title;
+      if (reference.kind === "image" && url) {
+        const image = document.createElement("img");
+        image.src = url;
+        image.alt = "";
+        image.loading = "lazy";
+        preview.append(image);
+      } else if (reference.kind === "video" && url) {
+        const video = document.createElement("video");
+        video.src = url;
+        video.muted = true;
+        video.preload = "metadata";
+        video.tabIndex = -1;
+        preview.append(video);
+      } else {
+        preview.append(el("span", "psvstudio-media-library-kind", reference.kind === "video" ? "VIDEO" : reference.kind === "audio" ? "AUDIO" : "IMAGE"));
+      }
+
+      const content = el("div", "psvstudio-media-library-content");
+      const cardHeading = el("div", "psvstudio-media-library-card-heading");
+      const identity = el("div");
+      const sourceSize = reference.source_width && reference.source_height
+        ? `${reference.source_width}×${reference.source_height}`
+        : humanizePromptOption(reference.kind);
+      identity.append(el("strong", "", displayLabel), el("small", "", `${sourceName} · ${sourceSize}`));
+      const order = el("div", "psvstudio-inline");
+      const up = button("↑", () => {
+        moveReference(project, reference.id, index - 1);
+        render();
+      }, "psvstudio-button psvstudio-icon-button");
+      const down = button("↓", () => {
+        moveReference(project, reference.id, index + 2);
+        render();
+      }, "psvstudio-button psvstudio-icon-button");
+      up.disabled = index === 0;
+      down.disabled = index === references.length - 1;
+      up.title = `Move ${displayLabel} up`;
+      down.title = `Move ${displayLabel} down`;
+      order.append(up, down);
+      cardHeading.append(identity, order);
+
+      const roleOptions = referenceRoleOptions(reference.kind);
+      const currentRole = (reference.roles || [])[0] || roleOptions[0].value;
+      const role = selectInput(roleOptions, currentRole, value => {
+        setReferenceRole(project, reference, value);
+        render();
+      });
+      const settings = el("div", "psvstudio-media-library-settings");
+      settings.append(
+        field("Media role", role, "How this source conditions MiniMax H3."),
+        field("Source description", textArea(reference.prompt || "", value => {
+          reference.prompt = value;
+          markProjectChanged();
+        }, 3, "Concrete source facts or manual reference guidance.")),
+      );
+      if (reference.kind === "video") {
+        const trimStart = textInput(reference.trim_start ?? 0, (value, control) => {
+          reference.trim_start = control.value === "" ? 0 : Math.max(0, value);
+          markProjectChanged();
+        }, "number");
+        trimStart.min = "0";
+        trimStart.step = "0.01";
+        const trimEnd = textInput(reference.trim_end ?? "", (value, control) => {
+          reference.trim_end = control.value === "" ? null : Math.max(0, value);
+          markProjectChanged();
+        }, "number");
+        trimEnd.min = "0";
+        trimEnd.step = "0.01";
+        const trims = el("div", "psvstudio-field-row");
+        trims.append(field("Trim start (s)", trimStart), field("Trim end (s)", trimEnd, "Blank uses source end."));
+        settings.append(trims, checkControl("Use embedded audio", reference.use_embedded_audio, value => {
+          reference.use_embedded_audio = value;
+          markProjectChanged();
+        }));
+      }
+      const actions = el("div", "psvstudio-media-library-actions");
+      actions.append(button("Remove from project", () => {
+        removeProjectReference(project, reference, displayLabel);
+        render();
+      }, "psvstudio-button psvstudio-button-danger"));
+      content.append(cardHeading, settings, actions);
+      card.append(preview, content);
+      list.append(card);
+    });
+    const footer = el("footer", "psvstudio-media-library-footer");
+    footer.append(
+      el("small", "psvstudio-help", "Changes save automatically and apply to every shot that uses the reference."),
+      button("Done", () => dialog.close(), "psvstudio-button psvstudio-button-primary"),
+    );
+    dialog.append(header, list, footer);
+  };
+  dialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  render();
+  dialog.showModal();
 }
 
 function inspectorDetails(title, open = false) {
@@ -3075,19 +3595,37 @@ function renderDialogueStep(body, step) {
     field("Speaker ID", textInput(step.speaker_id, value => { step.speaker_id = value.toUpperCase(); }, "text", PLACEHOLDERS.speakerId)),
   );
   const flags = el("div", "psvstudio-field-row");
+  const voiceover = checkControl("Voiceover", step.voiceover, value => { step.voiceover = value; });
+  voiceover.querySelector("input").disabled = step.performance === "singing";
   flags.append(
-    checkControl("Voiceover", step.voiceover, value => { step.voiceover = value; }),
+    voiceover,
     checkControl("Off-screen", step.offscreen, value => { step.offscreen = value; }),
     checkControl("Crosses cut", step.crosses_cut, value => { step.crosses_cut = value; }),
     checkControl("Cut off", step.cutoff, value => { step.cutoff = value; }),
   );
   body.append(
     speakerRow,
+    field("Performance", selectInput([
+      { value: "speech", label: "Spoken dialogue" },
+      { value: "singing", label: "Singing / lyrics" },
+    ], step.performance || "speech", value => {
+      step.performance = value;
+      if (value === "singing") step.voiceover = false;
+      renderShotEditorDialog();
+    })),
     field("Language", textInput(step.language, value => { step.language = value; }, "text", PLACEHOLDERS.language)),
-    field("Exact dialogue", textArea(step.text, value => { step.text = value; }, 3, PLACEHOLDERS.dialogue)),
+    field(step.performance === "singing" ? "Exact lyrics" : "Exact dialogue", textArea(step.text, value => { step.text = value; }, 3, PLACEHOLDERS.dialogue)),
     field("Delivery", textInput(step.delivery, value => { step.delivery = value; }, "text", PLACEHOLDERS.delivery)),
     flags,
   );
+}
+
+function collapsedStepSummary(step) {
+  if (step.type === "dialogue") {
+    const speaker = String(step.speaker || step.speaker_id || "The speaker").trim();
+    return `${speaker}: ${String(step.text || "Empty dialogue line").trim()}`;
+  }
+  return String(step.text || "Empty action step").trim();
 }
 
 function renderShotSteps(container, shot) {
@@ -3097,7 +3635,8 @@ function renderShotSteps(container, shot) {
     container.append(el("div", "psvstudio-empty", "Add the first action or dialogue step. The compiler follows this list from top to bottom."));
   }
   steps.forEach((step, index) => {
-    const card = el("article", `psvstudio-step-card is-${step.type}`);
+    const expanded = state.shotEditorExpandedStepIds.has(step.id);
+    const card = el("article", `psvstudio-step-card is-${step.type}${expanded ? "" : " is-collapsed"}`);
     card.dataset.stepId = step.id;
     const header = el("div", "psvstudio-step-header");
     const drag = el("span", "psvstudio-step-drag", "⋮⋮");
@@ -3113,8 +3652,20 @@ function renderShotSteps(container, shot) {
       state.shotStepDragId = "";
       card.classList.remove("is-dragging");
     });
-    const label = el("div", "psvstudio-step-label");
-    label.append(el("strong", "", `Step ${index + 1}`), el("span", "", step.type === "dialogue" ? "Dialogue" : "Action"));
+    const label = button("", () => {
+      if (expanded) state.shotEditorExpandedStepIds.delete(step.id);
+      else state.shotEditorExpandedStepIds.add(step.id);
+      state.shotEditorRevealStepId = step.id;
+      renderShotEditorDialog();
+    }, "psvstudio-step-label");
+    label.ariaExpanded = String(expanded);
+    label.ariaLabel = `${expanded ? "Collapse" : "Expand"} step ${index + 1}`;
+    label.append(
+      el("span", "psvstudio-step-chevron", expanded ? "▾" : "▸"),
+      el("strong", "", `Step ${index + 1}`),
+      el("span", "psvstudio-step-kind", step.type === "dialogue" ? "Dialogue" : "Action"),
+    );
+    if (!expanded) label.append(el("span", "psvstudio-step-summary", collapsedStepSummary(step)));
     const controls = el("div", "psvstudio-step-controls");
     const up = button("↑", () => moveShotStep(shot, step.id, index - 1), "psvstudio-button psvstudio-icon-button");
     const down = button("↓", () => moveShotStep(shot, step.id, index + 2), "psvstudio-button psvstudio-icon-button");
@@ -3124,11 +3675,14 @@ function renderShotSteps(container, shot) {
       const copy = clone(step);
       copy.id = makeId(step.type === "dialogue" ? "dialogue" : "step");
       steps.splice(index + 1, 0, copy);
+      state.shotEditorExpandedStepIds.add(copy.id);
+      state.shotEditorRevealStepId = copy.id;
       syncShotLegacyFields(shot);
       renderShotEditorDialog();
     });
     const remove = button("Remove", () => {
       steps.splice(index, 1);
+      state.shotEditorExpandedStepIds.delete(step.id);
       syncShotLegacyFields(shot);
       renderShotEditorDialog();
     }, "psvstudio-button psvstudio-button-danger");
@@ -3140,6 +3694,7 @@ function renderShotSteps(container, shot) {
     } else {
       body.append(field("Visible action or state change", textArea(step.text, value => { step.text = value; }, 3, PLACEHOLDERS.action)));
     }
+    body.hidden = !expanded;
     card.append(header, body);
     card.addEventListener("dragover", event => {
       if (!state.shotStepDragId || state.shotStepDragId === step.id) return;
@@ -3178,6 +3733,8 @@ function closeShotEditor({ force = false } = {}) {
   state.shotEditorOriginal = null;
   state.shotEditorShotId = "";
   state.shotStepDragId = "";
+  state.shotEditorExpandedStepIds = new Set();
+  state.shotEditorRevealStepId = "";
   return true;
 }
 
@@ -3222,6 +3779,7 @@ function renderShotEditorDialog() {
   const project = activeProject();
   const index = project?.document?.shots?.findIndex(shot => shot.id === state.shotEditorShotId) ?? -1;
   if (!dialog || !draft || !project || index < 0) return;
+  const previousStepScroll = dialog.querySelector(".psvstudio-step-list")?.scrollTop || 0;
   ensureShotSteps(draft);
   dialog.replaceChildren();
 
@@ -3282,11 +3840,33 @@ function renderShotEditorDialog() {
   sequenceTitle.append(el("h3", "", "Chronological steps"), el("small", "", "Drag or use the arrows. MiniMax receives this exact top-to-bottom order."));
   const addControls = el("div", "psvstudio-inline");
   addControls.append(
-    button("Add action", () => { draft.steps.push(newActionStep()); renderShotEditorDialog(); }),
-    button("Add dialogue", () => { draft.steps.push(newDialogueStep(draft)); renderShotEditorDialog(); }, "psvstudio-button psvstudio-button-primary"),
+    button("Expand all", () => {
+      state.shotEditorExpandedStepIds = new Set(draft.steps.map(step => step.id));
+      renderShotEditorDialog();
+    }),
+    button("Collapse all", () => {
+      state.shotEditorExpandedStepIds = new Set();
+      renderShotEditorDialog();
+    }),
+    button("Add action", () => {
+      const step = newActionStep();
+      draft.steps.push(step);
+      state.shotEditorExpandedStepIds.add(step.id);
+      state.shotEditorRevealStepId = step.id;
+      renderShotEditorDialog();
+    }),
+    button("Add dialogue", () => {
+      const step = newDialogueStep(draft);
+      draft.steps.push(step);
+      state.shotEditorExpandedStepIds.add(step.id);
+      state.shotEditorRevealStepId = step.id;
+      renderShotEditorDialog();
+    }, "psvstudio-button psvstudio-button-primary"),
   );
   sequenceHeader.append(sequenceTitle, addControls);
   const stepList = el("div", "psvstudio-step-list");
+  stepList.tabIndex = 0;
+  stepList.ariaLabel = "Chronological shot steps";
   renderShotSteps(stepList, draft);
   sequence.append(sequenceHeader, stepList);
   workspace.append(setup, sequence);
@@ -3303,6 +3883,17 @@ function renderShotEditorDialog() {
   );
   footer.append(left, right);
   dialog.append(header, workspace, footer);
+  const revealStepId = state.shotEditorRevealStepId;
+  state.shotEditorRevealStepId = "";
+  state.panel.ownerDocument.defaultView?.requestAnimationFrame(() => {
+    if (revealStepId) {
+      const target = [...stepList.querySelectorAll(".psvstudio-step-card")]
+        .find(card => card.dataset.stepId === revealStepId);
+      target?.scrollIntoView({ block: "nearest" });
+    } else {
+      stepList.scrollTop = previousStepScroll;
+    }
+  });
 }
 
 function openShotEditor(shotId = state.selectedShotId) {
@@ -3315,6 +3906,8 @@ function openShotEditor(shotId = state.selectedShotId) {
   state.shotEditorShotId = shot.id;
   state.shotEditorDraft = clone(shot);
   state.shotEditorOriginal = clone(shot);
+  state.shotEditorExpandedStepIds = new Set();
+  state.shotEditorRevealStepId = "";
   const dialog = el("dialog", "psvstudio-shot-editor-dialog");
   dialog.addEventListener("cancel", event => {
     event.preventDefault();
@@ -3413,11 +4006,7 @@ function renderGenerations() {
         video.controls = true;
         video.preload = "metadata";
         video.src = url;
-        video.addEventListener("play", () => {
-          for (const otherVideo of list.querySelectorAll("video")) {
-            if (otherVideo !== video) otherVideo.pause();
-          }
-        });
+        enforceSingleVideoPlayback(video);
         media.replaceChildren(video);
       } else video = currentVideo;
       video.loop = state.loopingGenerations.has(loopKey);
@@ -3496,6 +4085,72 @@ function showCompiledPrompt(prompt) {
   dialog.showModal();
 }
 
+function showEditableProjectPrompt(project, { prompt = "", settingsPrompt = "", settingsError = "" } = {}) {
+  const dialog = el("dialog", "psvstudio-prompt-dialog");
+  const title = el("h2", "", "Editable MiniMax prompt");
+  const warning = el("div", "psvstudio-prompt-warning");
+  warning.setAttribute("role", "status");
+  const editor = document.createElement("textarea");
+  editor.value = prompt;
+  editor.rows = 18;
+  editor.placeholder = "Write a complete MiniMax prompt, or rebuild one from the Shot Composer settings.";
+  const rebuild = button("Rebuild from settings", () => {
+    if (!settingsPrompt) return;
+    editor.value = settingsPrompt;
+    project.document.prompt_override = "";
+    markProjectChanged();
+    renderHeader();
+    refreshWarning();
+    setStatus("The manual prompt override was removed and rebuilt from Shot Composer settings.", "ready");
+  });
+  rebuild.disabled = !settingsPrompt;
+  rebuild.title = settingsPrompt
+    ? "Discard the manual override and compile the current structured settings"
+    : (settingsError || "The structured settings cannot currently be compiled");
+  const save = button("Save prompt", () => {
+    const value = editor.value.trim();
+    if (!value) {
+      state.panel.ownerDocument.defaultView?.alert("The generation prompt cannot be empty.");
+      return;
+    }
+    const diverged = !settingsPrompt || value !== settingsPrompt.trim();
+    project.document.prompt_override = diverged ? value : "";
+    markProjectChanged();
+    renderHeader();
+    setStatus(
+      diverged
+        ? "Manual prompt saved. It is now used for generation instead of the Shot Composer settings."
+        : "Prompt matches the Shot Composer settings; the manual override was removed.",
+      diverged ? "warning" : "ready",
+    );
+    dialog.close();
+  }, "psvstudio-button psvstudio-button-primary");
+  const refreshWarning = () => {
+    const diverged = !settingsPrompt || editor.value.trim() !== settingsPrompt.trim();
+    warning.hidden = !diverged;
+    warning.textContent = settingsError
+      ? `The structured settings cannot currently rebuild a valid prompt: ${settingsError}`
+      : "This prompt has manual edits and does not automatically align with the Shot Composer settings. Generation will use this text until you rebuild it from settings.";
+  };
+  editor.addEventListener("input", refreshWarning);
+  const actions = el("div", "psvstudio-inline psvstudio-prompt-actions");
+  actions.append(
+    rebuild,
+    button("Copy", async () => {
+      await navigator.clipboard.writeText(editor.value);
+      setStatus("Prompt copied.", "ready");
+    }),
+    button("Close", () => dialog.close()),
+    save,
+  );
+  dialog.append(title, warning, editor, actions);
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  refreshWarning();
+  dialog.showModal();
+  editor.focus();
+}
+
 async function compilePreview() {
   const project = activeProject();
   if (!project) return;
@@ -3506,8 +4161,18 @@ async function compilePreview() {
       body: JSON.stringify({ document: project.document }),
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || "The prompt could not be compiled.");
-    showCompiledPrompt(data.compiled_prompt);
+    if (!response.ok) {
+      showEditableProjectPrompt(project, {
+        prompt: project.document.prompt_override || "",
+        settingsError: data.error || "The Shot Composer settings could not be compiled.",
+      });
+      return;
+    }
+    showEditableProjectPrompt(project, {
+      prompt: data.compiled_prompt,
+      settingsPrompt: data.settings_prompt,
+      settingsError: data.settings_prompt_error,
+    });
   } catch (error) {
     setStatus(error.message || String(error), "error");
   }
@@ -3526,6 +4191,14 @@ function renderHeader() {
   if (generate) generate.disabled = !project || !state.workflows.length;
   if (duplicate) duplicate.disabled = !project;
   if (preview) preview.disabled = !project;
+  if (preview) {
+    const overridden = Boolean(project?.document?.prompt_override);
+    preview.textContent = overridden ? "Prompt*" : "Prompt";
+    preview.title = overridden
+      ? "A manual prompt override is active and may not match the Shot Composer settings"
+      : "View or edit the compiled MiniMax prompt";
+    preview.dataset.override = overridden ? "true" : "false";
+  }
   renderWorkflowSelect();
 }
 
@@ -3535,7 +4208,6 @@ function renderAll() {
   renderProjectList();
   renderHeader();
   renderPreview();
-  renderBriefCard();
   renderTimeline();
   renderMediaLane();
   renderInspector();
@@ -3584,7 +4256,6 @@ function buildPanel() {
         <div class="psvstudio-editor-scroll">
           <section class="psvstudio-stage">
             <div id="psvstudio-preview" class="psvstudio-preview"></div>
-            <div id="psvstudio-brief-card" class="psvstudio-brief-card"></div>
           </section>
           <section class="psvstudio-generations">
             <div class="psvstudio-section-heading"><h2>Generations</h2><small class="psvstudio-help">Each render keeps an exact workflow snapshot.</small></div>
@@ -3593,16 +4264,27 @@ function buildPanel() {
         </div>
         <section class="psvstudio-timeline-card">
           <div class="psvstudio-section-heading psvstudio-timeline-heading">
-            <div><h2>Timeline</h2><small class="psvstudio-help">Drop media or paste images anywhere · drag media to renumber references · drag shots to reorder · 24 fps snap</small></div>
+            <div><h2>Timeline</h2><small class="psvstudio-help">Drag shots to reorder · resize boundaries · 24 fps snap</small></div>
             <div class="psvstudio-timeline-tools">
               <label class="psvstudio-zoom-control" title="Timeline zoom"><span>−</span><input id="psvstudio-timeline-zoom" type="range" min="36" max="160" step="4" value="80" aria-label="Timeline zoom" /><span>+</span></label>
               <button id="psvstudio-fit-timeline" class="psvstudio-button" type="button">Fit</button>
-              <button id="psvstudio-add-media" class="psvstudio-button" type="button">Add media</button>
               <button id="psvstudio-add-shot" class="psvstudio-button" type="button">Add shot</button>
+              <button id="psvstudio-grand-director" class="psvstudio-button psvstudio-button-primary psvstudio-timeline-director-button" type="button" title="Consult the Grand Director about the entire video">✦ Grand Director</button>
             </div>
           </div>
-          <div id="psvstudio-shot-list" class="psvstudio-timeline-viewport"></div>
-          <div id="psvstudio-media-lane" class="psvstudio-media-lane" aria-label="Project media"></div>
+          <div class="psvstudio-timeline-content">
+            <div id="psvstudio-shot-list" class="psvstudio-timeline-viewport"></div>
+            <section class="psvstudio-media-panel">
+              <div class="psvstudio-media-panel-heading">
+                <div><strong>Media</strong><small>Click to preview · drag to reorder</small></div>
+                <div class="psvstudio-media-panel-actions">
+                  <button id="psvstudio-add-media" class="psvstudio-button" type="button">Add</button>
+                  <button id="psvstudio-view-all-media" class="psvstudio-button" type="button">View all</button>
+                </div>
+              </div>
+              <div id="psvstudio-media-lane" class="psvstudio-media-lane" aria-label="Project media"></div>
+            </section>
+          </div>
           <input id="psvstudio-media-input" class="psvstudio-sr-only" type="file" accept="image/*,video/*,audio/*" multiple />
         </section>
       </div>
@@ -3618,7 +4300,9 @@ function buildPanel() {
 
   panel.querySelector("#psvstudio-new-project").addEventListener("click", newProject);
   panel.querySelector("#psvstudio-add-shot").addEventListener("click", addShot);
+  panel.querySelector("#psvstudio-grand-director").addEventListener("click", () => openDirector("project"));
   panel.querySelector("#psvstudio-add-media").addEventListener("click", () => panel.querySelector("#psvstudio-media-input").click());
+  panel.querySelector("#psvstudio-view-all-media").addEventListener("click", () => showMediaLibrary());
   panel.querySelector("#psvstudio-media-input").addEventListener("change", async event => {
     await addMediaFiles(event.target.files);
     event.target.value = "";

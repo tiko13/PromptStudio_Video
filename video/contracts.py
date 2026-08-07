@@ -235,6 +235,23 @@ def _normalize_reference(reference, index):
         "use_embedded_audio": bool(reference.get("use_embedded_audio", False)),
         "source_width": max(0, int(_number(reference.get("source_width"), 0))),
         "source_height": max(0, int(_number(reference.get("source_height"), 0))),
+        # Cached Director grounding is descriptive metadata, not prompt prose.
+        # It lets later conversational turns keep stable subject bindings without
+        # requiring the user to attach the same project reference again.
+        "observed_visual_facts": _text(reference.get("observed_visual_facts")),
+        "subject_candidates": [
+            {
+                "name": _text(item.get("name")),
+                "location": _text(item.get("location")),
+                "visual_selectors": [
+                    _text(selector)
+                    for selector in (item.get("visual_selectors") or [])
+                    if _text(selector)
+                ][:16],
+            }
+            for item in (reference.get("subject_candidates") or [])
+            if isinstance(item, dict) and _text(item.get("name"))
+        ][:16],
     }
 
 
@@ -244,12 +261,18 @@ def _normalize_dialogue(event, index):
     speaker_id = _text(event.get("speaker_id"), "S1").upper()
     if not re.fullmatch(r"S\d+(?:,S\d+)*", speaker_id):
         raise PromptDocumentError(f"Dialogue event {index + 1} has invalid speaker ID")
+    performance = _text(event.get("performance"), "speech").lower()
+    if performance not in {"speech", "singing"}:
+        raise PromptDocumentError(f"Dialogue event {index + 1} has invalid performance type")
+    if performance == "singing" and bool(event.get("voiceover", False)):
+        raise PromptDocumentError("Singing must use offscreen rather than voiceover")
     text = str(event.get("text") or "").strip()
     return {
         "id": _identifier(event.get("id"), "dialogue"),
         "speaker": _text(event.get("speaker"), "The speaker"),
         "speaker_id": speaker_id,
         "language": _text(event.get("language"), "English"),
+        "performance": performance,
         "text": text,
         "delivery": _text(event.get("delivery")),
         "voiceover": bool(event.get("voiceover", False)),
@@ -450,6 +473,7 @@ def normalize_document(value):
         "canvas_reference_id": _text(value.get("canvas_reference_id")),
         "ref_image_size": _text(value.get("ref_image_size"), "match").lower(),
         "main_description": _text(value.get("main_description")),
+        "prompt_override": _text(value.get("prompt_override")),
         "style": _text(value.get("style"), "Live-action, cinematic"),
         "shots": shots,
         "references": references,

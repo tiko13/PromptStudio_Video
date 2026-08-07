@@ -297,6 +297,15 @@ def _document_response(document, include_prompt=False):
     }
     if include_prompt:
         response["compiled_prompt"] = compile_prompt(document)
+        try:
+            response["settings_prompt"] = compile_prompt(document, use_override=False)
+            response["settings_prompt_error"] = ""
+        except PromptDocumentError as exc:
+            if not document.get("prompt_override"):
+                raise
+            response["settings_prompt"] = ""
+            response["settings_prompt_error"] = str(exc)
+        response["prompt_is_override"] = bool(document.get("prompt_override"))
     return response
 
 

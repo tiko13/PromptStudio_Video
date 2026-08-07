@@ -72,9 +72,29 @@ class DirectorTests(unittest.TestCase):
             self.assertNotIn("concrete visible identity traits observed in that image", system_message)
             self.assertNotIn("shoulder-length wavy black hair", system_message)
             self.assertNotIn("teal linen blouse", system_message)
-            self.assertIn("observed_visual_facts", system_message)
+            self.assertIn("private_subject_bindings", system_message)
+            self.assertIn("visual_selectors", system_message)
+            self.assertIn("Never copy a visual_selector", system_message)
             self.assertIn("When exactly one compatible reference exists", system_message)
             self.assertIn("When multiple compatible references exist, never guess", system_message)
+
+    def test_document_fingerprint_ignores_cached_vision_grounding(self):
+        document = normalize_document({
+            **director_document(),
+            "references": [{
+                "id": "reference-1",
+                "kind": "image",
+                "path": "woman.png",
+                "roles": ["subject"],
+            }],
+        })
+        fingerprint = document_fingerprint(document)
+        document["references"][0]["observed_visual_facts"] = "One woman is seated near a window."
+        document["references"][0]["subject_candidates"] = [{
+            "name": "young woman",
+            "location": "",
+        }]
+        self.assertEqual(document_fingerprint(document), fingerprint)
 
     def test_vision_grounding_contract_is_reference_role_focused(self):
         self.assertIn("Follow assigned_usage strictly", VISION_GROUNDING_SYSTEM_MESSAGE)
@@ -93,13 +113,25 @@ class DirectorTests(unittest.TestCase):
             {"id": "b", "name": "Second.png", "usage": "scene"},
         ]
         parsed = _parse_vision_grounding(
-            '{"images":[{"index":2,"observations":"Blue tiled room."},'
-            '{"index":1,"observations":"Platinum-blonde hair and pink clothing."}]}',
+            '{"images":[{"index":2,"observations":"Blue tiled room.","subjects":[]},'
+            '{"index":1,"observations":"Platinum-blonde hair and pink clothing.",'
+            '"subjects":[{"name":"young woman"}]}]}',
             attachments,
         )
         self.assertEqual([item["attachment_id"] for item in parsed], ["a", "b"])
         self.assertIn("Platinum-blonde", parsed[0]["observations"])
         self.assertIn("Blue tiled room", parsed[1]["observations"])
+        self.assertEqual(parsed[0]["subject_candidates"][0]["name"], "young woman")
+
+    def test_vision_grounding_requires_locations_for_same_type_subjects(self):
+        attachments = [{"id": "a", "name": "People.png", "usage": "subject"}]
+        with self.assertRaisesRegex(ValueError, "distinct locations"):
+            _parse_vision_grounding(
+                '{"images":[{"index":1,"observations":"Two people.","subjects":['
+                '{"name":"person","visual_selectors":["person in black"]},'
+                '{"name":"person","visual_selectors":["person in white"]}]}]}',
+                attachments,
+            )
 
     def test_scene_grounding_filters_person_identity_and_wardrobe(self):
         parsed = _parse_vision_grounding(
@@ -124,9 +156,9 @@ class DirectorTests(unittest.TestCase):
             ),
         )
         correction = retry[-1]["content"]
-        self.assertIn("observed_visual_facts", correction)
-        self.assertIn("Copy only those grounded facts", correction)
-        self.assertIn("do not invent or substitute appearance details", correction)
+        self.assertIn("subject_candidates", correction)
+        self.assertIn("minimal subject-to-source binding", correction)
+        self.assertIn("Do not copy image observations", correction)
 
     def test_invalid_retention_relationship_retry_lists_exact_allowed_values(self):
         retry = _proposal_retry_messages(
@@ -176,6 +208,26 @@ class DirectorTests(unittest.TestCase):
         self.assertFalse(parsed["proposal_error"])
         self.assertEqual(preview["document"]["task_types"], [])
         self.assertEqual(preview["document"]["shots"][0]["action"], "She opens a red umbrella.")
+
+    def test_director_can_replace_ordered_steps_and_visible_text(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Compose the exact shot sequence","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"visible_text":["LAST TRAIN"],"steps":['
+            '{"type":"action","text":"She raises the letter."},'
+            '{"type":"dialogue","speaker":"The woman","speaker_id":"S1","language":"English",'
+            '"performance":"singing","text":"Wait for me!"},'
+            '{"type":"action","text":"The carriage lights fade."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+        preview = preview_changeset(document, parsed["proposal"])
+        shot = preview["document"]["shots"][0]
+        self.assertEqual([step["type"] for step in shot["steps"]], ["action", "dialogue", "action"])
+        self.assertEqual(shot["visible_text"], ["LAST TRAIN"])
+        self.assertIn("(S1) sings: <d>[English] Wait for me!</d>", preview["compiled_prompt"])
 
     def test_parser_repairs_a_missing_operation_closing_brace(self):
         document = normalize_document(director_document())
@@ -358,6 +410,7 @@ class DirectorTests(unittest.TestCase):
             "source_name": "Woman",
             "usage": "subject",
             "observations": "A girl with long blonde hair wears a bright yellow raincoat and black boots.",
+            "subject_candidates": [{"name": "young woman", "location": ""}],
         }]
         with patch("video.director.load_vision_images", return_value=(attachments, [{}])), patch(
             "video.director._ground_vision_images", return_value=observations
@@ -381,8 +434,10 @@ class DirectorTests(unittest.TestCase):
         )
         preview = preview_changeset(document, result["proposal"])
         self.assertEqual(preview["document"]["subject_definitions"][0]["label"], "Subject 1")
-        self.assertIn("long blonde hair", preview["document"]["subject_definitions"][0]["text"])
-        self.assertIn("<Picture 1>", preview["document"]["subject_definitions"][0]["text"])
+        definition = preview["document"]["subject_definitions"][0]["text"]
+        self.assertEqual(definition, "is the young woman in <Picture 1>.")
+        self.assertNotIn("blonde", definition)
+        self.assertNotIn("raincoat", definition)
         self.assertIn("<Subject 1>", preview["document"]["shots"][0]["subjects"])
 
     def test_context_keeps_selected_neighbors_and_bounds_history(self):
@@ -642,7 +697,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual([shot["id"] for shot in result["document"]["shots"]], ["shot-1", "shot-2"])
         self.assertEqual(result["document"]["shots"][1]["start"], 4.5)
 
-    def test_proposal_rejects_protected_fields_and_other_shots(self):
+    def test_selected_shot_proposal_accepts_visible_text_but_rejects_other_shots(self):
         fingerprint = document_fingerprint(director_document())
         protected = (
             f"{CHANGESET_BEGIN}\n"
@@ -651,8 +706,8 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_END}"
         )
         parsed = parse_director_response(protected, "shot-2", fingerprint)
-        self.assertIsNone(parsed["proposal"])
-        self.assertIn("Protected or unsupported", parsed["proposal_error"])
+        self.assertIsNotNone(parsed["proposal"])
+        self.assertEqual(parsed["proposal"]["operations"][0]["fields"]["visible_text"], ["Changed"])
 
         other = protected.replace('"shot_id":"shot-2"', '"shot_id":"shot-1"').replace(
             '"visible_text":["Changed"]', '"action":"Changed"'
@@ -749,7 +804,7 @@ class DirectorTests(unittest.TestCase):
         attached = context["attached_images"][0]
         self.assertIn("platinum-blonde", attached["observed_visual_facts"])
         self.assertIn("pink crop top", attached["observed_visual_facts"])
-        self.assertIn("Authoritative pixel observations", attached["observation_policy"])
+        self.assertIn("do not copy them into prompt prose", attached["observation_policy"])
 
     def test_director_grounds_images_before_structured_request(self):
         document = director_document()
@@ -904,7 +959,8 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 1)
         preview = preview_changeset(document, result["proposal"])
         prompt = preview["compiled_prompt"]
-        self.assertIn("<Subject 1> is the blonde woman in <Picture 1>", prompt)
+        self.assertIn("<Subject 1> is the woman in <Picture 1>", prompt)
+        self.assertNotIn("<Subject 1> is the blonde woman", prompt)
         self.assertIn("<Subject 2> is the contemporary office environment in <Picture 2>", prompt)
         self.assertGreaterEqual(prompt.count("<Subject 1>"), 5)
         self.assertGreaterEqual(prompt.count("<Subject 2>"), 5)
@@ -1344,7 +1400,170 @@ class DirectorTests(unittest.TestCase):
             })
         self.assertEqual(generate.call_count, 4)
         self.assertIsNone(result["proposal"])
-        self.assertIn("required structured proposal", result["proposal_error"])
+        self.assertEqual(result["status"], "needs_clarification")
+        self.assertFalse(result["proposal_error"])
+        self.assertIn("kept the draft", result["message"])
+        self.assertIn("required structured proposal", result["pending_plan"]["validation_issue"])
+
+    def test_ambiguous_subject_binding_asks_then_continues_pending_plan(self):
+        value = director_document()
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "women.png",
+            "name": "Women", "roles": ["subject"],
+            "observed_visual_facts": "Two women stand side by side.",
+            "subject_candidates": [
+                {"name": "young woman", "location": "left"},
+                {"name": "young woman", "location": "right"},
+            ],
+        }]
+        document = normalize_document(value)
+        first_request = {
+            "scope": "project",
+            "document": document,
+            "messages": [{"role": "user", "content": "She sits down on a chair."}],
+        }
+        with patch("video.director.generate_chat") as generate:
+            clarification = director_chat(first_request)
+
+        self.assertEqual(generate.call_count, 0)
+        self.assertEqual(clarification["status"], "needs_clarification")
+        self.assertEqual(
+            clarification["clarification"]["choices"],
+            ["young woman on the left", "young woman on the right"],
+        )
+        response = (
+            "I continued the pending plan.\n"
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Seat the selected subject","operations":['
+            '{"op":"update_shot","shot_id":"shot-1","fields":'
+            '{"action":"<Subject 1> sits down on a chair."}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        continued_request = {
+            "scope": "project",
+            "document": document,
+            "pending_plan": clarification["pending_plan"],
+            "messages": [
+                {"role": "user", "content": "She sits down on a chair."},
+                {"role": "assistant", "content": clarification["message"]},
+                {"role": "user", "content": "The young woman on the left."},
+            ],
+        }
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat(continued_request)
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(result["status"], "ready")
+        preview = preview_changeset(document, result["proposal"])
+        self.assertEqual(
+            preview["document"]["subject_definitions"][0]["text"],
+            "is the young woman on the left in <Picture 1>.",
+        )
+        self.assertIn("<Subject 1> sits down on a chair", preview["compiled_prompt"])
+
+    def test_visual_identifiers_resolve_two_private_subjects_without_prompt_leakage(self):
+        value = director_document()
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "people.png",
+            "name": "People", "roles": ["subject"],
+            "observed_visual_facts": "Two people stand side by side, one dressed in black and one in white.",
+            "subject_candidates": [
+                {
+                    "name": "person", "location": "left",
+                    "visual_selectors": ["person in black", "black outfit"],
+                },
+                {
+                    "name": "person", "location": "right",
+                    "visual_selectors": ["person in white", "white outfit"],
+                },
+            ],
+        }]
+        document = normalize_document(value)
+        response = (
+            "I assigned both referenced people independently.\n"
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage both subjects","operations":['
+            '{"op":"update_shot","shot_id":"shot-1","fields":'
+            '{"action":"<Subject 1> sits down while <Subject 2> opens the door."}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        request = {
+            "scope": "project",
+            "document": document,
+            "messages": [{
+                "role": "user",
+                "content": "Person in black sits down; person in white opens the door.",
+            }],
+        }
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat(request)
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(result["status"], "ready")
+        context = provider_context(generate.call_args.args[1])
+        self.assertEqual(
+            [item["token"] for item in context["private_subject_bindings"]],
+            ["<Subject 1>", "<Subject 2>"],
+        )
+        preview = preview_changeset(document, result["proposal"])
+        definitions = preview["document"]["subject_definitions"]
+        self.assertEqual(
+            [item["text"] for item in definitions],
+            [
+                "is the person on the left in <Picture 1>.",
+                "is the person on the right in <Picture 1>.",
+            ],
+        )
+        prompt = preview["compiled_prompt"].casefold()
+        self.assertIn("<subject 1> sits down", prompt)
+        self.assertIn("<subject 2> opens the door", prompt)
+        self.assertNotIn("person in black", prompt)
+        self.assertNotIn("person in white", prompt)
+        self.assertNotIn("black outfit", prompt)
+        self.assertNotIn("white outfit", prompt)
+
+    def test_private_visual_identifier_leak_is_corrected_to_subject_token(self):
+        value = director_document()
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "people.png",
+            "name": "People", "roles": ["subject"],
+            "subject_candidates": [
+                {
+                    "name": "person", "location": "left",
+                    "visual_selectors": ["person in black", "black outfit"],
+                },
+                {
+                    "name": "person", "location": "right",
+                    "visual_selectors": ["person in white", "white outfit"],
+                },
+            ],
+        }]
+        document = normalize_document(value)
+        leaked = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Seat the subject","operations":[{"op":"update_shot","shot_id":"shot-1",'
+            '"fields":{"action":"The person in black sits down."}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        corrected = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Seat the subject","operations":[{"op":"update_shot","shot_id":"shot-1",'
+            '"fields":{"action":"<Subject 1> sits down."}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        with patch("video.director.generate_chat", side_effect=[leaked, corrected]) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "messages": [{"role": "user", "content": "Person in black sits down."}],
+            })
+
+        self.assertEqual(generate.call_count, 2)
+        retry = generate.call_args_list[1].args[1][-1]["content"]
+        self.assertIn("only a private identifier", retry)
+        preview = preview_changeset(document, result["proposal"])
+        self.assertIn("<Subject 1> sits down", preview["compiled_prompt"])
+        self.assertNotIn("person in black", preview["compiled_prompt"].casefold())
 
     def test_complete_project_gets_second_correction_for_an_incomplete_first_correction(self):
         document = normalize_document(director_document())

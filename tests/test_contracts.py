@@ -26,6 +26,10 @@ class ContractTests(unittest.TestCase):
         normalized = normalize_document(document(main_description="A cyclist crosses the city at dawn."))
         self.assertEqual(normalized["main_description"], "A cyclist crosses the city at dawn.")
 
+    def test_manual_prompt_override_is_preserved(self):
+        normalized = normalize_document(document(prompt_override="A complete ad-hoc MiniMax prompt."))
+        self.assertEqual(normalized["prompt_override"], "A complete ad-hoc MiniMax prompt.")
+
     def test_adaptive_canvas_preserves_ratio_on_minimax_grid(self):
         self.assertEqual(adapt_canvas(1920, 1080), (1344, 768))
         self.assertEqual(adapt_canvas(1080, 1920), (768, 1344))
@@ -81,6 +85,31 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(normalized["task_types"], ["reference generation"])
         self.assertEqual(normalized["references"][0]["label"], "<Picture 1>")
 
+    def test_reference_subject_grounding_cache_is_preserved(self):
+        subject = {
+            "kind": "image",
+            "path": "subject.png",
+            "roles": ["subject"],
+            "observed_visual_facts": "One young woman stands near the center.",
+            "subject_candidates": [{
+                "name": "young woman",
+                "location": "center",
+                "visual_selectors": ["person in black", "black jacket"],
+            }],
+        }
+        normalized = normalize_document(document(references=[subject]))
+
+        reference = normalized["references"][0]
+        self.assertEqual(reference["observed_visual_facts"], subject["observed_visual_facts"])
+        self.assertEqual(
+            reference["subject_candidates"],
+            [{
+                "name": "young woman",
+                "location": "center",
+                "visual_selectors": ["person in black", "black jacket"],
+            }],
+        )
+
     def test_retention_relationship_spelling_variants_are_canonicalized(self):
         normalized = normalize_document(document(retention_analysis=[{
             "label": "<Subject 1>",
@@ -120,6 +149,20 @@ class ContractTests(unittest.TestCase):
             normalize_document(document(shots=[{
                 "start": 0,
                 "dialogue": [{"speaker_id": "speaker one", "text": "Hello."}],
+            }]))
+
+    def test_singing_is_supported_but_not_as_voiceover(self):
+        normalized = normalize_document(document(shots=[{
+            "start": 0,
+            "dialogue": [{"speaker_id": "S1", "performance": "singing", "text": "Hold on."}],
+        }]))
+        self.assertEqual(normalized["shots"][0]["dialogue"][0]["performance"], "singing")
+        with self.assertRaisesRegex(PromptDocumentError, "offscreen rather than voiceover"):
+            normalize_document(document(shots=[{
+                "start": 0,
+                "dialogue": [{
+                    "speaker_id": "S1", "performance": "singing", "voiceover": True, "text": "Hold on.",
+                }],
             }]))
 
     def test_legacy_action_and_dialogue_migrate_to_ordered_steps(self):

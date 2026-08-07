@@ -94,8 +94,9 @@ def _dialogue_text(event):
             f"{speaker} ({speaker_id}) says in an off-screen voiceover{delivery}: "
             f"{block} while the corresponding on-screen character's lips remain completely closed"
         )
+    verb = "sings" if event.get("performance") == "singing" else "says"
     location = " off-screen" if event.get("offscreen") else ""
-    return _sentence(f"{speaker} ({speaker_id}) says{location}{delivery}: {block}")
+    return _sentence(f"{speaker} ({speaker_id}) {verb}{location}{delivery}: {block}")
 
 
 def _step_text(step):
@@ -351,8 +352,10 @@ def validate_reference_semantics(document):
         )
 
 
-def compile_prompt(value):
+def compile_prompt(value, *, use_override=True):
     document = normalize_document(value)
+    if use_override and document["prompt_override"]:
+        return document["prompt_override"]
     if document["resolved_mode"] == "ref2va":
         validate_reference_semantics(document)
         return _compile_reference(document)
