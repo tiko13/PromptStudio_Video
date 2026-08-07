@@ -35,7 +35,7 @@ class CompilerTests(unittest.TestCase):
     def test_t2va_has_three_core_fields_and_no_alignment_instruction(self):
         prompt = compile_prompt(base_document())
         self.assertTrue(prompt.startswith("integrated_multimodal_description: [Shot 1]"))
-        self.assertIn("A baker opens the street bakery before sunrise.", prompt)
+        self.assertNotIn("A baker opens the street bakery before sunrise.", prompt)
         self.assertIn("The camera pushes in with small amplitude at slow speed toward the bread.", prompt)
         self.assertIn("<d>[English] First batch of the morning.</d>", prompt)
         self.assertIn("\noverall_soundscape:", prompt)
@@ -50,11 +50,34 @@ class CompilerTests(unittest.TestCase):
         self.assertTrue(prompt.startswith("For the target video, at 0.00 seconds"))
         self.assertIn("<d>[English] Don't rewrite THIS!</d>", prompt)
 
-    def test_main_description_precedes_shot_specific_details(self):
+    def test_i2va_first_shot_uses_pixels_for_anchored_visual_details(self):
+        value = base_document(references=[{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+        }])
+        value["shots"][0].update({
+            "subjects": "An invented subject description",
+            "environment": "An invented setting",
+            "lighting": "Invented sunset lighting",
+            "action": "The subject raises one hand.",
+        })
+
+        prompt = compile_prompt(value)
+
+        self.assertNotIn("Live-action, cinematic", prompt)
+        self.assertNotIn("A medium-wide shot", prompt)
+        self.assertNotIn("An invented subject description", prompt)
+        self.assertNotIn("An invented setting", prompt)
+        self.assertNotIn("Invented sunset lighting", prompt)
+        self.assertIn("established by <Picture 1> remain fully preserved", prompt)
+        self.assertIn("The subject raises one hand.", prompt)
+        self.assertIn("The camera pushes in", prompt)
+
+    def test_main_description_is_planning_only_and_not_compiled(self):
         prompt = compile_prompt(base_document())
-        self.assertLess(
-            prompt.index("A baker opens the street bakery before sunrise."),
-            prompt.index("A medium-wide shot frames a baker opening the shutters."),
+        self.assertNotIn("A baker opens the street bakery before sunrise.", prompt)
+        self.assertIn(
+            "integrated_multimodal_description: [Shot 1] Live-action, cinematic.",
+            prompt,
         )
 
     def test_fl2va_uses_effective_duration_and_final_shot(self):
@@ -207,7 +230,9 @@ class CompilerTests(unittest.TestCase):
             main_description="The target edits <Video 1> while following its existing action.",
             overall_soundscape="The speaker uses the low, calm vocal timbre from <Audio 1>.",
         )
+        value["shots"][0]["action"] = "<Video 1> supplies the source action and cut timing."
         prompt = compile_prompt(value)
+        self.assertNotIn("The target edits <Video 1> while following its existing action.", prompt)
         self.assertIn("[video editing + audio reference]", prompt)
         self.assertIn("<Video 1> is the source video", prompt)
         self.assertIn("<Audio 1> is the speaker's low, calm voice-timbre reference", prompt)
@@ -221,6 +246,31 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("says in an off-screen voiceover", prompt)
         self.assertIn("<cutoff></d>", prompt)
         self.assertIn("lips remain completely closed", prompt)
+
+    def test_shot_steps_compile_in_their_exact_chronological_order(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [
+            {"type": "action", "text": "Character A picks up the letter."},
+            {
+                "type": "dialogue", "speaker": "Character A", "speaker_id": "S1",
+                "language": "English", "text": "This came yesterday.",
+            },
+            {"type": "action", "text": "She recognizes the handwriting."},
+            {
+                "type": "dialogue", "speaker": "Character A", "speaker_id": "S1",
+                "language": "English", "text": "I thought he was dead.",
+            },
+        ]
+        prompt = compile_prompt(value)
+        ordered = [
+            "Character A picks up the letter.",
+            "<d>[English] This came yesterday.</d>",
+            "She recognizes the handwriting.",
+            "<d>[English] I thought he was dead.</d>",
+        ]
+        positions = [prompt.index(item) for item in ordered]
+        self.assertEqual(positions, sorted(positions))
 
 
 if __name__ == "__main__":

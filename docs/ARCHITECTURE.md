@@ -13,26 +13,36 @@ The versioned structured document is authoritative:
 ```text
 document
 ├── mode, duration, and canvas
-├── main whole-video description and visual style
+├── planning-only whole-video synopsis and compiled visual style
 ├── references and semantic roles
 ├── shots
-│   ├── composition, subjects, environment, lighting, action
+│   ├── composition, subjects, environment, and lighting
+│   ├── authoritative chronological action/dialogue steps
 │   ├── camera motion, amplitude, speed, and target
-│   ├── immutable dialogue and visible text
+│   ├── compatibility action/dialogue mirrors and immutable visible text
 │   └── synchronized sound events
 ├── overall soundscape and non-diegetic music
 └── REF2VA definitions, summary, and retention analysis
 ```
 
 The canvas and future LLM patches edit this document. `video/compiler.py`
-produces the queue prompt deterministically. Alignment instructions, section
-ordering, reference labels, dialogue tags, and timestamps must not be delegated
-to unrestricted LLM prose.
+produces the queue prompt deterministically. `main_description` remains visible
+as a planning synopsis and Grand Director input, but the compiler deliberately
+omits it; all generated visual content begins in `[Shot 1]`. Alignment
+instructions, section ordering, reference labels, dialogue tags, and timestamps
+must not be delegated to unrestricted LLM prose.
 
 The standalone studio wraps the prompt document in a project record containing
 the user's production brief, selected `[PSV]` workflow, and immutable generation
 snapshots. Manual controls and AI Director patches operate on the same
 document; there is no separate simplified prompt state.
+
+The standalone right panel is a compact Shots navigator. Detailed shot setup
+and the ordered performance sequence live in a transactional popup editor. The
+compiler follows the step list exactly, allowing action, dialogue, subsequent
+action, and later dialogue to remain causally ordered without artificial
+timestamps. Documents without steps migrate deterministically by placing the
+legacy action first and existing dialogue after it.
 
 ## AI Directors
 
@@ -43,22 +53,24 @@ tail. Its validated change set supports project-field updates, edits across
 existing shots, cut-time changes, adding or removing unprotected shots, and the
 structured reference definitions and retention analysis required by REF2VA.
 
-The selected-shot inspector opens a separate shot-scoped Director. It receives
+The shot popup editor opens a separate shot-scoped Director. It receives
 the selected shot, its immediate neighbors, and the same compact constraints.
-Its write contract remains limited to descriptive, sound, and camera updates on
-that selected shot, plus reference-semantic fields when an attached reference
-must be activated for that shot. Neither scope receives the compiled queue
-prompt or unlimited conversation history.
+Its write contract remains limited to descriptive, sound, camera, and new
+dialogue additions on that selected shot, plus reference-semantic fields when
+an attached reference must be activated for that shot. Neither scope receives
+the compiled queue prompt or unlimited conversation history.
 
 Conversational answers do not mutate project state. Requested edits use a
 video-specific change set whose base-document hash, scope, target IDs, field
 allowlists, camera vocabulary, timing, reference coverage, and normalized
-result are validated on the server. Reference assets themselves, dialogue,
-speaker IDs, and visible text remain outside both write scopes; reference
-analysis may describe and activate already-committed assets but cannot replace
-them. A project proposal cannot remove a shot that contains protected dialogue
-or visible text. The browser applies the validated document only after explicit
-user approval and rejects proposals made against an older document revision.
+result are validated on the server. Reference assets and visible text remain
+outside both write scopes. Dialogue proposals are append-only: the Director may
+add newly requested lines but cannot rewrite or remove existing dialogue or
+speaker IDs. Reference analysis may describe and activate already-committed
+assets but cannot replace them. A project proposal cannot remove a shot that
+contains protected dialogue or visible text. The browser applies the validated
+document only after explicit user approval and rejects proposals made against
+an older document revision.
 
 Director history is stored separately in browser storage and capped. Approved
 document changes remain the durable memory that subsequent bounded-context

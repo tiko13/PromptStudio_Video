@@ -19,8 +19,9 @@ This repository is under active development. The current vertical slice contains
   visible text, sound, and media roles; and
 - a standalone Video Studio with durable projects, authoritative manual shot
   editing, a docked proportional timeline with pointer reordering, frame-snapped
-  trimming, zoom and fit controls, screen-wide media drop, draggable reference
-  ordering, explicit MiniMax media roles, `[PSV]` workflow discovery,
+  trimming, a compact Shots navigator, transactional per-shot popup editors,
+  draggable chronological action/dialogue steps, zoom and fit controls,
+  screen-wide media drop, draggable reference ordering, explicit MiniMax media roles, `[PSV]` workflow discovery,
   deterministic prompt preview, ComfyUI queueing, progress, video history, and
   exact workflow replay;
 - a context-budgeted selected-shot AI Director for KoboldCpp or Ollama, with
@@ -72,13 +73,18 @@ geometry. The linked ratio is resized to a configurable target megapixel value
 (about 1.03 MP by default, matching `768 × 1344`) and both axes are rounded to
 MiniMax H3's required multiple of 32.
 
-Dialogue text is stored separately and emitted verbatim inside MiniMax `<d>`
-tags. Camera movement is stored as motion type, amplitude, speed, and target,
-then compiled into natural English.
+Each shot owns an authoritative chronological `steps` list. Action and dialogue
+steps can be interleaved and are compiled in their exact top-to-bottom order;
+dialogue text remains verbatim inside MiniMax `<d>` tags. Legacy `action` and
+`dialogue` fields are retained as deterministic compatibility mirrors. Camera
+movement is stored as motion type, amplitude, speed, and target, then compiled
+into natural English.
 
-The editable **Production brief** is the main whole-video description. It is
-compiled before the timeline-specific shot details and is also available as
-**Main video description** in the workflow node's Director Canvas.
+The editable **Production brief** is a planning synopsis for the user and Grand
+Director. It is not compiled into the MiniMax prompt. The Grand Director uses it
+to infer the useful shot count and translates its visual beats into the
+timeline-specific shot fields. It is also available as **Production brief
+(planning only)** in the workflow node's Director Canvas.
 
 Reference and shot identifiers use MiniMax's guide-exact grammar:
 `<Picture 1>`, `<Video 1>`, `<Audio 1>`, `<Subject 1>`, and `[Shot 1]`. Legacy
@@ -96,10 +102,10 @@ times, or add and remove unprotected shots. REF2VA proposals must represent
 every source reference, use every defined label in the summary and applicable
 shots, and populate all six full-reference sections before generation.
 
-Use **Ask Director about this shot** in the selected-shot inspector for the
+Use **Save & ask Director** in the shot popup editor for the
 tighter shot-focused workflow. It receives only the selected shot and immediate
-neighbors, and its proposals can update only descriptive fields, sound, and
-camera on that selected shot.
+neighbors, and its proposals can update descriptive fields, sound, camera, and
+append newly requested dialogue on that selected shot.
 
 Both buttons open the local LLM consultation panel with separate conversation
 histories. Connection settings default to the companion
@@ -142,10 +148,12 @@ outside Director dialogs. It reports idle, busy, or unreachable state and can
 send KoboldCpp's supported abort signal to stop a runaway text generation
 without unloading the model or restarting KoboldCpp.
 
-Dialogue, visible text, and references remain protected in both scopes. The
-Grand Director cannot remove a shot containing protected dialogue or visible
-text. Every proposal is previewed against a document hash, normalized,
-compiled, and applied only after confirmation.
+Existing dialogue, visible text, and references remain protected in both
+scopes. The Director may append newly requested dialogue but cannot rewrite or
+remove an existing line or speaker ID. The Grand Director cannot remove a shot
+containing protected dialogue or visible text. Every proposal is previewed
+against a document hash, normalized, compiled, and applied only after
+confirmation.
 
 Explicit requests to create, compose, generate, or apply the full prompt require
 a structured proposal. If a local model returns only prose, Video Studio makes

@@ -678,7 +678,7 @@ function install(node) {
       renderShotInspector(shot);
       inspectorPane.append(
         el("h4", "", "Whole video"),
-        field("Main video description", textarea(draft.main_description, value => { draft.main_description = value; })),
+        field("Production brief (planning only)", textarea(draft.main_description, value => { draft.main_description = value; })),
         field("Overall soundscape", textarea(draft.overall_soundscape, value => { draft.overall_soundscape = value; })),
         field("Non-diegetic music", textarea(draft.non_diegetic_music, value => { draft.non_diegetic_music = value; })),
       );

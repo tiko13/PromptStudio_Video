@@ -122,6 +122,40 @@ class ContractTests(unittest.TestCase):
                 "dialogue": [{"speaker_id": "speaker one", "text": "Hello."}],
             }]))
 
+    def test_legacy_action_and_dialogue_migrate_to_ordered_steps(self):
+        normalized = normalize_document(document(shots=[{
+            "start": 0,
+            "action": "She picks up the letter.",
+            "dialogue": [{"speaker_id": "S1", "text": "This came yesterday."}],
+        }]))
+        shot = normalized["shots"][0]
+        self.assertEqual([step["type"] for step in shot["steps"]], ["action", "dialogue"])
+        self.assertEqual(shot["action"], "She picks up the letter.")
+        self.assertEqual(shot["dialogue"][0]["text"], "This came yesterday.")
+
+    def test_steps_are_authoritative_and_keep_legacy_mirrors(self):
+        normalized = normalize_document(document(shots=[{
+            "start": 0,
+            "action": "Obsolete action.",
+            "dialogue": [{"speaker_id": "S9", "text": "Obsolete line."}],
+            "steps": [
+                {"id": "step-1", "type": "action", "text": "She opens the letter."},
+                {"id": "line-1", "type": "dialogue", "speaker_id": "S1", "text": "It is his handwriting."},
+                {"id": "step-2", "type": "action", "text": "She freezes."},
+            ],
+        }]))
+        shot = normalized["shots"][0]
+        self.assertEqual(shot["action"], "She opens the letter. She freezes.")
+        self.assertEqual([item["text"] for item in shot["dialogue"]], ["It is his handwriting."])
+        self.assertEqual([step["id"] for step in shot["steps"]], ["step-1", "line-1", "step-2"])
+
+    def test_step_types_are_validated(self):
+        with self.assertRaisesRegex(PromptDocumentError, "unsupported type"):
+            normalize_document(document(shots=[{
+                "start": 0,
+                "steps": [{"type": "pause", "text": "A pause."}],
+            }]))
+
 
 if __name__ == "__main__":
     unittest.main()

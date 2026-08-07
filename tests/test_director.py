@@ -17,6 +17,7 @@ from video.director import (
     parse_director_response,
     preview_changeset,
     _validate_reference_only_preservation,
+    _validate_i2va_anchor_preservation,
     _validate_requested_project_result,
     _enrich_reference_definition_placeholders,
     _parse_vision_grounding,
@@ -57,6 +58,14 @@ def provider_context(messages):
 
 
 class DirectorTests(unittest.TestCase):
+    @staticmethod
+    def i2va_document():
+        value = director_document()
+        value["references"] = [{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+        }]
+        return normalize_document(value)
+
     def test_reference_contract_has_no_literal_appearance_example(self):
         for system_message in (SHOT_SYSTEM_MESSAGE, PROJECT_SYSTEM_MESSAGE):
             self.assertNotIn("with the observed identity traits.", system_message)
@@ -277,6 +286,48 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("<Subject 1>", result["document"]["shots"][0]["subjects"])
         self.assertIn("<Subject 1>", result["compiled_prompt"])
 
+    def test_reference_subject_prose_is_grammatical_and_not_duplicated_in_shot(self):
+        value = director_document()
+        value["shots"] = [value["shots"][0]]
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "woman.png",
+            "name": "Woman", "roles": ["subject"],
+        }]
+        document = normalize_document(value)
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Create the rain dance",
+            "operations": [{"op": "update_project", "fields": {
+                "task_types": ["reference generation"],
+                "subject_definitions": [{
+                    "label": "Subject 1",
+                    "text": "A young woman defined in <Picture 1>, wearing casual clothes, with dark hair.",
+                }],
+                "summary": "The video follows <Subject 1> dancing in the rain.",
+                "retention_analysis": [{
+                    "label": "<Subject 1>", "where": "appears in [Shot 1]",
+                    "relationship": "fully_preserved",
+                    "detail": "Her appearance remains consistent.",
+                }],
+            }}, {"op": "update_shot", "shot_id": "shot-1", "fields": {
+                "subjects": "<Subject 1> stands center frame.",
+                "action": "The girl from <Subject 1> dances happily in the rain. She spins and smiles brightly.",
+            }}],
+        }
+
+        result = preview_changeset(document, proposal)
+        shot_value = result["document"]["shots"][0]
+        definition = result["document"]["subject_definitions"][0]["text"]
+
+        self.assertEqual(
+            shot_value["action"],
+            "<Subject 1> dances happily in the rain. She spins and smiles brightly.",
+        )
+        self.assertEqual(shot_value["subjects"].count("<Subject 1>"), 1)
+        self.assertNotIn("defined in <Picture 1>", shot_value["subjects"])
+        self.assertTrue(definition.startswith("is a young woman shown in <Picture 1>"))
+
     def test_director_synthesizes_grounded_reference_package_when_model_omits_it(self):
         value = director_document()
         value["shots"] = [value["shots"][0]]
@@ -400,6 +451,74 @@ class DirectorTests(unittest.TestCase):
                     "messages": [{"role": "user", "content": instruction}],
                 }))
 
+    def test_dialogue_line_requests_require_an_applicable_proposal(self):
+        for instruction in (
+            "Create a line of dialogue for her.",
+            "Give the woman a good line here.",
+            "What should she say in this moment?",
+        ):
+            with self.subTest(instruction=instruction):
+                self.assertTrue(_proposal_requested({
+                    "messages": [{"role": "user", "content": instruction}],
+                }))
+        self.assertTrue(_proposal_requested({
+            "messages": [{"role": "user", "content": "Suggest a line and change the camera to a push-in."}],
+        }))
+
+    def test_dialogue_changeset_appends_without_rewriting_existing_dialogue(self):
+        document = normalize_document(director_document())
+        fingerprint = document_fingerprint(document)
+        raw = (
+            "This line fits the farewell.\n"
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Suggest a line","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"dialogue":[{"speaker":"The woman",'
+            '"speaker_id":"S1","language":"English","text":"Maybe goodbye is just another window.",'
+            '"start":1.5}]}}]}\n'
+            f"{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", fingerprint)
+        preview = preview_changeset(document, parsed["proposal"])
+
+        self.assertFalse(parsed["proposal_error"])
+        self.assertEqual(parsed["message"], "This line fits the farewell.")
+        dialogue = preview["document"]["shots"][0]["dialogue"]
+        self.assertEqual([item["text"] for item in dialogue], [
+            "Do not rewrite this.",
+            "Maybe goodbye is just another window.",
+        ])
+        self.assertNotIn("start", dialogue[1])
+        self.assertEqual(
+            [step["type"] for step in preview["document"]["shots"][0]["steps"]],
+            ["action", "dialogue", "dialogue"],
+        )
+
+    def test_project_proposal_accepts_new_shot_dialogue_and_empty_protected_echoes(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add the invitation","operations":['
+            '{"op":"update_shot","shot_id":"shot-2","fields":{"action":"She powers on the computer.",'
+            '"dialogue":[],"visible_text":[]}},'
+            '{"op":"add_shot","shot":{"id":"invitation-shot","start":6.0,'
+            '"action":"She turns toward the lens.","dialogue":[{"speaker":"",'
+            '"text":"wanna play?","start":6.5}],"visible_text":[]}}]}\n'
+            f"{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+        preview = preview_changeset(document, parsed["proposal"])
+
+        self.assertFalse(parsed["proposal_error"])
+        self.assertEqual(len(preview["document"]["shots"]), 3)
+        dialogue = preview["document"]["shots"][2]["dialogue"][0]
+        self.assertEqual(dialogue["speaker"], "The speaker")
+        self.assertEqual(dialogue["speaker_id"], "S1")
+        self.assertEqual(dialogue["language"], "English")
+        self.assertEqual(dialogue["text"], "wanna play?")
+        self.assertIn("<d>[English] wanna play?</d>", preview["compiled_prompt"])
+
     def test_camera_phrases_are_normalized_to_document_enums(self):
         document = normalize_document(director_document())
         fingerprint = document_fingerprint(document)
@@ -472,7 +591,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(result["document"]["non_diegetic_music"], "N/A")
         self.assertEqual(result["document"]["overall_soundscape"], "Wheel hum.")
 
-    def test_project_proposal_can_update_main_description(self):
+    def test_project_proposal_can_update_planning_synopsis_without_compiling_it(self):
         document = normalize_document(director_document())
         fingerprint = document_fingerprint(document)
         raw = (
@@ -488,7 +607,7 @@ class DirectorTests(unittest.TestCase):
             result["document"]["main_description"],
             "A woman reads a farewell letter during a rainy night train journey.",
         )
-        self.assertIn(result["document"]["main_description"], result["compiled_prompt"])
+        self.assertNotIn(result["document"]["main_description"], result["compiled_prompt"])
 
     def test_structured_camera_motion_is_not_duplicated_in_action(self):
         document = normalize_document(director_document())
@@ -527,15 +646,17 @@ class DirectorTests(unittest.TestCase):
         fingerprint = document_fingerprint(director_document())
         protected = (
             f"{CHANGESET_BEGIN}\n"
-            '{"summary":"Rewrite dialogue","operations":[{"op":"update_shot",'
-            '"shot_id":"shot-2","fields":{"dialogue":[]}}]}\n'
+            '{"summary":"Rewrite visible text","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"visible_text":["Changed"]}}]}\n'
             f"{CHANGESET_END}"
         )
         parsed = parse_director_response(protected, "shot-2", fingerprint)
         self.assertIsNone(parsed["proposal"])
         self.assertIn("Protected or unsupported", parsed["proposal_error"])
 
-        other = protected.replace('"shot_id":"shot-2"', '"shot_id":"shot-1"').replace('"dialogue":[]', '"action":"Changed"')
+        other = protected.replace('"shot_id":"shot-2"', '"shot_id":"shot-1"').replace(
+            '"visible_text":["Changed"]', '"action":"Changed"'
+        )
         parsed = parse_director_response(other, "shot-2", fingerprint)
         self.assertIsNone(parsed["proposal"])
         self.assertIn("another shot", parsed["proposal_error"])
@@ -548,7 +669,7 @@ class DirectorTests(unittest.TestCase):
             "summary": "Update action",
             "operations": [{"op": "update_shot", "shot_id": "shot-2", "fields": {"action": "New action"}}],
         }
-        document["shots"][1]["action"] = "A manual edit happened."
+        document["shots"][1]["steps"][0]["text"] = "A manual edit happened."
         with self.assertRaisesRegex(ValueError, "changed after this proposal"):
             preview_changeset(document, proposal)
 
@@ -1055,6 +1176,74 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 1)
         self.assertNotIn("temperature", generate.call_args.args[0])
         self.assertEqual(generate.call_args.args[0]["thinking_mode"], "Disabled")
+
+    def test_i2va_director_context_enforces_first_frame_lock(self):
+        messages, _usage = build_provider_messages({
+            "scope": "project",
+            "document": self.i2va_document(),
+            "messages": [{"role": "user", "content": "Create the full prompt."}],
+        })
+
+        self.assertIn("I2VA FIRST-FRAME LOCK", messages[0]["content"])
+        self.assertIn("A request for a complete/full prompt does not authorize", messages[0]["content"])
+
+    def test_i2va_rejects_fabricated_anchor_and_inherited_scene_fields(self):
+        original = self.i2va_document()
+        result = copy.deepcopy(original)
+        result["shots"][0]["lighting"] = "Invented orange sunset light."
+        result["shots"][1]["environment"] = "An invented marble ballroom."
+
+        with self.assertRaisesRegex(ValueError, "Shot 1 anchored visual fields"):
+            _validate_i2va_anchor_preservation(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": "Create the complete prompt."}]},
+            )
+
+        result["shots"][0] = copy.deepcopy(original["shots"][0])
+        with self.assertRaisesRegex(ValueError, "later shots to inherit"):
+            _validate_i2va_anchor_preservation(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": "Create the complete prompt."}]},
+            )
+
+    def test_i2va_allows_explicit_later_scene_change(self):
+        original = self.i2va_document()
+        result = copy.deepcopy(original)
+        result["shots"][1]["environment"] = "A different exterior location."
+        result["shots"][1]["lighting"] = "Night lighting from street lamps."
+
+        _validate_i2va_anchor_preservation(
+            original,
+            result,
+            {"messages": [{
+                "role": "user",
+                "content": "In Shot 2, change the location to the street and switch the lighting to night.",
+            }]},
+        )
+
+        _validate_i2va_anchor_preservation(
+            original,
+            result,
+            {
+                "document": original,
+                "brief": "After the cut, change the scene to a street and shift the lighting to night.",
+                "messages": [{"role": "user", "content": "Build the full prompt from the brief."}],
+            },
+        )
+
+    def test_complete_i2va_requires_action_but_not_fabricated_visual_fields(self):
+        document = self.i2va_document()
+        for shot in document["shots"]:
+            shot["composition"] = ""
+            shot["subjects"] = ""
+            shot["environment"] = ""
+            shot["lighting"] = ""
+
+        _validate_requested_project_result(document, {
+            "messages": [{"role": "user", "content": "Create the complete video prompt."}],
+        })
 
     def test_explicit_full_prompt_request_retries_missing_proposal_once(self):
         proposal_response = (

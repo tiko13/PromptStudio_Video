@@ -259,6 +259,22 @@ def _normalize_dialogue(event, index):
     }
 
 
+def _normalize_step(step, index):
+    if not isinstance(step, dict):
+        raise PromptDocumentError(f"Shot step {index + 1} must be an object")
+    step_type = _text(step.get("type")).lower()
+    if step_type == "action":
+        return {
+            "id": _identifier(step.get("id"), "step"),
+            "type": "action",
+            "text": _text(step.get("text")),
+        }
+    if step_type == "dialogue":
+        dialogue = _normalize_dialogue(step, index)
+        return {**dialogue, "type": "dialogue"}
+    raise PromptDocumentError(f"Shot step {index + 1} has unsupported type '{step_type}'")
+
+
 def _normalize_shot(shot, index):
     if not isinstance(shot, dict):
         raise PromptDocumentError(f"Shot {index + 1} must be an object")
@@ -272,9 +288,29 @@ def _normalize_shot(shot, index):
         raise PromptDocumentError(f"Shot {index + 1} has invalid camera amplitude")
     if speed not in {"slow", "default", "fast"}:
         raise PromptDocumentError(f"Shot {index + 1} has invalid camera speed")
-    dialogue = [
+    legacy_dialogue = [
         _normalize_dialogue(event, event_index)
         for event_index, event in enumerate(shot.get("dialogue") or [])
+    ]
+    if "steps" in shot:
+        raw_steps = shot.get("steps")
+        if not isinstance(raw_steps, list):
+            raise PromptDocumentError(f"Shot {index + 1} steps must be a list")
+        steps = [_normalize_step(step, step_index) for step_index, step in enumerate(raw_steps)]
+    else:
+        steps = []
+        legacy_action = _text(shot.get("action"))
+        if legacy_action:
+            steps.append({"id": _identifier(None, "step"), "type": "action", "text": legacy_action})
+        steps.extend({**event, "type": "dialogue"} for event in legacy_dialogue)
+    action = " ".join(
+        step["text"] for step in steps
+        if step["type"] == "action" and step.get("text")
+    )
+    dialogue = [
+        {name: value for name, value in step.items() if name != "type"}
+        for step in steps
+        if step["type"] == "dialogue"
     ]
     return {
         "id": _identifier(shot.get("id"), "shot"),
@@ -284,13 +320,16 @@ def _normalize_shot(shot, index):
         "subjects": _text(shot.get("subjects")),
         "environment": _text(shot.get("environment")),
         "lighting": _text(shot.get("lighting")),
-        "action": _text(shot.get("action")),
+        # These two mirrors keep old workflows and Director change sets compatible.
+        # The ordered steps are authoritative for compilation and manual editing.
+        "action": action,
         "camera": {
             "type": camera_type,
             "amplitude": amplitude,
             "speed": speed,
             "target": _text(camera.get("target")),
         },
+        "steps": steps,
         "dialogue": dialogue,
         "visible_text": [str(value).strip() for value in (shot.get("visible_text") or []) if str(value).strip()],
         "sounds": [str(value).strip() for value in (shot.get("sounds") or []) if str(value).strip()],

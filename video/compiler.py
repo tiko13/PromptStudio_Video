@@ -98,7 +98,15 @@ def _dialogue_text(event):
     return _sentence(f"{speaker} ({speaker_id}) says{location}{delivery}: {block}")
 
 
-def _shot_text(shot, index, *, include_style="", include_main_description=""):
+def _step_text(step):
+    if step.get("type") == "dialogue":
+        return _dialogue_text(step) if step.get("text") else ""
+    if step.get("type") == "action" and step.get("text"):
+        return _sentence(_canonical_tokens(step["text"]))
+    return ""
+
+
+def _shot_text(shot, index, *, include_style="", first_frame_lock=False):
     if index == 0:
         prefix = "[Shot 1]"
     else:
@@ -107,17 +115,23 @@ def _shot_text(shot, index, *, include_style="", include_main_description=""):
             transition += " a new view"
         prefix = f"[Shot {index + 1}] At {_cut_time(shot['start'])}, {_sentence(transition, capitalize=False)}"
     parts = []
+    if first_frame_lock and index == 0:
+        parts.append(_sentence(
+            "The style, subjects, composition, scene, lighting, clothing, colors, key objects, and spatial "
+            "relationships established by <Picture 1> remain fully preserved"
+        ))
     if include_style:
         parts.append(_sentence(_canonical_tokens(include_style)))
-    if include_main_description:
-        parts.append(_sentence(_canonical_tokens(include_main_description)))
-    for field in ("composition", "subjects", "environment", "lighting", "action"):
+    visual_fields = () if first_frame_lock and index == 0 else (
+        "composition", "subjects", "environment", "lighting"
+    )
+    for field in visual_fields:
         if shot.get(field):
             parts.append(_sentence(_canonical_tokens(shot[field])))
     camera = _camera_sentence(shot.get("camera") or {})
     if camera:
         parts.append(camera)
-    parts.extend(_dialogue_text(event) for event in shot.get("dialogue") or [] if event.get("text"))
+    parts.extend(_step_text(step) for step in shot.get("steps") or [])
     for visible in shot.get("visible_text") or []:
         escaped = visible.replace('"', '\\"')
         parts.append(_sentence(f'A visible text element reads "{escaped}"'))
@@ -150,8 +164,8 @@ def _compile_base(document):
         _shot_text(
             shot,
             index,
-            include_style=document["style"] if index == 0 else "",
-            include_main_description=document["main_description"] if index == 0 else "",
+            include_style=document["style"] if index == 0 and mode != "i2va" else "",
+            first_frame_lock=mode == "i2va",
         )
         for index, shot in enumerate(document["shots"])
     )
@@ -192,7 +206,6 @@ def _compile_reference(document):
     )
     detailed = " ".join(part for part in (
         _sentence(_canonical_tokens(document["style"])),
-        _sentence(_canonical_tokens(document["main_description"])),
         shots,
     ) if part)
     return "\n\n".join([
@@ -307,7 +320,10 @@ def _reference_semantic_issues(document):
             )
 
     summary = _canonical_tokens(document["summary"]).casefold()
-    detailed_parts = [document["style"], document["main_description"]]
+    # main_description is a planning synopsis for the user and Grand Director,
+    # not part of the generated prompt. Reference tokens must be grounded in a
+    # compiled shot or audio field to count as active.
+    detailed_parts = [document["style"]]
     for shot in document["shots"]:
         detailed_parts.extend(
             shot.get(name, "")
