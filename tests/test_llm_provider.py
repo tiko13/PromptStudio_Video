@@ -1,10 +1,25 @@
 import unittest
 from unittest.mock import patch
 
-from video.llm_provider import generate_chat, generation_status
+from video.llm_provider import abort_generation, generate_chat, generation_status
 
 
 class LlmProviderTests(unittest.TestCase):
+    def test_kobold_abort_uses_extra_abort_endpoint(self):
+        with patch("video.llm_provider._post_json", return_value={"success": True}) as post:
+            result = abort_generation({"kobold_url": "http://localhost:5001"})
+
+        self.assertTrue(result["success"])
+        self.assertTrue(post.call_args.args[0].endswith("/api/extra/abort"))
+        self.assertEqual(post.call_args.args[1], {})
+        self.assertEqual(post.call_args.args[2], 10)
+
+    def test_kobold_abort_preserves_negative_confirmation(self):
+        with patch("video.llm_provider._post_json", return_value={"success": False}):
+            result = abort_generation({"kobold_url": "http://localhost:5001"})
+
+        self.assertFalse(result["success"])
+
     def test_kobold_generation_status_reports_live_partial_output_size(self):
         with (
             patch("video.llm_provider._get_json", return_value={"idle": 0, "queue": 1}),
@@ -30,6 +45,20 @@ class LlmProviderTests(unittest.TestCase):
         self.assertFalse(status["busy"])
         self.assertNotIn("generated_characters", status)
         post.assert_not_called()
+
+    def test_kobold_generation_status_tolerates_malformed_partial_output(self):
+        with (
+            patch("video.llm_provider._get_json", return_value={"idle": 0, "queue": 0}),
+            patch(
+                "video.llm_provider._post_json",
+                return_value={"results": {"unexpected": "shape"}},
+            ),
+        ):
+            status = generation_status({"llm_provider": "koboldcpp"})
+
+        self.assertTrue(status["reachable"])
+        self.assertTrue(status["busy"])
+        self.assertIsNone(status["generated_characters"])
 
     def test_kobold_auto_response_budget_uses_remaining_context(self):
         posted = []

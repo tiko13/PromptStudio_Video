@@ -137,6 +137,11 @@ processing the prompt or how many response characters are available. The
 request timeout defaults to 600 seconds and can be adjusted in Director
 settings.
 
+The compact Kobold status control in the Video Studio toolbar remains available
+outside Director dialogs. It reports idle, busy, or unreachable state and can
+send KoboldCpp's supported abort signal to stop a runaway text generation
+without unloading the model or restarting KoboldCpp.
+
 Dialogue, visible text, and references remain protected in both scopes. The
 Grand Director cannot remove a shot containing protected dialogue or visible
 text. Every proposal is previewed against a document hash, normalized,

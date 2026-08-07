@@ -118,12 +118,24 @@ button { color: inherit; }
 .psvstudio-project-delete:hover:not(:disabled) { color: #ffb4bd; background: rgba(218, 72, 91, .13); border-color: rgba(233, 96, 112, .24); }
 .psvstudio-project-delete:disabled { opacity: .3; cursor: not-allowed; }
 
-.psvstudio-topbar { gap: 7px; }
+.psvstudio-topbar { position: relative; z-index: 10; gap: 7px; }
 .psvstudio-title-field { min-width: 120px; max-width: 360px; flex: 1; padding: 7px 2px !important; background: transparent !important; border-color: transparent !important; font-weight: 700 !important; }
 .psvstudio-title-field:focus { border-bottom-color: var(--psv-accent) !important; box-shadow: none !important; }
 .psvstudio-save-state { color: var(--psv-muted); font-size: 10px; white-space: nowrap; }
 .psvstudio-topbar-spacer { flex: 1; }
 .psvstudio-workflow-select { min-width: 190px; max-width: 280px; }
+.psvstudio-kobold-control { position: relative; flex: 0 0 auto; }
+.psvstudio-kobold-control > summary { min-height: 32px; display: flex; align-items: center; gap: 6px; padding: 0 9px; color: var(--psv-muted); background: rgba(255, 255, 255, .035); border: 1px solid var(--psv-border); border-radius: 999px; cursor: pointer; list-style: none; white-space: nowrap; font-size: 10px; font-weight: 700; }
+.psvstudio-kobold-control > summary::-webkit-details-marker { display: none; }
+.psvstudio-kobold-control[open] > summary, .psvstudio-kobold-control > summary:hover { color: var(--psv-text); border-color: rgba(255, 255, 255, .17); }
+.psvstudio-kobold-dot { width: 7px; height: 7px; background: var(--psv-muted); border-radius: 50%; box-shadow: 0 0 0 3px rgba(144, 150, 168, .1); }
+.psvstudio-kobold-control[data-state="idle"] .psvstudio-kobold-dot { background: var(--psv-ok); box-shadow: 0 0 0 3px rgba(120, 217, 154, .12); }
+.psvstudio-kobold-control[data-state="busy"] .psvstudio-kobold-dot { background: var(--psv-warn); box-shadow: 0 0 0 3px rgba(240, 188, 109, .15); }
+.psvstudio-kobold-control[data-state="offline"] .psvstudio-kobold-dot { background: var(--psv-error); box-shadow: 0 0 0 3px rgba(255, 133, 142, .12); }
+.psvstudio-kobold-popover { position: absolute; z-index: 50; top: calc(100% + 9px); right: 0; width: 245px; display: grid; gap: 8px; padding: 11px; background: rgba(19, 21, 29, .98); border: 1px solid var(--psv-border); border-radius: 12px; box-shadow: 0 18px 44px rgba(0, 0, 0, .52); }
+.psvstudio-kobold-popover strong { font-size: 11px; }
+.psvstudio-kobold-popover span, .psvstudio-kobold-popover small { color: var(--psv-muted); font-size: 9px; line-height: 1.4; }
+.psvstudio-kobold-popover .psvstudio-button { width: 100%; }
 
 .psvstudio-field input, .psvstudio-field select, .psvstudio-field textarea, .psvstudio-workflow-select, .psvstudio-title-field {
   width: 100%;
@@ -271,6 +283,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-director-message { max-width: 88%; display: grid; gap: 5px; padding: 10px 11px; background: var(--psv-panel); border: 1px solid var(--psv-border); border-radius: 12px; }
 .psvstudio-director-message.is-user { justify-self: end; background: rgba(103, 78, 188, .2); border-color: rgba(151, 126, 255, .34); }
 .psvstudio-director-message.is-assistant { justify-self: start; }
+.psvstudio-director-message.is-pending { color: var(--psv-muted); border-style: dashed; }
 .psvstudio-director-message > small { color: var(--psv-muted); font-size: 9px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
 .psvstudio-director-message-text { white-space: pre-wrap; }
 .psvstudio-director-message-attachments { display: flex; flex-wrap: wrap; gap: 4px; }

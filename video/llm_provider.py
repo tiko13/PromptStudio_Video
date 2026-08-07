@@ -133,13 +133,35 @@ def generation_status(data):
                     3,
                     "KoboldCpp status check",
                 )
-                text = str(((partial.get("results") or [{}])[0]).get("text") or "")
-                status["generated_characters"] = len(text)
-            except (RuntimeError, AttributeError, IndexError, TypeError):
+                results = partial.get("results") if isinstance(partial, dict) else None
+                first = results[0] if isinstance(results, list) and results else None
+                text = str(first.get("text") or "") if isinstance(first, dict) else ""
+                status["generated_characters"] = len(text) if isinstance(first, dict) else None
+            except (RuntimeError, AttributeError, IndexError, KeyError, TypeError):
                 status["generated_characters"] = None
         return status
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return {"provider": provider, "reachable": False, "busy": None}
+
+
+def abort_generation(data):
+    """Ask KoboldCpp to stop its currently active text generation."""
+    base_url = clean_service_url(
+        data.get("kobold_url"),
+        DEFAULT_KOBOLD_URL,
+        "KoboldCpp",
+        "PROMPT_STUDIO_VIDEO_KOBOLD_ALLOWED_HOSTS",
+    )
+    result = _post_json(
+        urllib.parse.urljoin(base_url + "/", "api/extra/abort"),
+        {},
+        10,
+        "KoboldCpp abort",
+    )
+    return {
+        "provider": "koboldcpp",
+        "success": isinstance(result, dict) and result.get("success") is True,
+    }
 
 
 def _thinking_mode(value):

@@ -37,7 +37,7 @@ from .video.media import (
     MIN_REFERENCE_SECONDS,
 )
 from .video.director import director_chat, preview_changeset
-from .video.llm_provider import generation_status
+from .video.llm_provider import abort_generation, generation_status
 from .video.store import (
     StoreConflictError,
     read_project_store,
@@ -63,6 +63,11 @@ DIRECTOR_LLM_LOCK = asyncio.Lock()
 DIRECTOR_JOBS = {}
 DIRECTOR_TASKS = set()
 MAX_DIRECTOR_JOBS = 32
+STUDIO_PRESENCE_TIMEOUT_SECONDS = 8.0
+STUDIO_HANDOFF_TIMEOUT_SECONDS = 60.0
+STUDIO_BRIDGE_LOCK = threading.Lock()
+STUDIO_PRESENCES = {}
+STUDIO_HANDOFFS = {}
 
 
 CAPABILITY = {
@@ -71,13 +76,152 @@ CAPABILITY = {
     "workflow_prefix": "[PSV]",
     "adapters": ["minimax_h3"],
     "node_types": ["PSV_MiniMaxH3Director"],
-    "features": ["project_director", "selected_shot_director", "director_vision_attachments"],
+    "features": [
+        "project_director",
+        "selected_shot_director",
+        "director_vision_attachments",
+        "kobold_control",
+        "studio_image_handoff",
+    ],
     "standalone_page": "/extensions/PromptStudio_Video/prompt_studio_video.html",
 }
 
 
+def _clean_studio_bridge(now=None):
+    now = time.monotonic() if now is None else now
+    expired_instances = [
+        instance_id for instance_id, presence in STUDIO_PRESENCES.items()
+        if now - presence["seen_at"] > STUDIO_PRESENCE_TIMEOUT_SECONDS
+    ]
+    for instance_id in expired_instances:
+        STUDIO_PRESENCES.pop(instance_id, None)
+    expired_handoffs = [
+        request_id for request_id, handoff in STUDIO_HANDOFFS.items()
+        if now - handoff["created_at"] > STUDIO_HANDOFF_TIMEOUT_SECONDS
+    ]
+    for request_id in expired_handoffs:
+        STUDIO_HANDOFFS.pop(request_id, None)
+
+
+def _studio_instances():
+    with STUDIO_BRIDGE_LOCK:
+        _clean_studio_bridge()
+        return [
+            {
+                "instanceId": instance_id,
+                "open": True,
+                "openedAt": presence["opened_at"],
+                "activeProjectId": presence["active_project_id"],
+                "projectName": presence["project_name"],
+            }
+            for instance_id, presence in STUDIO_PRESENCES.items()
+        ]
+
+
 async def promptstudio_video_capabilities(_request):
-    return web.json_response(CAPABILITY)
+    return web.json_response({**CAPABILITY, "studio_instances": _studio_instances()})
+
+
+def _bridge_text(value, name, maximum=256, required=False):
+    text = str(value or "").strip()
+    if required and not text:
+        raise ValueError(f"{name} is required")
+    if len(text) > maximum:
+        raise ValueError(f"{name} exceeds {maximum} characters")
+    return text
+
+
+async def promptstudio_video_presence(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        instance_id = _bridge_text(data.get("instanceId"), "instanceId", 128, required=True)
+        now = time.monotonic()
+        handoffs = []
+        with STUDIO_BRIDGE_LOCK:
+            _clean_studio_bridge(now)
+            if data.get("open"):
+                STUDIO_PRESENCES[instance_id] = {
+                    "seen_at": now,
+                    "opened_at": float(data.get("openedAt") or 0),
+                    "active_project_id": _bridge_text(data.get("activeProjectId"), "activeProjectId", 128),
+                    "project_name": _bridge_text(data.get("projectName"), "projectName", 256),
+                }
+                for request_id, handoff in STUDIO_HANDOFFS.items():
+                    if handoff["target_instance_id"] != instance_id or handoff["status"] != "pending":
+                        continue
+                    handoff["status"] = "delivered"
+                    handoffs.append({"requestId": request_id, "image": handoff["image"]})
+            else:
+                STUDIO_PRESENCES.pop(instance_id, None)
+        return web.json_response({"ok": True, "handoffs": handoffs})
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+
+async def promptstudio_video_handoff_create(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        request_id = _bridge_text(data.get("requestId"), "requestId", 128, required=True)
+        target_instance_id = _bridge_text(data.get("targetInstanceId"), "targetInstanceId", 128, required=True)
+        image = data.get("image")
+        if not isinstance(image, dict) or not str(image.get("url") or "").startswith("/"):
+            raise ValueError("image must contain a same-server URL")
+        now = time.monotonic()
+        with STUDIO_BRIDGE_LOCK:
+            _clean_studio_bridge(now)
+            if target_instance_id not in STUDIO_PRESENCES:
+                return web.json_response({"error": "Video Studio is no longer open."}, status=409)
+            STUDIO_HANDOFFS[request_id] = {
+                "created_at": now,
+                "target_instance_id": target_instance_id,
+                "image": image,
+                "status": "pending",
+                "result": None,
+                "error": "",
+            }
+        return web.json_response({"ok": True}, status=202)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+
+async def promptstudio_video_handoff_result(request):
+    request_id = _bridge_text(request.match_info.get("request_id"), "requestId", 128, required=True)
+    with STUDIO_BRIDGE_LOCK:
+        _clean_studio_bridge()
+        handoff = STUDIO_HANDOFFS.get(request_id)
+        if handoff is None:
+            return web.json_response({"error": "Image handoff was not found or expired."}, status=404)
+        if handoff["status"] != "complete":
+            return web.json_response({"status": handoff["status"]}, status=202)
+        STUDIO_HANDOFFS.pop(request_id, None)
+        return web.json_response({
+            "ok": not handoff["error"],
+            "result": handoff["result"] or {},
+            "error": handoff["error"],
+        })
+
+
+async def promptstudio_video_handoff_complete(request):
+    try:
+        request_id = _bridge_text(request.match_info.get("request_id"), "requestId", 128, required=True)
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        with STUDIO_BRIDGE_LOCK:
+            _clean_studio_bridge()
+            handoff = STUDIO_HANDOFFS.get(request_id)
+            if handoff is None:
+                return web.json_response({"error": "Image handoff was not found or expired."}, status=404)
+            handoff["status"] = "complete"
+            handoff["result"] = data.get("result") if isinstance(data.get("result"), dict) else {}
+            handoff["error"] = _bridge_text(data.get("error"), "error", 2048)
+        return web.json_response({"ok": True})
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
 
 async def promptstudio_video_page(_request):
@@ -246,11 +390,15 @@ def _prune_director_jobs():
 
 async def _run_director_job(job_id, data):
     job = DIRECTOR_JOBS[job_id]
+
+    def update_progress(progress):
+        job["director_progress"] = dict(progress)
+
     try:
         async with DIRECTOR_LLM_LOCK:
             job["status"] = "running"
             job["started_at"] = time.time()
-            job["result"] = await asyncio.to_thread(director_chat, data)
+            job["result"] = await asyncio.to_thread(director_chat, data, update_progress)
         job["status"] = "complete"
     except Exception as exc:
         job["status"] = "failed"
@@ -297,9 +445,19 @@ async def promptstudio_video_director_status(request):
         return web.json_response({"error": "Director job was not found"}, status=404)
     response = {"status": job["status"]}
     if job["status"] == "running":
-        response["provider_status"] = await asyncio.to_thread(
-            generation_status, job["provider_settings"]
-        )
+        if job.get("director_progress"):
+            response["director_progress"] = dict(job["director_progress"])
+        try:
+            response["provider_status"] = await asyncio.to_thread(
+                generation_status, job["provider_settings"]
+            )
+        except Exception:
+            provider = str(job["provider_settings"].get("llm_provider") or "koboldcpp").strip().casefold()
+            response["provider_status"] = {
+                "provider": provider,
+                "reachable": False,
+                "busy": None,
+            }
     elif job["status"] == "complete":
         response["result"] = job.get("result")
     elif job["status"] == "failed":
@@ -316,6 +474,27 @@ async def promptstudio_video_director_preview(request):
         return web.json_response({"valid": False, "error": str(exc)}, status=status)
 
 
+async def promptstudio_video_kobold_status(request):
+    try:
+        data = await _director_body(request)
+        data["llm_provider"] = "koboldcpp"
+        return web.json_response(await asyncio.to_thread(generation_status, data))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
+async def promptstudio_video_kobold_abort(request):
+    try:
+        data = await _director_body(request)
+        return web.json_response(await asyncio.to_thread(abort_generation, data))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
 def register_routes():
     """Register after ComfyUI has created its PromptServer singleton."""
     server = getattr(PromptServer, "instance", None)
@@ -323,6 +502,10 @@ def register_routes():
         return False
     routes = server.routes
     routes.get("/promptstudio-video/capabilities")(promptstudio_video_capabilities)
+    routes.post("/promptstudio-video/studio-presence")(promptstudio_video_presence)
+    routes.post("/promptstudio-video/studio-handoff")(promptstudio_video_handoff_create)
+    routes.get("/promptstudio-video/studio-handoff/{request_id}")(promptstudio_video_handoff_result)
+    routes.post("/promptstudio-video/studio-handoff/{request_id}")(promptstudio_video_handoff_complete)
     routes.get(STANDALONE_ALIAS_PATH)(promptstudio_video_page)
     routes.get("/promptstudio-video/config")(promptstudio_video_config)
     routes.get("/promptstudio-video/runtime-health")(promptstudio_video_runtime_health)
@@ -335,6 +518,8 @@ def register_routes():
     routes.post("/promptstudio-video/director/chat")(promptstudio_video_director_chat)
     routes.get("/promptstudio-video/director/chat/{job_id}")(promptstudio_video_director_status)
     routes.post("/promptstudio-video/director/preview")(promptstudio_video_director_preview)
+    routes.post("/promptstudio-video/kobold/status")(promptstudio_video_kobold_status)
+    routes.post("/promptstudio-video/kobold/abort")(promptstudio_video_kobold_abort)
     return True
 
 

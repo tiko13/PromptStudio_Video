@@ -81,6 +81,12 @@ job, polls its status route, and—while a KoboldCpp job is running—uses
 `/api/extra/perf` plus `/api/extra/generate/check` to distinguish active prompt
 processing or generation from a completed or failed Director task.
 
+Independent Kobold status and abort routes proxy `/api/extra/perf` and
+`/api/extra/abort` through the same loopback-host validation as Director
+generation. The compact toolbar control polls without acquiring the Director
+LLM lock, so it can stop a runaway generation while the Director job is still
+blocked on KoboldCpp.
+
 Sampling is intent-sensitive. Conversational advice uses the configured
 temperature, structured proposal requests cap it at `0.2`, and the single
 contract-correction retry uses `0.0` to favor exact document enums.

@@ -7,6 +7,8 @@ from video.contracts import normalize_document
 from video.director import (
     CHANGESET_BEGIN,
     CHANGESET_END,
+    PROJECT_SYSTEM_MESSAGE,
+    SHOT_SYSTEM_MESSAGE,
     build_provider_messages,
     compact_project_context,
     director_chat,
@@ -16,6 +18,7 @@ from video.director import (
     _validate_reference_only_preservation,
     _validate_requested_project_result,
     _enrich_reference_definition_placeholders,
+    _proposal_retry_messages,
     _proposal_requested,
 )
 
@@ -51,6 +54,26 @@ def provider_context(messages):
 
 
 class DirectorTests(unittest.TestCase):
+    def test_reference_examples_do_not_model_the_rejected_placeholder(self):
+        for system_message in (SHOT_SYSTEM_MESSAGE, PROJECT_SYSTEM_MESSAGE):
+            self.assertNotIn("with the observed identity traits.", system_message)
+            self.assertNotIn("concrete visible identity traits observed in that image", system_message)
+            self.assertIn("shoulder-length wavy black hair", system_message)
+
+    def test_visual_trait_placeholder_retry_demands_source_observations(self):
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": "Use her as the identity reference."}],
+            "shot",
+            proposal_error=(
+                "REF2VA reference semantics are incomplete: definition 1 contains unresolved "
+                "visual-trait placeholder language"
+            ),
+        )
+        correction = retry[-1]["content"]
+        self.assertIn("Inspect the supplied reference image again", correction)
+        self.assertIn("hair, face, skin, eyes, and clothing", correction)
+        self.assertIn("do not copy hypothetical traits", correction)
+
     def test_reference_placeholders_are_enriched_from_visible_observations(self):
         proposal = {
             "operations": [{
@@ -576,13 +599,14 @@ class DirectorTests(unittest.TestCase):
             "video.director.generate_chat",
             side_effect=["Here is a complete prose answer without a change set.", proposal_response],
         ) as generate:
+            progress = []
             result = director_chat({
                 "scope": "project",
                 "document": director_document(),
                 "project_name": "Letter",
                 "brief": "A farewell on a train.",
                 "messages": [{"role": "user", "content": "Create the full prompt for this video."}],
-            })
+            }, progress.append)
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(result["proposal"]["scope"], {"type": "project"})
         self.assertEqual(generate.call_args_list[0].args[0]["temperature"], 0.2)
@@ -591,6 +615,11 @@ class DirectorTests(unittest.TestCase):
         retry_messages = generate.call_args.args[1]
         self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
         self.assertIn(CHANGESET_BEGIN, retry_messages[-1]["content"])
+        self.assertEqual(progress, [{
+            "phase": "proposal_correction",
+            "attempt": 1,
+            "maximum_attempts": 3,
+        }])
 
     def test_explicit_shot_count_retries_structurally_incomplete_proposal(self):
         document = normalize_document(director_document())

@@ -59,12 +59,14 @@ Help the user reason about the selected shot and its continuity with the adjacen
 
 The authoritative video document is edited by deterministic code. Never claim that you changed it. If the user only asks for advice, answer normally and do not emit a change set. If the user explicitly asks to draft, refine, revise, fill, improve, or change the selected shot, answer briefly and append exactly one JSON object between these markers:
 {CHANGESET_BEGIN}
-{{"summary":"Ground the identity reference in the selected shot","operations":[{{"op":"update_project","fields":{{"task_types":["reference generation"],"subject_definitions":[{{"label":"Subject 1","text":"is the woman in <Picture 1>, with the concrete visible identity traits observed in that image."}}],"summary":"The target video uses <Subject 1> in the selected shot while preserving the established action.","retention_analysis":[{{"label":"<Subject 1>","where":"appears in [Shot 1]","relationship":"fully_preserved","detail":"The referenced identity and visible traits are retained."}}]}}}},{{"op":"update_shot","shot_id":"the selected shot id","fields":{{"subjects":"<Subject 1>, the woman from <Picture 1>, with the observed identity traits."}}}}]}}
+{{"summary":"Ground the identity reference in the selected shot","operations":[{{"op":"update_project","fields":{{"task_types":["reference generation"],"subject_definitions":[{{"label":"Subject 1","text":"is the young woman in <Picture 1>, with shoulder-length wavy black hair, an oval face, warm brown skin, amber eyes, and a teal linen blouse."}}],"summary":"The target video uses <Subject 1> in the selected shot while preserving the established action.","retention_analysis":[{{"label":"<Subject 1>","where":"appears in [Shot 1]","relationship":"fully_preserved","detail":"Her wavy black hair, oval face, warm brown skin, amber eyes, and teal blouse are retained."}}]}}}},{{"op":"update_shot","shot_id":"the selected shot id","fields":{{"subjects":"<Subject 1>, the young woman from <Picture 1>, retains her shoulder-length wavy black hair, oval face, warm brown skin, amber eyes, and teal linen blouse."}}}}]}}
 {CHANGESET_END}
 
 Allowed shot fields: composition, subjects, environment, lighting, action, transition, notes, sounds, and camera. Camera may contain type, amplitude, speed, and target. A selected-shot proposal may also use update_project only for task_types, subject_definitions, summary, and retention_analysis when reference semantics must be created or repaired. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed.
 
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context. When a referenced image supplies a person, object, scene, style, action, pose, or camera treatment, define reusable visible content as <Subject N> sourced from its <Picture N>, add it to summary and retention_analysis, and use <Subject N> naturally in every affected shot. A Picture used only as the source of a Subject does not get a separate Picture definition or retention line. A storyboard or concrete keyframe may be defined directly as <Picture N>. Every source reference must be represented in subject_definitions, and every defined label must have one retention_analysis entry and appear in the summary and applicable shot/audio fields.
+
+The JSON above demonstrates structure with hypothetical traits only; never copy its visual details unless they are actually visible in the supplied source. A subject definition must enumerate concrete observed features from its source, such as hairstyle and color, face shape, skin tone, eye color, clothing cut/color/material, or equally specific object/scene traits. Never write placeholders or stand-ins such as "observed traits," "visible traits," "identity traits," "specific traits," or "concrete traits." Repeat the actual features in the affected shot fields and retention detail.
 
 When images are attached, inspect only visible details and follow each attachment's usage. An image marked describe is visual context only: transfer useful visible details into descriptive shot fields without claiming it is a MiniMax reference. Other usages correspond to project reference roles and include a canonical token when committed. Clearly separate observation from inference. If the request only assigns or repairs a reference role, preserve the existing action, environment, lighting, composition, camera, sounds, dialogue, and visible text while adding reference labels and observed traits. Do not replace the established story or action. Do not change timing, duration, shot order, IDs, references, dialogue, lyrics, speaker IDs, or visible text. Preserve established subjects, screen direction, props, wardrobe, environment, and action state. Treat dialogue and visible text in the context as immutable exact strings. Keep proposed prose concrete, audiovisual, and feasible within the selected shot's time budget. Do not reproduce the whole document or compiled MiniMax prompt."""
 
@@ -81,7 +83,7 @@ Before emitting a change set, infer the most effective shot structure from the u
 
 The authoritative video document is edited and compiled by deterministic code. Never claim that you changed it and never emit a compiled MiniMax prompt. If the user only asks for advice, answer normally and do not emit a change set. Treat requests to create, generate, compose, or apply the "full prompt" as requests to populate the complete structured video document. If the user explicitly asks to compose, create, generate, draft, restructure, refine, revise, fill, improve, split, add, remove, apply, or change the video, you MUST answer briefly and append exactly one JSON object between these markers:
 {CHANGESET_BEGIN}
-{{"summary":"Apply the requested production changes","operations":[{{"op":"update_project","fields":{{"main_description":"A concise whole-video action description.","style":"A concrete visual style description.","overall_soundscape":"A concrete ambience and physical-sound description.","non_diegetic_music":"N/A","task_types":["reference generation"],"subject_definitions":[{{"label":"Subject 1","text":"is the woman in <Picture 1>, with the concrete visible identity traits observed in that image."}}],"summary":"The target video follows <Subject 1> through the established sequence.","retention_analysis":[{{"label":"<Subject 1>","where":"appears in [Shot 1] and [Shot 2]","relationship":"fully_preserved","detail":"The referenced identity and visible traits are retained across both shots."}}]}}}},{{"op":"update_shot","shot_id":"existing shot id","fields":{{"subjects":"<Subject 1>, the woman from <Picture 1>, with the observed identity traits.","action":"A concrete visible action.","start":4.0}}}},{{"op":"add_shot","shot":{{"id":"new-shot-id","start":6.0,"transition":"the camera cuts to","composition":"A concrete composition.","subjects":"The visible subjects and positions.","environment":"A concrete environment.","lighting":"A concrete lighting setup.","action":"A concrete visible action.","camera":{{"type":"Push In","amplitude":"small","speed":"slow","target":"the primary subject"}},"sounds":["A concrete synchronized sound."]}}}},{{"op":"remove_shot","shot_id":"unneeded shot id"}}]}}
+{{"summary":"Apply the requested production changes","operations":[{{"op":"update_project","fields":{{"main_description":"A concise whole-video action description.","style":"A concrete visual style description.","overall_soundscape":"A concrete ambience and physical-sound description.","non_diegetic_music":"N/A","task_types":["reference generation"],"subject_definitions":[{{"label":"Subject 1","text":"is the young woman in <Picture 1>, with shoulder-length wavy black hair, an oval face, warm brown skin, amber eyes, and a teal linen blouse."}}],"summary":"The target video follows <Subject 1> through the established sequence.","retention_analysis":[{{"label":"<Subject 1>","where":"appears in [Shot 1] and [Shot 2]","relationship":"fully_preserved","detail":"Her wavy black hair, oval face, warm brown skin, amber eyes, and teal blouse are retained across both shots."}}]}}}},{{"op":"update_shot","shot_id":"existing shot id","fields":{{"subjects":"<Subject 1>, the young woman from <Picture 1>, retains her shoulder-length wavy black hair, oval face, warm brown skin, amber eyes, and teal linen blouse.","action":"A concrete visible action.","start":4.0}}}},{{"op":"add_shot","shot":{{"id":"new-shot-id","start":6.0,"transition":"the camera cuts to","composition":"A concrete composition.","subjects":"The visible subjects and positions.","environment":"A concrete environment.","lighting":"A concrete lighting setup.","action":"A concrete visible action.","camera":{{"type":"Push In","amplitude":"small","speed":"slow","target":"the primary subject"}},"sounds":["A concrete synchronized sound."]}}}},{{"op":"remove_shot","shot_id":"unneeded shot id"}}]}}
 {CHANGESET_END}
 
 Allowed project fields: main_description, style, overall_soundscape, non_diegetic_music, summary, complete_silence, task_types, subject_definitions, and retention_analysis. main_description is the concise general description of what happens across the whole video; shots provide timeline-specific detail. update_shot may target any existing shot and may change start, composition, subjects, environment, lighting, action, transition, notes, sounds, and camera. add_shot uses those same fields plus a new unique id. remove_shot cannot remove a shot that contains dialogue or visible text. Populate an existing shot with update_shot; never add a replacement for it. Preserve existing shot IDs when they remain useful. Preserve shot count and start times for narrow edits, but for broad production composition choose the shot count implied by the visual story and use add_shot or remove_shot as needed. A shot_id or new shot id is the exact literal id from the context, such as shot-1; it is never a display token such as [Shot 1]. Nest sounds inside fields for update_shot and inside shot for add_shot. Store camera movement only in camera; do not repeat the camera sentence in action because the deterministic compiler adds it. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed. Use N/A for no non-diegetic music.
@@ -89,6 +91,8 @@ Allowed project fields: main_description, style, overall_soundscape, non_diegeti
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context and preserve them verbatim. When the project resolves to REF2VA, always populate all six guide sections through the structured document: task_types and summary, subject_definitions, retention_analysis, detailed shot fields, overall_soundscape, and non_diegetic_music. For generation tasks, make the compiled detailed description approximately 350–500 English words by giving every shot concrete composition, subject appearance and position, environment, lighting, action/state changes, camera movement, and synchronized sound.
 
 For each image/video visual reference used as a person, object, scene, style, action, pose, or camera treatment, define one reusable <Subject N> and cite its source token in the definition. A source image used only to define a Subject is cited inside that Subject definition, not defined separately. Define a <Picture N> directly only for a storyboard or concrete keyframe/composition anchor. Define editing/continuation sources as <Video N> and audio sources as <Audio N>. Every source reference must be represented in subject_definitions; every defined label must appear in summary, have exactly one retention_analysis entry, and be used naturally in every applicable shot or audio section. With multiple references, keep their numbering and meanings distinct. With multiple shots, repeat the same Subject labels and concrete identity traits wherever they reappear.
+
+The JSON above demonstrates structure with hypothetical traits only; never copy its visual details unless they are actually visible in the supplied source. A subject definition must enumerate concrete observed features from its source, such as hairstyle and color, face shape, skin tone, eye color, clothing cut/color/material, or equally specific object/scene traits. Never write placeholders or stand-ins such as "observed traits," "visible traits," "identity traits," "specific traits," or "concrete traits." Repeat the actual features in every affected shot and retention detail.
 
 When images are attached, inspect only visible details and follow each attachment's usage. An image marked describe is visual context only; other usages correspond to project reference roles and include a canonical token when committed. Clearly separate observation from inference.
 
@@ -1159,6 +1163,15 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
         if "start time" in proposal_error.casefold() or "cut time" in proposal_error.casefold()
         else ""
     )
+    reference_feedback = (
+        " Inspect the supplied reference image again and replace every visual-trait placeholder with an explicit "
+        "list of features actually visible in that source. For a person, cover distinguishing hair, face, skin, "
+        "eyes, and clothing details when visible; for another subject type, give equivalently concrete colors, "
+        "shapes, materials, textures, and spatial features. Do not use observed/visible/identity/specific/concrete "
+        "traits as a noun phrase, and do not copy hypothetical traits from the system example."
+        if "visual-trait placeholder" in proposal_error.casefold()
+        else ""
+    )
     return [
         *messages,
         {
@@ -1169,7 +1182,7 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
             "role": "user",
             "content": (
                 f"Correct the response now for the {scope_name}. The request explicitly requires document changes."
-                f"{validation_feedback}{timing_feedback} "
+                f"{validation_feedback}{timing_feedback}{reference_feedback} "
                 f"Return a brief answer followed by exactly one valid JSON change set between {CHANGESET_BEGIN} "
                 f"and {CHANGESET_END}. Return a replacement for the invalid proposal and follow the allowed "
                 "operation and protected-field contract from the system message."
@@ -1423,7 +1436,17 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
     return parsed
 
 
-def director_chat(data):
+def _report_director_progress(progress_callback, progress):
+    if not callable(progress_callback):
+        return
+    try:
+        progress_callback(progress)
+    except Exception:
+        # Status reporting must never interrupt an otherwise valid generation.
+        pass
+
+
+def director_chat(data, progress_callback=None):
     attachments, vision_images = load_vision_images(data.get("attachments"))
     request_data = {**data, "attachments": attachments}
     scope = _director_scope(request_data)
@@ -1466,6 +1489,11 @@ def director_chat(data):
         for _attempt in range(PROPOSAL_CORRECTION_ATTEMPTS):
             if parsed["proposal"] is not None:
                 break
+            _report_director_progress(progress_callback, {
+                "phase": "proposal_correction",
+                "attempt": _attempt + 1,
+                "maximum_attempts": PROPOSAL_CORRECTION_ATTEMPTS,
+            })
             raw = generate_chat(
                 retry_request_data,
                 _proposal_retry_messages(

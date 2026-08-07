@@ -9,7 +9,11 @@ const PROJECTS_ENDPOINT = "/promptstudio-video/projects";
 const WORKFLOWS_ENDPOINT = "/promptstudio-video/workflows";
 const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
+const KOBOLD_STATUS_ENDPOINT = "/promptstudio-video/kobold/status";
+const KOBOLD_ABORT_ENDPOINT = "/promptstudio-video/kobold/abort";
 const DIRECTOR_JOB_POLL_MS = 1000;
+const DIRECTOR_STATUS_RETRY_LIMIT = 3;
+const KOBOLD_STATUS_POLL_MS = 3000;
 const DIRECTOR_SETTINGS_KEY = "promptstudio.video.director.settings.v1";
 const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
 const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
@@ -29,6 +33,7 @@ const DIRECTOR_IMAGE_USAGES = Object.freeze([
 ]);
 const DISCONNECTED_GENERATION_GRACE_MS = 15 * 1000;
 const GENERATION_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+const STUDIO_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 const PLACEHOLDERS = Object.freeze({
   projectTitle: "Last Train Letter",
@@ -58,6 +63,13 @@ const PLACEHOLDERS = Object.freeze({
 const state = {
   panel: null,
   popup: null,
+  bridgeChannel: null,
+  bridgePresenceTimer: null,
+  serverPresenceRequest: null,
+  serverPresenceQueued: false,
+  latestServerPresence: null,
+  relayedHandoffs: new Set(),
+  studioOpenedAt: 0,
   config: null,
   projects: [],
   activeProjectId: null,
@@ -87,8 +99,12 @@ const state = {
   drawer: "",
   directorDialog: null,
   directorBusy: false,
+  directorPendingText: "",
   directorSessions: null,
   directorScope: "shot",
+  koboldStatusRequest: null,
+  koboldStatusTimer: null,
+  koboldAbortBusy: false,
   ready: false,
 };
 
@@ -236,6 +252,82 @@ function saveDirectorSettings(dialog = state.directorDialog) {
     // The active request can still use these settings when storage is unavailable.
   }
   return settings;
+}
+
+function renderKoboldStatus(status = {}) {
+  const control = state.panel?.querySelector("#psvstudio-kobold-control");
+  const label = control?.querySelector("#psvstudio-kobold-status-label");
+  const detail = control?.querySelector("#psvstudio-kobold-status-detail");
+  const stop = control?.querySelector("#psvstudio-kobold-stop");
+  if (!control || !label || !detail || !stop) return;
+  const reachable = status.reachable === true;
+  const busy = reachable && status.busy === true;
+  const stateName = busy ? "busy" : (reachable ? "idle" : (status.checking ? "checking" : "offline"));
+  control.dataset.state = stateName;
+  label.textContent = busy ? "Kobold busy" : (reachable ? "Kobold idle" : (status.checking ? "Kobold…" : "Kobold offline"));
+  const characters = Number(status.generated_characters);
+  detail.textContent = status.message || (busy
+    ? `Generation active${Number.isFinite(characters) && characters > 0 ? ` · ${characters.toLocaleString()} characters` : ""}`
+    : (reachable ? "Ready for local requests." : "KoboldCpp could not be reached."));
+  stop.disabled = !busy || state.koboldAbortBusy;
+  stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Stop generation";
+}
+
+async function refreshKoboldStatus() {
+  if (state.koboldStatusRequest) return state.koboldStatusRequest;
+  const settings = directorSettings();
+  const control = state.panel?.querySelector("#psvstudio-kobold-control");
+  if (!control || control.dataset.state === "checking") renderKoboldStatus({ checking: true });
+  state.koboldStatusRequest = (async () => {
+    try {
+      const response = await api.fetchApi(KOBOLD_STATUS_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kobold_url: settings.kobold_url }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `KoboldCpp status failed (${response.status}).`);
+      renderKoboldStatus(data);
+      return data;
+    } catch (error) {
+      renderKoboldStatus({ reachable: false, message: error.message || String(error) });
+      return null;
+    } finally {
+      state.koboldStatusRequest = null;
+    }
+  })();
+  return state.koboldStatusRequest;
+}
+
+async function stopKoboldGeneration() {
+  if (state.koboldAbortBusy) return;
+  state.koboldAbortBusy = true;
+  renderKoboldStatus({ reachable: true, busy: true, message: "Sending stop signal…" });
+  try {
+    const response = await api.fetchApi(KOBOLD_ABORT_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kobold_url: directorSettings().kobold_url }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `KoboldCpp stop failed (${response.status}).`);
+    renderKoboldStatus({
+      reachable: true,
+      busy: data.success !== true,
+      message: data.success ? "Stop signal accepted." : "KoboldCpp reported no abortable generation.",
+    });
+  } catch (error) {
+    renderKoboldStatus({ reachable: false, message: error.message || String(error) });
+  } finally {
+    state.koboldAbortBusy = false;
+    window.setTimeout(refreshKoboldStatus, 500);
+  }
+}
+
+function startKoboldStatusMonitor() {
+  if (state.koboldStatusTimer) return;
+  refreshKoboldStatus();
+  state.koboldStatusTimer = window.setInterval(refreshKoboldStatus, KOBOLD_STATUS_POLL_MS);
 }
 
 function directorSessions() {
@@ -622,6 +714,15 @@ function renderDirectorDialog() {
     }
     history.append(card);
   }
+  if (state.directorBusy && state.directorPendingText) {
+    const pending = el("article", "psvstudio-director-message is-assistant is-pending");
+    const pendingText = el("div", "psvstudio-director-message-text", state.directorPendingText);
+    pendingText.dataset.directorPending = "true";
+    pendingText.setAttribute("role", "status");
+    pendingText.setAttribute("aria-live", "polite");
+    pending.append(el("small", "", "Director"), pendingText);
+    history.append(pending);
+  }
   const usage = session.last_context_usage;
   const status = dialog.querySelector("#psvstudio-director-status");
   if (!state.directorBusy && usage) {
@@ -752,6 +853,13 @@ async function requestDirectorResponse(project, shot, scope, attachments, messag
 
 function directorJobStatusText(job) {
   if (job.status === "queued") return "Director request is queued…";
+  const progress = job.director_progress || {};
+  if (progress.phase === "proposal_correction") {
+    const attempt = Math.max(1, Number(progress.attempt) || 1);
+    const maximum = Math.max(attempt, Number(progress.maximum_attempts) || attempt);
+    const activity = job.provider_status?.busy ? "generating" : "queued";
+    return `Proposal omitted or invalid · automatic correction ${attempt} of ${maximum} is ${activity}…`;
+  }
   const provider = job.provider_status || {};
   if (provider.provider !== "koboldcpp") return "The local Director is still working…";
   if (provider.reachable === false) return "Director is running; KoboldCpp status is temporarily unavailable…";
@@ -765,16 +873,33 @@ function directorJobStatusText(job) {
 }
 
 async function pollDirectorJob(jobId) {
+  let statusFailures = 0;
   while (true) {
     await new Promise(resolve => setTimeout(resolve, DIRECTOR_JOB_POLL_MS));
     const response = await api.fetchApi(`${DIRECTOR_CHAT_ENDPOINT}/${encodeURIComponent(jobId)}`);
     const job = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(job.error || `Director status check failed (${response.status}).`);
+    if (!response.ok) {
+      if (response.status >= 500 && statusFailures < DIRECTOR_STATUS_RETRY_LIMIT) {
+        statusFailures += 1;
+        setDirectorProgress("Director status was temporarily unavailable; retrying…");
+        continue;
+      }
+      throw new Error(job.error || `Director status check failed (${response.status}).`);
+    }
+    statusFailures = 0;
     if (job.status === "complete") return job.result || {};
     if (job.status === "failed") throw new Error(job.error || "Director request failed.");
-    const status = state.directorDialog?.querySelector("#psvstudio-director-status");
-    if (status) status.textContent = directorJobStatusText(job);
+    setDirectorProgress(directorJobStatusText(job));
   }
+}
+
+function setDirectorProgress(text) {
+  state.directorPendingText = String(text || "");
+  const dialog = state.directorDialog;
+  const status = dialog?.querySelector("#psvstudio-director-status");
+  const pending = dialog?.querySelector("[data-director-pending]");
+  if (status) status.textContent = state.directorPendingText;
+  if (pending) pending.textContent = state.directorPendingText;
 }
 
 async function sendDirectorMessage() {
@@ -802,7 +927,7 @@ async function sendDirectorMessage() {
   input.value = "";
   persistDirectorSessions();
   state.directorBusy = true;
-  dialog.querySelector("#psvstudio-director-status").textContent = "Consulting the local Director…";
+  setDirectorProgress("Consulting the local Director…");
   renderDirectorDialog();
   const projectId = project.id;
   try {
@@ -826,6 +951,7 @@ async function sendDirectorMessage() {
     persistDirectorSessions();
   } finally {
     state.directorBusy = false;
+    state.directorPendingText = "";
     if (activeProject()?.id === projectId) renderDirectorDialog();
   }
 }
@@ -863,8 +989,10 @@ async function regenerateDirectorResponse(messageId) {
   ) return;
 
   const attachments = directorAttachmentMetadata(userMessage.attachments).filter(attachment => attachment.path);
+  const requestMessages = session.messages.slice(0, messageIndex);
+  session.messages.splice(messageIndex, 1);
   state.directorBusy = true;
-  dialog.querySelector("#psvstudio-director-status").textContent = "Regenerating the Director answer...";
+  setDirectorProgress("Regenerating the Director answer…");
   renderDirectorDialog();
   const projectId = project.id;
   let failure = "";
@@ -874,7 +1002,7 @@ async function regenerateDirectorResponse(messageId) {
       shot,
       directorScope,
       attachments,
-      session.messages.slice(0, messageIndex),
+      requestMessages,
     );
     const variants = ensureDirectorVariants(message);
     variants.push({
@@ -892,11 +1020,27 @@ async function regenerateDirectorResponse(messageId) {
     const regeneratedPaths = new Set(attachments.map(attachment => attachment.path));
     session.draft_attachments = session.draft_attachments.filter(attachment => !regeneratedPaths.has(attachment.path));
     session.updated_at = Date.now();
-    persistDirectorSessions();
   } catch (error) {
     failure = error.message || String(error);
+    const variants = ensureDirectorVariants(message);
+    variants.push({
+      id: makeId("director-response"),
+      text: `Director request failed: ${failure}`,
+      proposal: null,
+      proposal_error: "",
+      proposal_state: "",
+      context_usage: null,
+      created_at: Date.now(),
+    });
+    syncDirectorVariant(message, variants.length - 1);
   } finally {
+    if (!session.messages.includes(message)) {
+      session.messages.splice(Math.min(messageIndex, session.messages.length), 0, message);
+    }
+    session.updated_at = Date.now();
+    persistDirectorSessions();
     state.directorBusy = false;
+    state.directorPendingText = "";
     if (activeProject()?.id === projectId) {
       renderDirectorDialog();
       if (failure) dialog.querySelector("#psvstudio-director-status").textContent = failure;
@@ -1263,6 +1407,121 @@ async function addMediaFiles(fileList) {
   setStatus(errors.length ? `${summary} ${errors.join(" ")}` : summary, errors.length ? "warning" : "ready");
 }
 
+function videoStudioStatus() {
+  const project = activeProject();
+  const open = Boolean(state.ready && state.panel && !state.panel.hidden);
+  return {
+    instanceId: STUDIO_INSTANCE_ID,
+    open,
+    openedAt: state.studioOpenedAt,
+    activeProjectId: open ? project?.id || "" : "",
+    projectName: open && project ? project.name || "Untitled video" : "",
+  };
+}
+
+async function completeRelayedHandoff(requestId, result, error = "") {
+  await api.fetchApi(`/promptstudio-video/studio-handoff/${encodeURIComponent(requestId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ result: result || {}, error }),
+  });
+}
+
+async function processRelayedHandoff(handoff) {
+  const requestId = String(handoff?.requestId || "");
+  if (!requestId || state.relayedHandoffs.has(requestId)) return;
+  state.relayedHandoffs.add(requestId);
+  try {
+    const result = await handoffPromptStudioImage(handoff.image);
+    await completeRelayedHandoff(requestId, result);
+  } catch (error) {
+    const message = error.message || String(error);
+    setStatus(message, "error");
+    await completeRelayedHandoff(requestId, {}, message).catch(() => {});
+  }
+}
+
+function flushServerPresence() {
+  if (state.serverPresenceRequest || !state.latestServerPresence) {
+    if (state.serverPresenceRequest) state.serverPresenceQueued = true;
+    return;
+  }
+  const presence = state.latestServerPresence;
+  state.latestServerPresence = null;
+  state.serverPresenceRequest = api.fetchApi("/promptstudio-video/studio-presence", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(presence),
+    keepalive: true,
+  }).then(async response => {
+    if (!response.ok) return;
+    const data = await response.json().catch(() => ({}));
+    for (const handoff of data.handoffs || []) processRelayedHandoff(handoff);
+  }).catch(() => {}).finally(() => {
+    state.serverPresenceRequest = null;
+    if (state.serverPresenceQueued || state.latestServerPresence) {
+      state.serverPresenceQueued = false;
+      flushServerPresence();
+    }
+  });
+}
+
+function postVideoStudioPresence() {
+  const presence = videoStudioStatus();
+  state.bridgeChannel?.postMessage({ type: "studio-presence", ...presence });
+  state.latestServerPresence = presence;
+  flushServerPresence();
+}
+
+function safeHandoffFilename(value, mimeType) {
+  const fallbackExtension = mimeType === "image/jpeg" ? "jpg" : mimeType?.split("/")[1]?.split("+")[0] || "png";
+  const filename = String(value || "prompt-studio-image").split(/[\\/]/).pop().replace(/[<>:"|?*\u0000-\u001f]/g, "_").trim();
+  return filename && filename.includes(".") ? filename : `${filename || "prompt-studio-image"}.${fallbackExtension}`;
+}
+
+async function handoffPromptStudioImage(value) {
+  const status = videoStudioStatus();
+  const project = activeProject();
+  if (!status.open || !project) throw new Error("Video Studio no longer has an open project.");
+  if (value?.targetProjectId && value.targetProjectId !== project.id) {
+    throw new Error("The open Video Studio project changed before the image handoff started.");
+  }
+  const sourceUrl = new URL(String(value?.url || ""), window.location.href);
+  if (sourceUrl.origin !== window.location.origin) throw new Error("Video Studio only accepts same-origin Prompt Studio images.");
+  const limitError = mediaLimit(project, "image");
+  if (limitError) throw new Error(limitError);
+
+  setStatus(`Importing ${value?.filename || "Prompt Studio image"}…`, "working");
+  const response = await fetch(sourceUrl.href, { credentials: "same-origin" });
+  if (!response.ok) throw new Error(`Prompt Studio image could not be read (${response.status}).`);
+  const blob = await response.blob();
+  if (!blob.type.startsWith("image/")) throw new Error("The Prompt Studio handoff did not contain an image.");
+  const file = new File([blob], safeHandoffFilename(value?.filename, blob.type), { type: blob.type });
+  const suppliedWidth = Number(value?.width);
+  const suppliedHeight = Number(value?.height);
+  const dimensions = suppliedWidth > 0 && suppliedHeight > 0
+    ? { width: suppliedWidth, height: suppliedHeight }
+    : await fileMediaDimensions(file, "image");
+  const path = await uploadMediaFile(file);
+  if (activeProject()?.id !== project.id) {
+    throw new Error("The open Video Studio project changed during the image handoff. Try again in the intended project.");
+  }
+  project.document.references ||= [];
+  const reference = {
+    id: makeId("reference"), kind: "image", path, name: file.name,
+    roles: defaultReferenceRoles(project, "image"), prompt: "", label: "",
+    trim_start: 0, trim_end: null, use_embedded_audio: false,
+    source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
+  };
+  project.document.references.push(reference);
+  if (reference.roles.some(role => CANVAS_MEDIA_ROLES.has(role))) synchronizeGeometryCanvas(project);
+  invalidateReferenceSemantics(project);
+  markProjectChanged({ render: true });
+  const displayLabel = referenceDisplayLabel(project.document.references, reference);
+  setStatus(`${displayLabel} was added from Prompt Studio.`, "ready");
+  return { projectId: project.id, projectName: project.name || "Untitled video", referenceId: reference.id };
+}
+
 function clearMediaDrag(doc) {
   state.mediaDropDepth.set(doc, 0);
   doc.body?.classList.remove("psvstudio-media-drag-active");
@@ -1412,6 +1671,7 @@ function newProject() {
   state.activeProjectId = project.id;
   state.selectedShotId = project.document.shots[0].id;
   markProjectChanged({ render: true });
+  postVideoStudioPresence();
   setStatus("New video project created.", "ready");
 }
 
@@ -1421,6 +1681,7 @@ function selectProject(projectId) {
   state.projectMutation += 1;
   persistProjects();
   renderAll();
+  postVideoStudioPresence();
 }
 
 function projectPendingGenerationCount(project) {
@@ -2832,6 +3093,15 @@ function buildPanel() {
         <span class="psvstudio-topbar-spacer"></span>
         <select id="psvstudio-workflow" class="psvstudio-workflow-select" aria-label="Video workflow"></select>
         <button id="psvstudio-refresh-workflows" class="psvstudio-button psvstudio-icon-button" type="button" title="Refresh [PSV] workflows" aria-label="Refresh [PSV] workflows">↻</button>
+        <details id="psvstudio-kobold-control" class="psvstudio-kobold-control" data-state="checking">
+          <summary title="KoboldCpp status and emergency stop"><span class="psvstudio-kobold-dot" aria-hidden="true"></span><span id="psvstudio-kobold-status-label">Kobold…</span></summary>
+          <div class="psvstudio-kobold-popover">
+            <strong>KoboldCpp</strong>
+            <span id="psvstudio-kobold-status-detail" role="status" aria-live="polite">Checking local status…</span>
+            <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Stop generation</button>
+            <small>Stops text generation only. KoboldCpp stays loaded.</small>
+          </div>
+        </details>
         <label class="psvstudio-inline psvstudio-help"><input id="psvstudio-new-seed" type="checkbox" checked /> New seed</label>
         <button id="psvstudio-compile-preview" class="psvstudio-button" type="button">Prompt</button>
         <button id="psvstudio-duplicate" class="psvstudio-button" type="button">Duplicate</button>
@@ -2889,6 +3159,7 @@ function buildPanel() {
   panel.querySelector("#psvstudio-duplicate").addEventListener("click", duplicateProject);
   panel.querySelector("#psvstudio-compile-preview").addEventListener("click", compilePreview);
   panel.querySelector("#psvstudio-refresh-workflows").addEventListener("click", () => refreshWorkflows());
+  panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopKoboldGeneration);
   panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
     const project = activeProject();
     if (!project) return;
@@ -2972,25 +3243,51 @@ async function attachStandalone(popup) {
   state.popup = popup;
   mount.replaceChildren(state.panel);
   state.panel.hidden = false;
+  state.studioOpenedAt = Date.now();
   installMediaDrop(popup.document);
   renderAll();
+  postVideoStudioPresence();
   popup.addEventListener("beforeunload", () => {
     if (state.panel?.ownerDocument !== document) document.body.append(state.panel);
     state.panel.hidden = true;
+    state.studioOpenedAt = 0;
     clearMediaDrag(popup.document);
     state.popup = null;
+    postVideoStudioPresence();
     persistProjects({ immediate: true });
   }, { once: true });
   return true;
 }
 
 function setupStandaloneBridge() {
-  globalThis.__promptstudioVideoStudioHost = { attach: attachStandalone };
+  globalThis.__promptstudioVideoStudioHost = {
+    attach: attachStandalone,
+    status: videoStudioStatus,
+    handoffImage: handoffPromptStudioImage,
+  };
   if (typeof BroadcastChannel !== "function") return;
+  state.bridgeChannel?.close();
   const channel = new BroadcastChannel(CHANNEL_NAME);
-  channel.addEventListener("message", () => {
-    // Direct pages fall back to a private hidden ComfyUI host. Opened pages attach through window.opener.
+  state.bridgeChannel = channel;
+  channel.addEventListener("message", async event => {
+    const data = event.data;
+    if (data?.type === "studio-probe") {
+      postVideoStudioPresence();
+      return;
+    }
+    if (data?.type !== "handoff-image" || data.targetInstanceId !== STUDIO_INSTANCE_ID || !data.requestId) return;
+    try {
+      const result = await handoffPromptStudioImage(data.image);
+      channel.postMessage({ type: "handoff-result", requestId: data.requestId, ok: true, result });
+    } catch (error) {
+      const message = error.message || String(error);
+      setStatus(message, "error");
+      channel.postMessage({ type: "handoff-result", requestId: data.requestId, ok: false, error: message });
+    }
   });
+  if (state.bridgePresenceTimer) window.clearInterval(state.bridgePresenceTimer);
+  state.bridgePresenceTimer = window.setInterval(postVideoStudioPresence, 2500);
+  postVideoStudioPresence();
 }
 
 function resumeGenerationPolling() {
@@ -3006,6 +3303,7 @@ app.registerExtension({
   async setup() {
     buildPanel();
     setupProgressEvents();
+    startKoboldStatusMonitor();
     try {
       await loadConfig();
       await Promise.all([loadProjects(), loadWorkflowCache()]);
