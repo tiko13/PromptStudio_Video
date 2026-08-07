@@ -108,6 +108,8 @@ Inspect the attached images directly and report only concrete facts visible in t
 
 For a person, prioritize visibly supported hair color/style, face and skin appearance, clothing type/color/material, footwear, accessories, pose, framing, and immediate background. For another subject type, provide equivalently concrete colors, shapes, materials, textures, components, layout, and spatial relationships. For style, pose, camera, storyboard, first-frame, or last-frame usages, also describe the visible composition and treatment relevant to that usage.
 
+Follow assigned_usage strictly. For scene usage, report the environment, furnishings, architecture, materials, layout, and lighting while omitting a visible person's identity and wardrobe unless required to explain spatial scale. For style usage, report rendering medium, shapes, linework, texture, palette, and compositional treatment while omitting depicted character identity and wardrobe. For subject usage, prioritize the assigned subject and do not promote incidental background elements into subject traits.
+
 Return JSON only with one entry per image in the same order: an object containing an images array; each array item must contain integer index and a non-empty observations string. Do not use Markdown fences or commentary."""
 
 
@@ -133,14 +135,15 @@ def _shot_ordinal(value):
 
 
 def _repair_json_structure(value):
-    """Remove only mismatched closing braces and close still-open containers."""
+    """Repair conservative container defects in an otherwise JSON-like change set."""
+    source = str(value or "")
     output = []
     stack = []
     pairs = {"{": "}", "[": "]"}
     in_string = False
     escaped = False
     changed = False
-    for character in str(value or ""):
+    for index, character in enumerate(source):
         if in_string:
             output.append(character)
             if escaped:
@@ -156,6 +159,18 @@ def _repair_json_structure(value):
         elif character in pairs:
             stack.append(character)
             output.append(character)
+        elif character == ",":
+            following = source[index + 1:]
+            next_token = following.lstrip()
+            if next_token.startswith(("}", "]")):
+                changed = True
+                continue
+            if re.match(r'^\{\s*"op"\s*:', next_token) and stack and stack[-1] == "{":
+                while stack and stack[-1] == "{":
+                    stack.pop()
+                    output.append("}")
+                    changed = True
+            output.append(character)
         elif character in {"}", "]"}:
             if stack and pairs[stack[-1]] == character:
                 stack.pop()
@@ -165,11 +180,11 @@ def _repair_json_structure(value):
         else:
             output.append(character)
     if in_string:
-        return str(value or "")
+        return source
     while stack:
         output.append(pairs[stack.pop()])
         changed = True
-    return "".join(output) if changed else str(value or "")
+    return "".join(output) if changed else source
 
 
 def _reference_tokens(document):
@@ -508,7 +523,7 @@ def _parse_vision_grounding(raw, attachments):
         observations = _text(item.get("observations"), VISION_GROUNDING_MAX_CHARS)
         if not observations:
             raise ValueError(f"image observation {index} is empty")
-        by_index[index] = observations
+        by_index[index] = _role_focused_observations(observations, attachments[index - 1].get("usage"))
     if set(by_index) != set(range(1, len(attachments) + 1)):
         raise ValueError("image observation indexes do not cover every attachment")
     return [
@@ -521,6 +536,25 @@ def _parse_vision_grounding(raw, attachments):
         }
         for index, attachment in enumerate(attachments, 1)
     ]
+
+
+def _role_focused_observations(value, usage):
+    """Remove clearly role-irrelevant person descriptions from scene grounding."""
+    observations = _text(value, VISION_GROUNDING_MAX_CHARS)
+    if _text(usage, 40).casefold() != "scene":
+        return observations
+    person_detail = re.compile(
+        r"\b(woman|man|person|girl|boy|she|he|her|his|hair|wearing|wears|dressed|"
+        r"shirt|blouse|dress|skirt|trousers|pants|face|skin)\b",
+        re.IGNORECASE,
+    )
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", observations)
+        if sentence.strip()
+    ]
+    focused = [sentence for sentence in sentences if not person_detail.search(sentence)]
+    return " ".join(focused) or observations
 
 
 def _vision_grounding_messages(attachments, correction=""):
@@ -551,14 +585,22 @@ def _vision_grounding_messages(attachments, correction=""):
 def _ground_vision_images(data, attachments, images, progress_callback=None):
     if not images:
         return []
+    thinking_mode = _text(data.get("thinking_mode"), 20).casefold()
+    if thinking_mode == "high":
+        grounding_response_tokens = min(6_000, 3_500 + 500 * len(images))
+    elif thinking_mode == "medium":
+        grounding_response_tokens = min(4_000, 2_000 + 400 * len(images))
+    elif thinking_mode in {"minimal", "low"}:
+        grounding_response_tokens = min(2_400, 1_000 + 350 * len(images))
+    else:
+        grounding_response_tokens = max(600, min(1_600, 350 * len(images)))
     grounding_data = {
         **data,
         "temperature": 0.0,
         "top_p": 1.0,
         "top_k": 1,
         "min_p": 0.0,
-        "thinking_mode": "Disabled",
-        "max_response_tokens": max(600, min(1_600, 350 * len(images))),
+        "max_response_tokens": grounding_response_tokens,
     }
     error = ""
     for attempt in range(1, VISION_GROUNDING_ATTEMPTS + 1):
@@ -721,11 +763,17 @@ def _guide_reference_label(value, *, allow_subject=True):
 
 
 def _task_types(value):
-    if not isinstance(value, list) or not value:
-        raise ValueError("task_types must be a non-empty list")
+    if not isinstance(value, list):
+        raise ValueError("task_types must be a list")
     result = []
+    aliases = {
+        "ref2v": "reference generation",
+        "ref2va": "reference generation",
+        "reference-to-video": "reference generation",
+        "reference to video": "reference generation",
+    }
     for item in value:
-        task = _text(item, 80).casefold()
+        task = aliases.get(_text(item, 80).casefold(), _text(item, 80).casefold())
         if task not in TASK_TYPES:
             raise ValueError(f"Unsupported reference task type '{task}'")
         if task not in result:
@@ -734,8 +782,8 @@ def _task_types(value):
 
 
 def _subject_definitions(value):
-    if not isinstance(value, list) or not value:
-        raise ValueError("subject_definitions must be a non-empty list")
+    if not isinstance(value, list):
+        raise ValueError("subject_definitions must be a list")
     result = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
@@ -755,8 +803,8 @@ def _subject_definitions(value):
 
 
 def _retention_analysis(value):
-    if not isinstance(value, list) or not value:
-        raise ValueError("retention_analysis must be a non-empty list")
+    if not isinstance(value, list):
+        raise ValueError("retention_analysis must be a list")
     result = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
@@ -1205,6 +1253,178 @@ def _bind_unambiguous_reference_source(document):
     unbound_subjects[0]["text"] = f"{text} Source reference: {token}."
 
 
+def _canonicalize_subject_source_aliases(document):
+    """Repair a source token used where its sole derived Subject is required."""
+    definitions = document.get("subject_definitions") or []
+    defined_tokens = {
+        f"<{_text(item.get('label'), 80).strip('<>')}>".casefold()
+        for item in definitions
+    }
+    subjects_by_source = {}
+    for definition in definitions:
+        subject_token = f"<{_text(definition.get('label'), 80).strip('<>')}>"
+        definition_text = _text(definition.get("text"), 8_000)
+        for reference in document.get("references") or []:
+            source_token = _text(reference.get("label"), 80)
+            if source_token and source_token.casefold() in definition_text.casefold():
+                subjects_by_source.setdefault(source_token.casefold(), set()).add(subject_token)
+
+    retention_labels = {
+        _text(item.get("label"), 80).casefold()
+        for item in document.get("retention_analysis") or []
+    }
+    aliases = {
+        source_key: next(iter(subject_tokens))
+        for source_key, subject_tokens in subjects_by_source.items()
+        if len(subject_tokens) == 1
+        and source_key not in defined_tokens
+        and next(iter(subject_tokens)).casefold() not in retention_labels
+    }
+    if not aliases:
+        return
+
+    for item in document.get("retention_analysis") or []:
+        replacement = aliases.get(_text(item.get("label"), 80).casefold())
+        if replacement:
+            item["label"] = replacement
+        for field in ("where", "detail"):
+            value = _text(item.get(field), 8_000)
+            for source_key, subject_token in aliases.items():
+                value = re.sub(re.escape(source_key), subject_token, value, flags=re.IGNORECASE)
+            item[field] = value
+
+    summary = _text(document.get("summary"), 8_000)
+    for source_key, subject_token in aliases.items():
+        summary = re.sub(re.escape(source_key), subject_token, summary, flags=re.IGNORECASE)
+    document["summary"] = summary
+
+
+def _canonicalize_direct_visual_definitions(document):
+    """Turn non-keyframe Picture definitions into source-backed Subject definitions."""
+    references = {
+        _text(item.get("label"), 80).casefold(): item
+        for item in document.get("references") or []
+    }
+    existing = {
+        f"<{_text(item.get('label'), 80).strip('<>')}>".casefold()
+        for item in document.get("subject_definitions") or []
+    }
+    aliases = {}
+    for definition in document.get("subject_definitions") or []:
+        source_token = f"<{_text(definition.get('label'), 80).strip('<>')}>"
+        source = references.get(source_token.casefold())
+        roles = set(source.get("roles") or []) if source else set()
+        if not source or source.get("kind") != "image":
+            continue
+        if not roles & {"subject", "scene", "style", "action", "pose", "camera"}:
+            continue
+        ordinal = re.search(r"(\d+)", source_token)
+        subject_token = f"<Subject {ordinal.group(1)}>" if ordinal else ""
+        if not subject_token or subject_token.casefold() in existing:
+            continue
+        aliases[source_token.casefold()] = subject_token
+        definition["label"] = subject_token.strip("<>")
+        text = _text(definition.get("text"), 8_000).rstrip()
+        if source_token.casefold() not in text.casefold():
+            definition["text"] = f"{text} Source reference: {source_token}.".strip()
+        existing.add(subject_token.casefold())
+
+    if not aliases:
+        return
+    for item in document.get("retention_analysis") or []:
+        replacement = aliases.get(_text(item.get("label"), 80).casefold())
+        if replacement:
+            item["label"] = replacement
+        for field in ("where", "detail"):
+            value = _text(item.get(field), 8_000)
+            for source_key, subject_token in aliases.items():
+                value = re.sub(re.escape(source_key), subject_token, value, flags=re.IGNORECASE)
+            item[field] = value
+    for field in ("summary", "main_description", "style", "overall_soundscape", "non_diegetic_music"):
+        value = _text(document.get(field), 8_000)
+        for source_key, subject_token in aliases.items():
+            value = re.sub(re.escape(source_key), subject_token, value, flags=re.IGNORECASE)
+        document[field] = value
+    for shot_value in document.get("shots") or []:
+        for field in SHOT_TEXT_FIELDS:
+            value = _text(shot_value.get(field), 8_000)
+            for source_key, subject_token in aliases.items():
+                value = re.sub(re.escape(source_key), subject_token, value, flags=re.IGNORECASE)
+            shot_value[field] = value
+        shot_value["sounds"] = [
+            _replace_reference_aliases(sound, aliases) for sound in shot_value.get("sounds") or []
+        ]
+
+
+def _replace_reference_aliases(value, aliases):
+    result = _text(value, 8_000)
+    for source_key, replacement in aliases.items():
+        result = re.sub(re.escape(source_key), replacement, result, flags=re.IGNORECASE)
+    return result
+
+
+def _canonicalize_retention_shot_mentions(document):
+    """Canonicalize model-written shot IDs and bare shot ordinals in retention locations."""
+    replacements = {
+        _text(item.get("id"), 80): f"[Shot {index}]"
+        for index, item in enumerate(document.get("shots") or [], 1)
+    }
+    for item in document.get("retention_analysis") or []:
+        where = _text(item.get("where"), 2_000)
+        for shot_id, display in sorted(replacements.items(), key=lambda pair: len(pair[0]), reverse=True):
+            if shot_id:
+                where = re.sub(re.escape(shot_id), display, where, flags=re.IGNORECASE)
+        where = re.sub(
+            r"(?<!\[)\bShot\s+(\d+)\b(?!\])",
+            lambda match: f"[Shot {match.group(1)}]",
+            where,
+            flags=re.IGNORECASE,
+        )
+        combined = f"{where} {_text(item.get('detail'), 8_000)}"
+        if not re.search(r"\[\s*Shot\s+\d+\s*\]", where, re.IGNORECASE) and re.search(
+            r"\b(all shots|every shot|across all|entire video|throughout (?:the )?(?:video|sequence))\b",
+            combined,
+            re.IGNORECASE,
+        ):
+            where = "appears in " + " and ".join(replacements.values())
+        item["where"] = where
+
+
+def _ensure_defined_labels_in_summary(document):
+    """Keep otherwise-valid REF2VA proposals usable when the model omits summary labels."""
+    summary = _text(document.get("summary"), 8_000)
+    missing = []
+    for definition in document.get("subject_definitions") or []:
+        token = f"<{_text(definition.get('label'), 80).strip('<>')}>"
+        if token.casefold() not in summary.casefold():
+            missing.append(token)
+    if not missing:
+        return
+    if len(missing) == 1:
+        labels = missing[0]
+    else:
+        labels = f"{', '.join(missing[:-1])} and {missing[-1]}"
+    addition = f"The target video uses {labels}."
+    document["summary"] = " ".join(part for part in (summary, addition) if part)
+
+
+def _synchronize_reference_project_operation(proposal, document):
+    """Return the deterministic reference repairs in the proposal shown to the user."""
+    semantic_updates = [
+        operation for operation in proposal.get("operations") or []
+        if operation.get("op") == "update_project"
+        and set(operation.get("fields") or {}) & (PROJECT_REFERENCE_FIELDS | {"summary"})
+    ]
+    if not semantic_updates:
+        return
+    semantic_updates[-1]["fields"].update({
+        "task_types": copy.deepcopy(document.get("task_types") or []),
+        "subject_definitions": copy.deepcopy(document.get("subject_definitions") or []),
+        "summary": _text(document.get("summary"), 8_000),
+        "retention_analysis": copy.deepcopy(document.get("retention_analysis") or []),
+    })
+
+
 def preview_changeset(document_value, proposal_value):
     document = normalize_document(document_value)
     expected_hash = _text(proposal_value.get("base_document_hash") if isinstance(proposal_value, dict) else "", 128)
@@ -1240,8 +1460,6 @@ def preview_changeset(document_value, proposal_value):
         if operation_type == "remove_shot":
             if shot.get("dialogue") or shot.get("visible_text"):
                 raise ValueError("The Grand Director cannot remove a shot containing protected dialogue or visible text")
-            if len(updated["shots"]) == 1:
-                raise ValueError("The video must keep at least one shot")
             updated["shots"].remove(shot)
             continue
         for name, value in operation["fields"].items():
@@ -1249,15 +1467,23 @@ def preview_changeset(document_value, proposal_value):
                 shot["camera"].update(value)
             else:
                 shot[name] = value
+    if not updated["shots"]:
+        raise ValueError("The video must keep at least one shot in the resulting timeline")
     if proposal["scope"]["type"] == "project":
         updated["shots"].sort(key=lambda item: float(item.get("start", 0)))
     _bind_unambiguous_reference_source(updated)
+    _canonicalize_direct_visual_definitions(updated)
+    _canonicalize_subject_source_aliases(updated)
+    _canonicalize_retention_shot_mentions(updated)
+    _ensure_defined_labels_in_summary(updated)
     _ground_reference_definitions(updated)
     normalized = normalize_document(updated)
+    compiled_prompt = compile_prompt(normalized)
+    _synchronize_reference_project_operation(proposal, normalized)
     return {
         "valid": True,
         "document": normalized,
-        "compiled_prompt": compile_prompt(normalized),
+        "compiled_prompt": compiled_prompt,
         "resolved_mode": normalized["resolved_mode"],
         "proposal": proposal,
     }
@@ -1354,6 +1580,16 @@ def _preserve_reference_only_request(data):
     if not has_reference:
         return False
     content = _latest_user_content(data)
+    broad_rewrite = (
+        re.search(r"\b(rewrite|replace|restructure|compose|create|generate|transform)\b", content, re.IGNORECASE)
+        and re.search(
+            r"\b(complete|completely|entire|full|all|exactly\s+\w+\s+(?:resulting\s+)?shots?)\b",
+            content,
+            re.IGNORECASE,
+        )
+    )
+    if broad_rewrite:
+        return False
     explicit_preservation = re.search(r"\b(preserve|keep|retain|do not change|don't change)\b", content, re.IGNORECASE)
     simple_assignment = (
         len(content) <= 180
