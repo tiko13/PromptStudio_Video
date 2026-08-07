@@ -9,6 +9,7 @@ from video.director import (
     CHANGESET_END,
     PROJECT_SYSTEM_MESSAGE,
     SHOT_SYSTEM_MESSAGE,
+    VISION_GROUNDING_SYSTEM_MESSAGE,
     build_provider_messages,
     compact_project_context,
     director_chat,
@@ -18,6 +19,7 @@ from video.director import (
     _validate_reference_only_preservation,
     _validate_requested_project_result,
     _enrich_reference_definition_placeholders,
+    _parse_vision_grounding,
     _proposal_retry_messages,
     _proposal_requested,
 )
@@ -54,11 +56,32 @@ def provider_context(messages):
 
 
 class DirectorTests(unittest.TestCase):
-    def test_reference_examples_do_not_model_the_rejected_placeholder(self):
+    def test_reference_contract_has_no_literal_appearance_example(self):
         for system_message in (SHOT_SYSTEM_MESSAGE, PROJECT_SYSTEM_MESSAGE):
             self.assertNotIn("with the observed identity traits.", system_message)
             self.assertNotIn("concrete visible identity traits observed in that image", system_message)
-            self.assertIn("shoulder-length wavy black hair", system_message)
+            self.assertNotIn("shoulder-length wavy black hair", system_message)
+            self.assertNotIn("teal linen blouse", system_message)
+            self.assertIn("observed_visual_facts", system_message)
+
+    def test_vision_grounding_contract_separates_pixels_from_requested_action(self):
+        self.assertIn("report only concrete facts visible in their pixels", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("do not add the user's requested action", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("Return JSON only", VISION_GROUNDING_SYSTEM_MESSAGE)
+
+    def test_vision_grounding_parser_preserves_attachment_order(self):
+        attachments = [
+            {"id": "a", "name": "First.webp", "usage": "subject"},
+            {"id": "b", "name": "Second.png", "usage": "scene"},
+        ]
+        parsed = _parse_vision_grounding(
+            '{"images":[{"index":2,"observations":"Blue tiled room."},'
+            '{"index":1,"observations":"Platinum-blonde hair and pink clothing."}]}',
+            attachments,
+        )
+        self.assertEqual([item["attachment_id"] for item in parsed], ["a", "b"])
+        self.assertIn("Platinum-blonde", parsed[0]["observations"])
+        self.assertIn("Blue tiled room", parsed[1]["observations"])
 
     def test_visual_trait_placeholder_retry_demands_source_observations(self):
         retry = _proposal_retry_messages(
@@ -70,9 +93,41 @@ class DirectorTests(unittest.TestCase):
             ),
         )
         correction = retry[-1]["content"]
-        self.assertIn("Inspect the supplied reference image again", correction)
-        self.assertIn("hair, face, skin, eyes, and clothing", correction)
-        self.assertIn("do not copy hypothetical traits", correction)
+        self.assertIn("observed_visual_facts", correction)
+        self.assertIn("Copy only those grounded facts", correction)
+        self.assertIn("do not invent or substitute appearance details", correction)
+
+    def test_invalid_retention_relationship_retry_lists_exact_allowed_values(self):
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": "Apply the reference to the full video."}],
+            "project",
+            proposal_error="retention_analysis item 1 has an invalid relationship",
+        )
+        correction = retry[-1]["content"]
+        self.assertIn(
+            "Visual: fully_preserved, partially_preserved, attribute_transfer, or weak_reference",
+            correction,
+        )
+        self.assertIn(
+            "Audio: fully_copy, partially_copy, reference, or weak_reference",
+            correction,
+        )
+
+    def test_director_canonicalizes_retention_relationship_formatting(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Use the identity reference","operations":[{"op":"update_project","fields":{'
+            '"task_types":["reference generation"],'
+            '"subject_definitions":[{"label":"Subject 1","text":"is the woman in <Picture 1>."}],'
+            '"summary":"The target video follows <Subject 1>.",'
+            '"retention_analysis":[{"label":"<Subject 1>","where":"appears in [Shot 1]",'
+            '"relationship":"Fully Preserved","detail":"Her appearance is retained."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "project")
+        relationship = parsed["proposal"]["operations"][0]["fields"]["retention_analysis"][0]["relationship"]
+        self.assertEqual(relationship, "fully_preserved")
 
     def test_reference_placeholders_are_enriched_from_visible_observations(self):
         proposal = {
@@ -371,6 +426,76 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(context["attached_images"][1]["name"], "<Picture 1>")
         self.assertEqual(context["attached_images"][1]["source_name"], "Subject")
         self.assertEqual(context["attached_images"][1]["reference_token"], "<Picture 1>")
+
+    def test_grounded_visual_facts_are_authoritative_director_context(self):
+        document = director_document()
+        document["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "subject.webp",
+            "name": "Subject", "roles": ["subject"],
+        }]
+        messages, _usage = build_provider_messages({
+            "scope": "project",
+            "document": document,
+            "messages": [{"role": "user", "content": "Make her dance in the rain."}],
+            "attachments": [{
+                "id": "attachment-1", "path": "subject.webp", "name": "Subject",
+                "usage": "subject", "reference_id": "reference-1",
+            }],
+            "_vision_observations": [{
+                "observations": (
+                    "A full-body portrait of a platinum-blonde woman wearing a pink crop top and pink bottoms, "
+                    "with black boots, against a plain light wall."
+                ),
+            }],
+        })
+        context = provider_context(messages)
+        attached = context["attached_images"][0]
+        self.assertIn("platinum-blonde", attached["observed_visual_facts"])
+        self.assertIn("pink crop top", attached["observed_visual_facts"])
+        self.assertIn("Authoritative pixel observations", attached["observation_policy"])
+
+    def test_director_grounds_images_before_structured_request(self):
+        document = director_document()
+        document["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "subject.webp",
+            "name": "Subject", "roles": ["subject"],
+        }]
+        attachments = [{
+            "id": "attachment-1", "path": "subject.webp", "name": "Subject",
+            "usage": "subject", "reference_id": "reference-1",
+            "source_width": 1184, "source_height": 1776,
+        }]
+        images = [{
+            "data_uri": "data:image/png;base64,AAAA", "base64": "AAAA",
+            "mime_type": "image/png", "name": "Subject", "usage": "subject",
+        }]
+        grounding = (
+            '{"images":[{"index":1,"observations":"Platinum-blonde straight hair, pink crop top and '
+            'pink bottoms, black boots, full-body pose against a plain light wall."}]}'
+        )
+        progress = []
+        with patch("video.director.load_vision_images", return_value=(attachments, images)), patch(
+            "video.director.generate_chat", side_effect=[grounding, "The requested action is feasible."]
+        ) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "messages": [{"role": "user", "content": "Review her dancing in the rain."}],
+                "attachments": [{"path": "subject.webp", "usage": "subject"}],
+            }, progress.append)
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args_list[0].args[2], images)
+        self.assertEqual(generate.call_args_list[1].args[2], [])
+        context = provider_context(generate.call_args_list[1].args[1])
+        self.assertIn("Platinum-blonde", context["attached_images"][0]["observed_visual_facts"])
+        self.assertIn("pink crop top", context["attached_images"][0]["observed_visual_facts"])
+        self.assertEqual(result["vision_observations"][0]["usage"], "subject")
+        self.assertEqual(progress, [{
+            "phase": "vision_grounding",
+            "attempt": 1,
+            "maximum_attempts": 2,
+        }])
 
     def test_selected_shot_proposal_can_complete_reference_semantics(self):
         value = director_document()

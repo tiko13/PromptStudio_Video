@@ -96,8 +96,13 @@ loaded only through validated paths beneath that directory. A per-image usage
 separates visual description from conditioning: `describe` images are current-
 turn vision context only, while explicit first-frame, last-frame, subject,
 scene, style, pose, camera, and storyboard usages become normal project
-references before the request. Image bytes are attached only to the latest user
-message and are never replayed with older chat history.
+references before the request. Image bytes go first through a low-temperature,
+vision-only grounding request that has no access to the requested video action.
+Its validated observations are inserted into the production context as
+authoritative visual facts, and the larger structured Director request receives
+those facts without the image bytes. This keeps schema examples and story text
+from contaminating pixel observations. Images are never replayed with older chat
+history.
 
 ## Runtime dispatch
 

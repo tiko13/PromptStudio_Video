@@ -52,6 +52,20 @@ VISUAL_RETENTION = {
     "weak_reference",
 }
 AUDIO_RETENTION = {"fully_copy", "partially_copy", "reference", "weak_reference"}
+RETENTION_RELATIONSHIPS = VISUAL_RETENTION | AUDIO_RETENTION
+RETENTION_RELATIONSHIP_ALIASES = {
+    "full_preservation": "fully_preserved",
+    "complete_preservation": "fully_preserved",
+    "partial_preservation": "partially_preserved",
+    "attributes_transferred": "attribute_transfer",
+    "attribute_transferred": "attribute_transfer",
+    "weakly_referenced": "weak_reference",
+    "fully_copied": "fully_copy",
+    "full_copy": "fully_copy",
+    "partial_copy": "partially_copy",
+    "partially_copied": "partially_copy",
+    "referenced": "reference",
+}
 CAMERA_TYPES = {
     "",
     "Zoom In",
@@ -93,6 +107,12 @@ def _number(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
     return result if math.isfinite(result) else float(default)
+
+
+def normalize_retention_relationship(value, default="fully_preserved"):
+    """Canonicalize safe spelling variants without changing retention semantics."""
+    relationship = re.sub(r"[^a-z0-9]+", "_", _text(value, default).casefold()).strip("_")
+    return RETENTION_RELATIONSHIP_ALIASES.get(relationship, relationship)
 
 
 def _identifier(value, prefix):
@@ -321,9 +341,12 @@ def _normalize_subject_definition(item, index):
 def _normalize_retention(item, index):
     if not isinstance(item, dict):
         raise PromptDocumentError(f"Retention entry {index + 1} must be an object")
-    relationship = _text(item.get("relationship"), "fully_preserved")
-    if relationship not in VISUAL_RETENTION | AUDIO_RETENTION:
-        raise PromptDocumentError(f"Retention entry {index + 1} has an invalid relationship")
+    relationship = normalize_retention_relationship(item.get("relationship"))
+    if relationship not in RETENTION_RELATIONSHIPS:
+        allowed = ", ".join(sorted(RETENTION_RELATIONSHIPS))
+        raise PromptDocumentError(
+            f"Retention entry {index + 1} has invalid relationship {relationship!r}; use one of: {allowed}"
+        )
     return {
         "label": _canonical_reference_tokens(_text(item.get("label"))),
         "where": _canonical_reference_tokens(_text(item.get("where"))),

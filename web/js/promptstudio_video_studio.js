@@ -335,11 +335,15 @@ function directorSessions() {
   return state.directorSessions;
 }
 
+function directorSessionId(projectId = state.activeProjectId, scope = state.directorScope) {
+  const projectKey = String(projectId || "");
+  return scope === "project" ? `${projectKey}:project` : projectKey;
+}
+
 function directorSession(projectId = state.activeProjectId, scope = state.directorScope) {
   const sessions = directorSessions();
-  const projectKey = String(projectId || "");
   const normalizedScope = scope === "project" ? "project" : "shot";
-  const id = normalizedScope === "project" ? `${projectKey}:project` : projectKey;
+  const id = directorSessionId(projectId, normalizedScope);
   if (!sessions[id] || !Array.isArray(sessions[id].messages)) {
     sessions[id] = { scope: normalizedScope, messages: [], draft_attachments: [], updated_at: Date.now() };
   }
@@ -495,7 +499,7 @@ function renderDirectorAttachments() {
   container.replaceChildren();
   container.classList.toggle("is-empty", !session.draft_attachments.length);
   if (!session.draft_attachments.length) {
-    container.append(el("small", "", "Drop images here, paste them into the project first, or use Add image. Choose whether each image is visual context only or a MiniMax reference."));
+    container.append(el("small", "", "Drop or paste images here, or use Add image. Choose whether each image is visual context only or a MiniMax reference."));
     return;
   }
   for (const attachment of session.draft_attachments) {
@@ -531,6 +535,15 @@ function directorImageFile(file) {
   return ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].includes(file?.name?.split(".").pop()?.toLowerCase());
 }
 
+function clipboardImageFiles(event) {
+  const itemFiles = Array.from(event.clipboardData?.items || [])
+    .filter(item => item.kind === "file" && item.type?.startsWith("image/"))
+    .map(item => item.getAsFile())
+    .filter(Boolean);
+  if (itemFiles.length) return itemFiles;
+  return Array.from(event.clipboardData?.files || []).filter(directorImageFile);
+}
+
 async function addDirectorImages(fileList) {
   const project = activeProject();
   const dialog = state.directorDialog;
@@ -549,11 +562,11 @@ async function addDirectorImages(fileList) {
   const errors = [];
   for (const file of files.slice(0, remaining)) {
     try {
-      dialog.querySelector("#psvstudio-director-status").textContent = `Uploading ${file.name} to ComfyUI input storage…`;
+      dialog.querySelector("#psvstudio-director-status").textContent = `Uploading ${file.name || "pasted image"} to ComfyUI input storage…`;
       const dimensions = await fileMediaDimensions(file, "image");
       const path = await uploadMediaFile(file);
       session.draft_attachments.push({
-        id: makeId("director-image"), path, name: file.name, usage: "describe", reference_id: "",
+        id: makeId("director-image"), path, name: file.name || path.split("/").pop(), usage: "describe", reference_id: "",
         source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
       });
     } catch (error) {
@@ -735,8 +748,40 @@ function renderDirectorDialog() {
   }
   const send = dialog.querySelector("#psvstudio-director-send");
   if (send) send.disabled = state.directorBusy;
+  const clear = dialog.querySelector("#psvstudio-director-clear");
+  if (clear) clear.disabled = state.directorBusy;
   renderDirectorAttachments();
   history.scrollTop = history.scrollHeight;
+}
+
+function clearDirectorSession() {
+  const dialog = state.directorDialog;
+  const project = activeProject();
+  if (!dialog || !project || state.directorBusy) return;
+  const input = dialog.querySelector("#psvstudio-director-input");
+  const sessionId = directorSessionId(project.id, state.directorScope);
+  const session = directorSessions()[sessionId];
+  const hasConversation = Array.isArray(session?.messages) && session.messages.length > 0;
+  const hasPendingContext = Array.isArray(session?.draft_attachments) && session.draft_attachments.length > 0;
+  const hasCachedContext = Boolean(session?.last_context_usage);
+  if (!hasConversation && !hasPendingContext && !hasCachedContext && !input?.value.trim()) {
+    const status = dialog.querySelector("#psvstudio-director-status");
+    if (status) status.textContent = "Conversation is already clear.";
+    return;
+  }
+  const view = dialog.ownerDocument?.defaultView;
+  if (!view?.confirm("Clear this Director conversation, draft, and all pending image context?")) return;
+  delete directorSessions()[sessionId];
+  if (input) input.value = "";
+  const imageInput = dialog.querySelector("#psvstudio-director-image-input");
+  if (imageInput) imageInput.value = "";
+  state.directorPendingText = "";
+  dialog.classList.remove("is-image-dragover");
+  persistDirectorSessions();
+  renderDirectorDialog();
+  const status = dialog.querySelector("#psvstudio-director-status");
+  if (status) status.textContent = "Conversation cleared.";
+  input?.focus();
 }
 
 function ensureDirectorDialog() {
@@ -747,7 +792,7 @@ function ensureDirectorDialog() {
   const dialog = owner.createElement("dialog");
   dialog.className = "psvstudio-director-dialog";
   dialog.innerHTML = `
-    <header><div><h2 id="psvstudio-director-title">Director</h2><small id="psvstudio-director-subtitle">Context-efficient selected-shot consultation</small></div><button id="psvstudio-director-close" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close Director">×</button></header>
+    <header><div class="psvstudio-director-heading"><h2 id="psvstudio-director-title">Director</h2><small id="psvstudio-director-subtitle">Context-efficient selected-shot consultation</small></div><div class="psvstudio-director-header-actions"><button id="psvstudio-director-clear" class="psvstudio-button" type="button">Clear</button><button id="psvstudio-director-close" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close Director">×</button></div></header>
     <div id="psvstudio-director-history" class="psvstudio-director-history"></div>
     <div class="psvstudio-director-composer">
       <div id="psvstudio-director-attachments" class="psvstudio-director-attachments is-empty"></div>
@@ -773,6 +818,7 @@ function ensureDirectorDialog() {
   dialog.querySelector("#psvstudio-director-max-tokens").value = String(settings.max_response_tokens);
   dialog.querySelector("#psvstudio-director-context-budget").value = String(settings.context_budget_chars);
   dialog.querySelector("#psvstudio-director-timeout").value = String(settings.request_timeout);
+  dialog.querySelector("#psvstudio-director-clear").addEventListener("click", clearDirectorSession);
   dialog.querySelector("#psvstudio-director-close").addEventListener("click", () => dialog.close());
   dialog.querySelector("#psvstudio-director-send").addEventListener("click", sendDirectorMessage);
   dialog.querySelector("#psvstudio-director-add-image").addEventListener("click", () => dialog.querySelector("#psvstudio-director-image-input").click());
@@ -796,6 +842,13 @@ function ensureDirectorDialog() {
     event.stopPropagation();
     dialog.classList.remove("is-image-dragover");
     addDirectorImages(event.dataTransfer.files);
+  });
+  dialog.addEventListener("paste", event => {
+    const files = clipboardImageFiles(event);
+    if (!files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addDirectorImages(files);
   });
   dialog.addEventListener("close", () => dialog.classList.remove("is-image-dragover"));
   dialog.querySelector("#psvstudio-director-input").addEventListener("keydown", event => {
@@ -1225,8 +1278,11 @@ function isFileDrag(event) {
 }
 
 async function uploadMediaFile(file) {
+  const subtype = String(file?.type || "").split("/")[1]?.split(/[;+]/)[0];
+  const extension = subtype === "jpeg" ? "jpg" : subtype || "bin";
+  const filename = file?.name || `pasted-media-${makeId("upload")}.${extension}`;
   const form = new FormData();
-  form.append("image", file, file.name);
+  form.append("image", file, filename);
   form.append("type", "input");
   form.append("overwrite", "false");
   const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
@@ -1387,7 +1443,7 @@ async function addMediaFiles(fileList) {
       const path = await uploadMediaFile(file);
       project.document.references ||= [];
       const reference = {
-        id: makeId("reference"), kind, path, name: file.name,
+        id: makeId("reference"), kind, path, name: file.name || path.split("/").pop(),
         roles: defaultReferenceRoles(project, kind), prompt: "", label: "",
         trim_start: 0, trim_end: null, use_embedded_audio: false,
         source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
@@ -1557,6 +1613,14 @@ function installMediaDrop(doc) {
     event.stopPropagation();
     clearMediaDrag(doc);
     addMediaFiles(event.dataTransfer.files);
+  }, true);
+  doc.addEventListener("paste", event => {
+    if (!activeHere() || targetsDirector(event)) return;
+    const files = clipboardImageFiles(event);
+    if (!files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    addMediaFiles(files);
   }, true);
 }
 
@@ -2718,7 +2782,7 @@ function renderMediaLane() {
   lane.append(el("span", "psvstudio-media-lane-label", "Media"));
   const references = project?.document?.references || [];
   if (!references.length) {
-    lane.append(el("span", "psvstudio-media-lane-empty", project ? "Drop media anywhere on this screen" : "Create a project or drop media anywhere"));
+    lane.append(el("span", "psvstudio-media-lane-empty", project ? "Drop media or paste an image anywhere on this screen" : "Create a project, drop media, or paste an image anywhere"));
     return;
   }
   references.forEach((reference, index) => {
@@ -3120,7 +3184,7 @@ function buildPanel() {
         </div>
         <section class="psvstudio-timeline-card">
           <div class="psvstudio-section-heading psvstudio-timeline-heading">
-            <div><h2>Timeline</h2><small class="psvstudio-help">Drop media anywhere · drag media to renumber references · drag shots to reorder · 24 fps snap</small></div>
+            <div><h2>Timeline</h2><small class="psvstudio-help">Drop media or paste images anywhere · drag media to renumber references · drag shots to reorder · 24 fps snap</small></div>
             <div class="psvstudio-timeline-tools">
               <label class="psvstudio-zoom-control" title="Timeline zoom"><span>−</span><input id="psvstudio-timeline-zoom" type="range" min="36" max="160" step="4" value="80" aria-label="Timeline zoom" /><span>+</span></label>
               <button id="psvstudio-fit-timeline" class="psvstudio-button" type="button">Fit</button>

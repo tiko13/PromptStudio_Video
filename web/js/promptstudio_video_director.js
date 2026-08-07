@@ -123,8 +123,11 @@ function select(options, value, onChange) {
 }
 
 async function uploadFile(file, status) {
+  const subtype = String(file?.type || "").split("/")[1]?.split(/[;+]/)[0];
+  const extension = subtype === "jpeg" ? "jpg" : subtype || "bin";
+  const filename = file?.name || `pasted-media-${identifier("upload")}.${extension}`;
   const form = new FormData();
-  form.append("image", file, file.name);
+  form.append("image", file, filename);
   form.append("type", "input");
   form.append("overwrite", "false");
   status.textContent = `Uploading ${file.name}…`;
@@ -153,6 +156,15 @@ function referenceDisplayLabel(references, reference) {
 
 function isFileDrag(event) {
   return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+function clipboardImageFiles(event) {
+  const itemFiles = Array.from(event.clipboardData?.items || [])
+    .filter(item => item.kind === "file" && item.type?.startsWith("image/"))
+    .map(item => item.getAsFile())
+    .filter(Boolean);
+  if (itemFiles.length) return itemFiles;
+  return Array.from(event.clipboardData?.files || []).filter(file => mediaKind(file) === "image");
 }
 
 function roundTime(value) {
@@ -239,7 +251,7 @@ function install(node) {
           const roles = kind === "image" && !firstFrameTaken
             ? ["first_frame"]
             : [kind === "audio" ? "audio_reference" : "subject"];
-          draft.references.push({ id: identifier("reference"), kind, path, name: file.name, roles, prompt: "", trim_start: 0, trim_end: null, use_embedded_audio: false });
+          draft.references.push({ id: identifier("reference"), kind, path, name: file.name || path.split("/").pop(), roles, prompt: "", trim_start: 0, trim_end: null, use_embedded_audio: false });
           selectedReferenceId = draft.references.at(-1).id;
           added += 1;
         } catch (error) {
@@ -291,13 +303,21 @@ function install(node) {
     };
     const mediaDragEvents = ["dragenter", "dragover", "dragleave", "drop"];
     mediaDragEvents.forEach(type => window.addEventListener(type, captureMediaDrag, true));
+    const captureMediaPaste = event => {
+      const files = clipboardImageFiles(event);
+      if (!files.length) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void addMediaFiles(files);
+    };
+    window.addEventListener("paste", captureMediaPaste, true);
 
     function renderReferences() {
       referencesPane.replaceChildren();
       const heading = el("div", "psv-row");
       heading.append(el("h3", "", "References"), button("Add media", () => fileInput.click()));
-      const dropZone = button("Drop image, video, or audio here", () => fileInput.click(), "psv-media-dropzone");
-      dropZone.title = "Choose files, or drop media anywhere on the Director Canvas";
+      const dropZone = button("Drop media or paste an image here", () => fileInput.click(), "psv-media-dropzone");
+      dropZone.title = "Choose files, drop media, or paste an image anywhere on the Director Canvas";
       const stack = el("div", "psv-stack");
       if (!draft.references.length) stack.append(el("div", "psv-empty", "No references. Auto mode resolves to T2VA."));
       draft.references.forEach(reference => {
@@ -682,6 +702,7 @@ function install(node) {
     dialog.addEventListener("close", () => {
       clearMediaDrag();
       mediaDragEvents.forEach(type => window.removeEventListener(type, captureMediaDrag, true));
+      window.removeEventListener("paste", captureMediaPaste, true);
       dialog.remove();
     }, { once: true });
     render(); dialog.showModal();

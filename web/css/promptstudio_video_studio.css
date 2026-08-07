@@ -275,7 +275,8 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-director-dialog::backdrop { background: rgba(0, 0, 0, .78); backdrop-filter: blur(3px); }
 .psvstudio-director-dialog.is-image-dragover::after { content: "Drop images for this Director turn"; position: absolute; z-index: 20; inset: 10px; display: grid; place-items: center; color: #f4f0ff; background: rgba(35, 25, 68, .94); border: 2px dashed #ad98ff; border-radius: 13px; font-size: 16px; font-weight: 750; pointer-events: none; }
 .psvstudio-director-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: rgba(22, 24, 35, .96); border-bottom: 1px solid var(--psv-border); }
-.psvstudio-director-dialog > header > div { display: grid; gap: 2px; }
+.psvstudio-director-heading { display: grid; gap: 2px; }
+.psvstudio-director-header-actions { display: flex; align-items: center; gap: 7px; }
 .psvstudio-director-dialog h2 { margin: 0; font-size: 15px; }
 .psvstudio-director-dialog header small, .psvstudio-director-composer-actions small, .psvstudio-director-settings > small { color: var(--psv-muted); font-size: 10px; }
 .psvstudio-director-history { min-height: 0; display: grid; align-content: start; gap: 10px; overflow: auto; padding: 14px; scrollbar-width: thin; }

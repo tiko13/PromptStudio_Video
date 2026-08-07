@@ -81,6 +81,26 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(normalized["task_types"], ["reference generation"])
         self.assertEqual(normalized["references"][0]["label"], "<Picture 1>")
 
+    def test_retention_relationship_spelling_variants_are_canonicalized(self):
+        normalized = normalize_document(document(retention_analysis=[{
+            "label": "<Subject 1>",
+            "where": "appears in [Shot 1]",
+            "relationship": "Fully Preserved",
+            "detail": "The referenced appearance is retained.",
+        }]))
+        self.assertEqual(normalized["retention_analysis"][0]["relationship"], "fully_preserved")
+
+    def test_invalid_retention_relationship_reports_the_value_and_allowed_enum(self):
+        with self.assertRaisesRegex(
+            PromptDocumentError,
+            "invalid relationship 'identity_preserved'.*fully_preserved",
+        ):
+            normalize_document(document(retention_analysis=[{
+                "label": "<Subject 1>",
+                "relationship": "identity preserved",
+                "detail": "The referenced appearance is retained.",
+            }]))
+
     def test_explicit_modes_enforce_required_anchors(self):
         with self.assertRaisesRegex(PromptDocumentError, "first-frame"):
             normalize_document(document(mode="i2va"))

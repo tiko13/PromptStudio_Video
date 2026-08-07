@@ -162,10 +162,14 @@ image**. Each attachment has an explicit usage:
   usages add the uploaded image to project references with that semantic role
   and expose its canonical `<Picture N>` token to the Director.
 
-Image bytes are sent only with the current user turn. Older turns retain compact
-attachment metadata and the Director's textual answer, avoiding repeated vision
-tokens. KoboldCpp requires an active vision model with MMProj and Jinja; Ollama
-must report the `vision` capability for the selected model.
+Image bytes are sent only to a short, deterministic grounding pass for the
+current turn. That pass extracts ordered pixel observations without seeing the
+requested video action; the structured Director then receives those validated
+facts as authoritative context instead of reinterpreting the image inside its
+larger schema prompt. Older turns retain compact attachment metadata and the
+Director's textual answer, avoiding repeated vision tokens. KoboldCpp requires
+an active vision model with MMProj and Jinja; Ollama must report the `vision`
+capability for the selected model.
 
 The compiler follows MiniMax's official guides:
 
