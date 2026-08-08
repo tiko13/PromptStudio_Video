@@ -30,7 +30,9 @@ class StoreTests(unittest.TestCase):
                 "created_at": 1,
                 "updated_at": 1,
             }
-            project["document"]["shots"][0]["action"] = project["brief"]
+            project["document"]["shots"][0]["steps"] = [
+                {"type": "action", "text": project["brief"]},
+            ]
             saved = update_project_store(path, {
                 "version": 1,
                 "revision": 0,
@@ -45,7 +47,10 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored_project["document"]["resolved_mode"], "t2va")
             self.assertEqual(restored_project["document"]["main_description"], project["brief"])
             self.assertEqual(restored_project["brief"], project["brief"])
-            self.assertEqual(restored_project["document"]["shots"][0]["action"], "")
+            self.assertEqual(
+                restored_project["document"]["shots"][0]["steps"][0]["text"],
+                project["brief"],
+            )
             with self.assertRaises(StoreConflictError):
                 update_project_store(path, {
                     "version": 1,

@@ -17,18 +17,22 @@ from video.director import (
     parse_director_response,
     preview_changeset,
     _validate_reference_only_preservation,
+    _validate_first_frame_proposal_lock,
     _validate_i2va_anchor_preservation,
+    _validate_protected_sequence_content,
     _validate_requested_project_result,
     _enrich_reference_definition_placeholders,
     _parse_vision_grounding,
     _preserve_reference_only_request,
     _proposal_retry_messages,
     _proposal_requested,
+    _restrict_first_frame_proposal,
+    _restrict_reference_only_proposal,
 )
 
 
 def director_document():
-    return {
+    return normalize_document({
         "version": 1,
         "mode": "auto",
         "duration_seconds": 8,
@@ -37,8 +41,8 @@ def director_document():
             {
                 "id": "shot-1",
                 "start": 0,
-                "action": "The woman unfolds a letter.",
-                "dialogue": [{
+                "steps": [{"type": "action", "text": "The woman unfolds a letter."}, {
+                    "type": "dialogue",
                     "speaker": "The woman",
                     "speaker_id": "S1",
                     "language": "English",
@@ -46,10 +50,23 @@ def director_document():
                 }],
                 "visible_text": ["Central Station"],
             },
-            {"id": "shot-2", "start": 4, "action": "She looks toward the window."},
+            {"id": "shot-2", "start": 4, "steps": [
+                {"type": "action", "text": "She looks toward the window."},
+            ]},
         ],
         "references": [],
-    }
+    })
+
+
+def action_text(shot):
+    return " ".join(
+        step["text"] for step in shot.get("steps") or []
+        if step.get("type") == "action" and step.get("text")
+    )
+
+
+def dialogue_steps(shot):
+    return [step for step in shot.get("steps") or [] if step.get("type") == "dialogue"]
 
 
 def provider_context(messages):
@@ -72,11 +89,13 @@ class DirectorTests(unittest.TestCase):
             self.assertNotIn("concrete visible identity traits observed in that image", system_message)
             self.assertNotIn("shoulder-length wavy black hair", system_message)
             self.assertNotIn("teal linen blouse", system_message)
-            self.assertIn("private_subject_bindings", system_message)
-            self.assertIn("visual_selectors", system_message)
-            self.assertIn("Never copy a visual_selector", system_message)
+            self.assertIn("subject_registry", system_message)
+            self.assertIn("explicit_subject_attributes", system_message)
+            self.assertNotIn("private_subject_bindings", system_message)
             self.assertIn("When exactly one compatible reference exists", system_message)
             self.assertIn("When multiple compatible references exist, never guess", system_message)
+            self.assertIn("steps array is its only writable performance sequence", system_message)
+            self.assertIn("Never emit the legacy action or dialogue mirror fields", system_message)
 
     def test_document_fingerprint_ignores_cached_vision_grounding(self):
         document = normalize_document({
@@ -106,6 +125,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("report only concrete facts visible in their pixels", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("do not add the user's requested action", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("Return JSON only", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("grounded_attributes", VISION_GROUNDING_SYSTEM_MESSAGE)
 
     def test_vision_grounding_parser_preserves_attachment_order(self):
         attachments = [
@@ -176,6 +196,72 @@ class DirectorTests(unittest.TestCase):
             correction,
         )
 
+    def test_mixed_steps_retry_demands_one_chronological_representation(self):
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": "She speaks, then another woman enters."}],
+            "shot",
+            proposal_error="steps cannot be combined with action or dialogue in one shot update",
+        )
+        correction = retry[-1]["content"]
+        self.assertIn("return steps only", correction)
+        self.assertIn("omit the action and dialogue fields", correction)
+
+    def test_ordered_mixed_request_demands_steps_even_after_unrelated_failure(self):
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": 'She says "Come here", then another woman enters.'}],
+            "project",
+            proposal_error="First-frame lock forbids Director changes to project style",
+        )
+        self.assertIn("return steps only", retry[-1]["content"])
+
+    def test_incomplete_shot_retry_names_the_canonical_action_step(self):
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": "Create a complete three-shot video."}],
+            "project",
+            proposal_error="The complete project proposal left required shot fields empty: shot-3 (action)",
+        )
+        correction = retry[-1]["content"]
+        self.assertIn("non-empty steps array", correction)
+        self.assertIn("Do not use the legacy action field", correction)
+
+    def test_first_frame_restriction_keeps_sequence_and_sound(self):
+        document = self.i2va_document()
+        proposal = {
+            "operations": [
+                {"op": "update_project", "fields": {
+                    "style": "Invented watercolor style",
+                    "overall_soundscape": "Soft room tone.",
+                }},
+                {"op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "composition": "Invented composition",
+                    "subjects": "Invented subject description",
+                    "environment": "Invented room",
+                    "lighting": "Invented lighting",
+                    "steps": [{"type": "action", "text": "She raises one hand."}],
+                    "sounds": ["Fabric rustles."],
+                }},
+            ],
+        }
+        restricted = _restrict_first_frame_proposal(document, proposal)
+        self.assertEqual(
+            set(restricted["operations"][0]["fields"]),
+            {"overall_soundscape"},
+        )
+        shot_fields = restricted["operations"][1]["fields"]
+        self.assertEqual(set(shot_fields), {"steps", "sounds"})
+
+    def test_provider_context_exposes_only_canonical_sequence(self):
+        document = normalize_document(director_document())
+        _document, context = compact_project_context({
+            "scope": "project",
+            "document": document,
+        })
+        shot = context["shots"][0]
+        self.assertIn("steps", shot)
+        self.assertNotIn("action", shot)
+        self.assertNotIn("dialogue", shot)
+        self.assertEqual(shot["token"], "[Shot 1]")
+
     def test_director_canonicalizes_retention_relationship_formatting(self):
         document = normalize_document(director_document())
         raw = (
@@ -198,7 +284,8 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Rewrite I2VA shot","operations":['
             '{"op":"update_project","fields":{"task_types":[],"subject_definitions":[],"retention_analysis":[]} },'
-            '{"op":"update_shot","shot_id":"shot-1","fields":{"action":"She opens a red umbrella."}}]}'
+            '{"op":"update_shot","shot_id":"shot-1","fields":{"steps":['
+            '{"type":"action","text":"She opens a red umbrella."}]}}]}'
             f"\n{CHANGESET_END}"
         )
 
@@ -207,7 +294,28 @@ class DirectorTests(unittest.TestCase):
 
         self.assertFalse(parsed["proposal_error"])
         self.assertEqual(preview["document"]["task_types"], [])
-        self.assertEqual(preview["document"]["shots"][0]["action"], "She opens a red umbrella.")
+        self.assertEqual(action_text(preview["document"]["shots"][0]), "She opens a red umbrella.")
+
+    def test_t2va_proposal_discards_invented_reference_semantics(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage the baker","operations":['
+            '{"op":"update_project","fields":{"task_types":["reference generation"],'
+            '"subject_definitions":[{"label":"Subject 1","text":"is the baker."}],'
+            '"retention_analysis":[{"label":"<Subject 1>","where":"appears in [Shot 1]",'
+            '"relationship":"fully_preserved","detail":"The baker remains consistent."}]}},'
+            '{"op":"update_shot","shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"<Subject 1> opens the shutters."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+        preview = preview_changeset(document, parsed["proposal"])
+
+        self.assertEqual(preview["document"]["subject_definitions"], [])
+        self.assertNotIn("<Subject 1>", preview["compiled_prompt"])
+        self.assertIn("The subject opens the shutters", preview["compiled_prompt"])
 
     def test_director_can_replace_ordered_steps_and_visible_text(self):
         document = normalize_document(director_document())
@@ -229,13 +337,106 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(shot["visible_text"], ["LAST TRAIN"])
         self.assertIn("(S1) sings: <d>[English] Wait for me!</d>", preview["compiled_prompt"])
 
+    def test_director_rejects_legacy_sequence_mirrors(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage dialogue before an entrance","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{'
+            '"action":"<Subject 2> enters from frame right and smiles.",'
+            '"dialogue":[{"speaker":"<Subject 1>","speaker_id":"S1","language":"English",'
+            '"text":"Come here dear"}],'
+            '"steps":[{"type":"dialogue","speaker":"<Subject 1>","speaker_id":"S1",'
+            '"language":"English","text":"Come here dear"},'
+            '{"type":"action","text":"<Subject 2> enters from frame right and smiles."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "shot")
+
+        self.assertIsNone(parsed["proposal"])
+        self.assertIn("unsupported shot field 'action'", parsed["proposal_error"])
+
+    def test_director_canonicalizes_common_step_text_aliases(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage dialogue before an entrance","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"dialogue","speaker":"<Subject 1>","speaker_id":"S1",'
+            '"language":"English","text":"","line":"Come here dear"},'
+            '{"type":"action","text":"","description":"<Subject 2> enters from frame right and smiles."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "shot")
+
+        self.assertFalse(parsed["proposal_error"])
+        steps = parsed["proposal"]["operations"][0]["fields"]["steps"]
+        self.assertEqual([step["text"] for step in steps], [
+            "Come here dear",
+            "<Subject 2> enters from frame right and smiles.",
+        ])
+
+    def test_director_canonicalizes_subject_tokens_to_minimax_speaker_ids(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage the exchange","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"dialogue","speaker":"<Subject 1>","speaker_id":"<Subject 1>",'
+            '"language":"English","text":"Hello there"},'
+            '{"type":"dialogue","speaker":"<Subject 2>","speaker_id":"Subject 2",'
+            '"language":"English","text":"General Kenobi"}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "shot")
+
+        self.assertFalse(parsed["proposal_error"])
+        steps = parsed["proposal"]["operations"][0]["fields"]["steps"]
+        self.assertEqual([step["speaker_id"] for step in steps], ["S1", "S2"])
+
+    def test_director_infers_speaker_id_from_subject_speaker_name(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add a reply","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"dialogue","speaker":"<Subject 2>","speaker_id":"character two",'
+            '"language":"English","text":"General Kenobi"}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "shot")
+
+        self.assertFalse(parsed["proposal_error"])
+        event = parsed["proposal"]["operations"][0]["fields"]["steps"][0]
+        self.assertEqual(event["speaker_id"], "S2")
+
+    def test_director_rejects_divergent_legacy_field_beside_steps(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Conflicting representations","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"action":"She exits.",'
+            '"steps":[{"type":"action","text":"She enters."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "shot-1", document_fingerprint(document), "shot")
+
+        self.assertIsNone(parsed["proposal"])
+        self.assertIn("unsupported shot field 'action'", parsed["proposal_error"])
+
     def test_parser_repairs_a_missing_operation_closing_brace(self):
         document = normalize_document(director_document())
         raw = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Repair structure","operations":['
             '{"op":"update_project","fields":{"style":"Cinematic"},'
-            '{"op":"update_shot","shot_id":"shot-2","fields":{"action":"She turns."}}]}'
+            '{"op":"update_shot","shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She turns."}]}}]}'
             f"\n{CHANGESET_END}"
         )
 
@@ -265,14 +466,17 @@ class DirectorTests(unittest.TestCase):
     def test_reference_only_requests_cannot_replace_existing_actions(self):
         original = normalize_document(director_document())
         changed = copy.deepcopy(original)
-        changed["shots"][0]["action"] = "She poses without moving."
+        changed["shots"][0]["steps"] = [{"type": "action", "text": "She poses without moving."}]
         request = {
             "attachments": [{"path": "woman.png", "usage": "subject"}],
             "messages": [{"role": "user", "content": "Make this the identity reference."}],
         }
-        with self.assertRaisesRegex(ValueError, "preserve shot-1 action verbatim"):
+        with self.assertRaisesRegex(ValueError, "preserve shot-1 action steps verbatim"):
             _validate_reference_only_preservation(original, changed, request)
-        changed["shots"][0]["action"] = original["shots"][0]["action"] + " <Subject 1> keeps the same identity."
+        changed["shots"][0]["steps"] = [{
+            "type": "action",
+            "text": action_text(original["shots"][0]) + " <Subject 1> keeps the same identity.",
+        }]
         _validate_reference_only_preservation(original, changed, request)
 
     def test_complete_reference_rewrite_is_not_misclassified_by_keep_wording(self):
@@ -299,6 +503,27 @@ class DirectorTests(unittest.TestCase):
         }
 
         self.assertFalse(_preserve_reference_only_request(request))
+
+    def test_action_reference_assignment_preserves_canonical_steps(self):
+        document = normalize_document(director_document())
+        request = {
+            "attachments": [{"path": "action.png", "usage": "action"}],
+            "messages": [{"role": "user", "content": "Use this as the action reference."}],
+        }
+        proposal = {
+            "operations": [{
+                "op": "update_shot",
+                "shot_id": "shot-1",
+                "fields": {"steps": [{"type": "action", "text": "<Subject 1> turns."}]},
+            }],
+        }
+
+        self.assertTrue(_preserve_reference_only_request(request))
+        restricted = _restrict_reference_only_proposal(document, proposal, request)
+        self.assertEqual(
+            restricted["operations"][0]["fields"],
+            proposal["operations"][0]["fields"],
+        )
 
     def test_reference_definition_with_empty_where_is_grounded_into_single_shot(self):
         value = director_document()
@@ -328,7 +553,7 @@ class DirectorTests(unittest.TestCase):
                 }},
                 {"op": "update_shot", "shot_id": "shot-1", "fields": {
                     "subjects": "The girl stands in the rain.",
-                    "action": "She spins and smiles brightly.",
+                    "steps": [{"type": "action", "text": "She spins and smiles brightly."}],
                 }},
             ],
         }
@@ -364,7 +589,7 @@ class DirectorTests(unittest.TestCase):
                 }],
             }}, {"op": "update_shot", "shot_id": "shot-1", "fields": {
                 "subjects": "<Subject 1> stands center frame.",
-                "action": "The girl from <Subject 1> dances happily in the rain. She spins and smiles brightly.",
+                "steps": [{"type": "action", "text": "The girl from <Subject 1> dances happily in the rain. She spins and smiles brightly."}],
             }}],
         }
 
@@ -373,7 +598,7 @@ class DirectorTests(unittest.TestCase):
         definition = result["document"]["subject_definitions"][0]["text"]
 
         self.assertEqual(
-            shot_value["action"],
+            action_text(shot_value),
             "<Subject 1> dances happily in the rain. She spins and smiles brightly.",
         )
         self.assertEqual(shot_value["subjects"].count("<Subject 1>"), 1)
@@ -383,6 +608,9 @@ class DirectorTests(unittest.TestCase):
     def test_director_synthesizes_grounded_reference_package_when_model_omits_it(self):
         value = director_document()
         value["shots"] = [value["shots"][0]]
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "woman.png",
             "name": "Woman", "roles": ["subject"],
@@ -396,7 +624,8 @@ class DirectorTests(unittest.TestCase):
             '{"op":"update_shot","shot_id":"shot-1","fields":{'
             '"composition":"A full-body continuous shot.","subjects":"The girl stands in rainfall.",'
             '"environment":"A rain-soaked open space.","lighting":"Soft overcast daylight.",'
-            '"action":"She spins and smiles brightly.","sounds":["Rainfall and splashing footsteps."]}}]}'
+            '"steps":[{"type":"action","text":"She spins and smiles brightly."}],'
+            '"sounds":["Rainfall and splashing footsteps."]}}]}'
             f"\n{CHANGESET_END}"
         )
         attachments = [{
@@ -435,7 +664,7 @@ class DirectorTests(unittest.TestCase):
         preview = preview_changeset(document, result["proposal"])
         self.assertEqual(preview["document"]["subject_definitions"][0]["label"], "Subject 1")
         definition = preview["document"]["subject_definitions"][0]["text"]
-        self.assertEqual(definition, "is the young woman in <Picture 1>.")
+        self.assertEqual(definition, "is only the young woman in <Picture 1>.")
         self.assertNotIn("blonde", definition)
         self.assertNotIn("raincoat", definition)
         self.assertIn("<Subject 1>", preview["document"]["shots"][0]["subjects"])
@@ -470,7 +699,8 @@ class DirectorTests(unittest.TestCase):
             "A slow push-in will make the reaction clearer.\n"
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Clarify the reaction","operations":[{"op":"update_shot",'
-            '"shot_id":"shot-2","fields":{"action":"She watches the lights pass.",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She watches the lights pass."}],'
             '"camera":{"type":"Push In","amplitude":"small","speed":"slow",'
             '"target":"her reflection"}}}]}\n'
             f"{CHANGESET_END}"
@@ -479,9 +709,9 @@ class DirectorTests(unittest.TestCase):
         self.assertFalse(parsed["proposal_error"])
         result = preview_changeset(document, parsed["proposal"])
         updated = result["document"]
-        self.assertEqual(updated["shots"][1]["action"], "She watches the lights pass.")
+        self.assertEqual(action_text(updated["shots"][1]), "She watches the lights pass.")
         self.assertEqual(updated["shots"][1]["camera"]["type"], "Push In")
-        self.assertEqual(updated["shots"][0]["dialogue"][0]["text"], "Do not rewrite this.")
+        self.assertEqual(dialogue_steps(updated["shots"][0])[0]["text"], "Do not rewrite this.")
         self.assertEqual(updated["shots"][0]["visible_text"], ["Central Station"])
 
     def test_selected_shot_accepts_minimax_display_label(self):
@@ -519,17 +749,26 @@ class DirectorTests(unittest.TestCase):
         self.assertTrue(_proposal_requested({
             "messages": [{"role": "user", "content": "Suggest a line and change the camera to a push-in."}],
         }))
+        self.assertTrue(_proposal_requested({
+            "messages": [{
+                "role": "user",
+                "content": 'The girl from Picture 1 says "Come here dear". Then another girl enters.',
+            }],
+        }))
 
-    def test_dialogue_changeset_appends_without_rewriting_existing_dialogue(self):
+    def test_dialogue_changeset_preserves_existing_sequence(self):
         document = normalize_document(director_document())
         fingerprint = document_fingerprint(document)
         raw = (
             "This line fits the farewell.\n"
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Suggest a line","operations":[{"op":"update_shot",'
-            '"shot_id":"shot-1","fields":{"dialogue":[{"speaker":"The woman",'
-            '"speaker_id":"S1","language":"English","text":"Maybe goodbye is just another window.",'
-            '"start":1.5}]}}]}\n'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"action","text":"The woman unfolds a letter."},'
+            '{"type":"dialogue","speaker":"The woman","speaker_id":"S1","language":"English",'
+            '"text":"Do not rewrite this."},'
+            '{"type":"dialogue","speaker":"The woman","speaker_id":"S1","language":"English",'
+            '"text":"Maybe goodbye is just another window."}]}}]}\n'
             f"{CHANGESET_END}"
         )
 
@@ -538,27 +777,67 @@ class DirectorTests(unittest.TestCase):
 
         self.assertFalse(parsed["proposal_error"])
         self.assertEqual(parsed["message"], "This line fits the farewell.")
-        dialogue = preview["document"]["shots"][0]["dialogue"]
+        dialogue = dialogue_steps(preview["document"]["shots"][0])
         self.assertEqual([item["text"] for item in dialogue], [
             "Do not rewrite this.",
             "Maybe goodbye is just another window.",
         ])
-        self.assertNotIn("start", dialogue[1])
         self.assertEqual(
             [step["type"] for step in preview["document"]["shots"][0]["steps"]],
             ["action", "dialogue", "dialogue"],
         )
+
+    def test_steps_cannot_silently_drop_existing_dialogue(self):
+        original = normalize_document(director_document())
+        result = copy.deepcopy(original)
+        result["shots"][0]["steps"] = [
+            step for step in result["shots"][0]["steps"]
+            if step["type"] != "dialogue"
+        ]
+        result = normalize_document(result)
+
+        with self.assertRaisesRegex(ValueError, "protected dialogue"):
+            _validate_protected_sequence_content(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": "Add another action after she speaks."}]},
+            )
+
+    def test_explicit_dialogue_rewrite_can_replace_existing_step_text(self):
+        original = normalize_document(director_document())
+        result = copy.deepcopy(original)
+        dialogue = next(step for step in result["shots"][0]["steps"] if step["type"] == "dialogue")
+        dialogue["text"] = "A deliberately revised line."
+        result = normalize_document(result)
+
+        _validate_protected_sequence_content(
+            original,
+            result,
+            {"messages": [{"role": "user", "content": "Rewrite the dialogue line in Shot 1."}]},
+        )
+
+    def test_steps_cannot_silently_drop_existing_visible_text(self):
+        original = normalize_document(director_document())
+        result = copy.deepcopy(original)
+        result["shots"][0]["visible_text"] = []
+
+        with self.assertRaisesRegex(ValueError, "protected visible text"):
+            _validate_protected_sequence_content(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": "Reorder the action steps."}]},
+            )
 
     def test_project_proposal_accepts_new_shot_dialogue_and_empty_protected_echoes(self):
         document = normalize_document(director_document())
         raw = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Add the invitation","operations":['
-            '{"op":"update_shot","shot_id":"shot-2","fields":{"action":"She powers on the computer.",'
-            '"dialogue":[],"visible_text":[]}},'
+            '{"op":"update_shot","shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She powers on the computer."}],"visible_text":[]}},'
             '{"op":"add_shot","shot":{"id":"invitation-shot","start":6.0,'
-            '"action":"She turns toward the lens.","dialogue":[{"speaker":"",'
-            '"text":"wanna play?","start":6.5}],"visible_text":[]}}]}\n'
+            '"steps":[{"type":"action","text":"She turns toward the lens."},'
+            '{"type":"dialogue","speaker":"","text":"wanna play?"}],"visible_text":[]}}]}\n'
             f"{CHANGESET_END}"
         )
 
@@ -567,12 +846,38 @@ class DirectorTests(unittest.TestCase):
 
         self.assertFalse(parsed["proposal_error"])
         self.assertEqual(len(preview["document"]["shots"]), 3)
-        dialogue = preview["document"]["shots"][2]["dialogue"][0]
+        dialogue = dialogue_steps(preview["document"]["shots"][2])[0]
         self.assertEqual(dialogue["speaker"], "The speaker")
         self.assertEqual(dialogue["speaker_id"], "S1")
         self.assertEqual(dialogue["language"], "English")
         self.assertEqual(dialogue["text"], "wanna play?")
         self.assertIn("<d>[English] wanna play?</d>", preview["compiled_prompt"])
+
+    def test_add_shot_keeps_canonical_steps_without_legacy_mirrors(self):
+        document = normalize_document(director_document())
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Add the final reaction",
+            "operations": [{"op": "add_shot", "shot": {
+                "id": "shot-3",
+                "start": 6.0,
+                "steps": [
+                    {"type": "action", "text": "She unfolds the note."},
+                    {"type": "dialogue", "speaker": "The baker", "speaker_id": "S1", "text": "Thank you."},
+                ],
+            }}],
+        }
+
+        result = preview_changeset(document, proposal)
+        shot = result["document"]["shots"][-1]
+
+        self.assertEqual([step["type"] for step in shot["steps"]], ["action", "dialogue"])
+        self.assertEqual(action_text(shot), "She unfolds the note.")
+        self.assertEqual(dialogue_steps(shot)[0]["text"], "Thank you.")
+        replay = preview_changeset(document, result["proposal"])
+        replay_shot = replay["document"]["shots"][-1]
+        self.assertEqual([step["type"] for step in replay_shot["steps"]], ["action", "dialogue"])
 
     def test_camera_phrases_are_normalized_to_document_enums(self):
         document = normalize_document(director_document())
@@ -625,7 +930,8 @@ class DirectorTests(unittest.TestCase):
             '"fields":{"non_diegetic_music":"none","overall_soundscape":"Wheel hum. No non-diegetic music."}},'
             '{"op":"update_shot","shot_id":"<Shot1>",'
             '"fields":{"subjects":"<Subject1> holding <Picture1> (red mug)",'
-            '"environment":"<Environment1> kitchen","action":"<Picture1> stays upright",'
+            '"environment":"<Environment1> kitchen","steps":['
+            '{"type":"action","text":"<Picture1> stays upright"}],'
             '"camera":{"type":"Pull Back",'
             '"amplitude":"restrained","speed":"smooth","target":"towards <Object1> (red mug)"}},'
             '"sounds":["<Audio1> (wheel hum)","Paper remains still"]}}]}'
@@ -642,9 +948,23 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(camera["target"], "red mug")
         self.assertEqual(result["document"]["shots"][0]["subjects"], "the subject holding red mug")
         self.assertEqual(result["document"]["shots"][0]["environment"], "the environment kitchen")
-        self.assertEqual(result["document"]["shots"][0]["action"], "red mug stays upright")
+        self.assertEqual(action_text(result["document"]["shots"][0]), "red mug stays upright")
         self.assertEqual(result["document"]["non_diegetic_music"], "N/A")
         self.assertEqual(result["document"]["overall_soundscape"], "Wheel hum.")
+
+    def test_sound_filter_keeps_audible_event_after_visual_stillness(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add the knock","operations":[{"op":"update_shot","shot_id":"shot-1",'
+            '"fields":{"sounds":["The woman remains still as three knocks strike the door."]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+        self.assertEqual(
+            parsed["proposal"]["operations"][0]["fields"]["sounds"],
+            ["The woman remains still as three knocks strike the door."],
+        )
 
     def test_project_proposal_can_update_planning_synopsis_without_compiling_it(self):
         document = normalize_document(director_document())
@@ -670,14 +990,14 @@ class DirectorTests(unittest.TestCase):
         raw = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Refine reveal","operations":[{"op":"update_shot","shot_id":"shot-2",'
-            '"fields":{"action":"She opens the letter. The camera slowly pushes in toward the text. The slow push-in emphasizes the writing.",'
+            '"fields":{"steps":[{"type":"action","text":"She opens the letter. The camera slowly pushes in toward the text. The slow push-in emphasizes the writing."}],'
             '"camera":{"type":"Push In","amplitude":"small","speed":"slow",'
             '"target":"her movement towards the text"}}}]} '
             f"\n{CHANGESET_END}"
         )
         parsed = parse_director_response(raw, "", fingerprint, "project")
         result = preview_changeset(document, parsed["proposal"])
-        self.assertEqual(result["document"]["shots"][1]["action"], "She opens the letter.")
+        self.assertEqual(action_text(result["document"]["shots"][1]), "She opens the letter.")
         self.assertEqual(result["document"]["shots"][1]["camera"]["target"], "the text")
         self.assertEqual(result["compiled_prompt"].count("camera pushes in"), 1)
 
@@ -687,8 +1007,8 @@ class DirectorTests(unittest.TestCase):
         raw = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Populate both shots","operations":['
-            '{"op":"add_shot","shot":{"id":"Shot1","start":0,"action":"Opening action."}},'
-            '{"op":"add_shot","shot":{"id":"Shot2","start":4.5,"action":"Reveal action."}}]}'
+            '{"op":"add_shot","shot":{"id":"Shot1","start":0,"steps":[{"type":"action","text":"Opening action."}]}},'
+            '{"op":"add_shot","shot":{"id":"Shot2","start":4.5,"steps":[{"type":"action","text":"Reveal action."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         parsed = parse_director_response(raw, "", fingerprint, "project")
@@ -722,7 +1042,9 @@ class DirectorTests(unittest.TestCase):
             "base_document_hash": document_fingerprint(document),
             "scope": {"type": "shot", "shot_id": "shot-2"},
             "summary": "Update action",
-            "operations": [{"op": "update_shot", "shot_id": "shot-2", "fields": {"action": "New action"}}],
+            "operations": [{"op": "update_shot", "shot_id": "shot-2", "fields": {
+                "steps": [{"type": "action", "text": "New action"}],
+            }}],
         }
         document["shots"][1]["steps"][0]["text"] = "A manual edit happened."
         with self.assertRaisesRegex(ValueError, "changed after this proposal"):
@@ -733,7 +1055,8 @@ class DirectorTests(unittest.TestCase):
             "This keeps the action feasible.\n"
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Refine action","operations":[{"op":"update_shot",'
-            '"shot_id":"shot-2","fields":{"action":"She turns toward the passing lights."}}]}\n'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She turns toward the passing lights."}]}}]}\n'
             f"{CHANGESET_END}"
         )
         with patch("video.director.generate_chat", return_value=response) as generate:
@@ -779,7 +1102,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(context["attached_images"][1]["source_name"], "Subject")
         self.assertEqual(context["attached_images"][1]["reference_token"], "<Picture 1>")
 
-    def test_grounded_visual_facts_are_authoritative_director_context(self):
+    def test_subject_grounding_is_reduced_to_a_token_registry_for_the_director(self):
         document = director_document()
         document["references"] = [{
             "id": "reference-1", "kind": "image", "path": "subject.webp",
@@ -798,13 +1121,28 @@ class DirectorTests(unittest.TestCase):
                     "A full-body portrait of a platinum-blonde woman wearing a pink crop top and pink bottoms, "
                     "with black boots, against a plain light wall."
                 ),
+                "subject_candidates": [{
+                    "name": "young woman", "location": "",
+                    "visual_selectors": ["platinum-blonde woman", "pink crop top"],
+                    "grounded_attributes": {
+                        "hair": "straight platinum-blonde hair",
+                        "clothing": "pink crop top and pink bottoms",
+                        "footwear": "black boots",
+                    },
+                }],
             }],
         })
         context = provider_context(messages)
         attached = context["attached_images"][0]
-        self.assertIn("platinum-blonde", attached["observed_visual_facts"])
-        self.assertIn("pink crop top", attached["observed_visual_facts"])
-        self.assertIn("do not copy them into prompt prose", attached["observation_policy"])
+        self.assertNotIn("observed_visual_facts", attached)
+        self.assertNotIn("subject_candidates", context["references"][0])
+        self.assertEqual(context["subject_registry"], [{
+            "token": "<Subject 1>",
+            "source_token": "<Picture 1>",
+            "name": "young woman",
+            "location": "",
+        }])
+        self.assertEqual(context["explicit_subject_attributes"], [])
 
     def test_director_grounds_images_before_structured_request(self):
         document = director_document()
@@ -823,7 +1161,10 @@ class DirectorTests(unittest.TestCase):
         }]
         grounding = (
             '{"images":[{"index":1,"observations":"Platinum-blonde straight hair, pink crop top and '
-            'pink bottoms, black boots, full-body pose against a plain light wall."}]}'
+            'pink bottoms, black boots, full-body pose against a plain light wall.","subjects":[{'
+            '"name":"young woman","visual_selectors":["platinum-blonde woman","pink crop top"],'
+            '"grounded_attributes":{"hair":"platinum-blonde straight hair",'
+            '"clothing":"pink crop top and pink bottoms","footwear":"black boots"}}]}]}'
         )
         progress = []
         with patch("video.director.load_vision_images", return_value=(attachments, images)), patch(
@@ -844,14 +1185,70 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_args_list[1].args[0]["thinking_mode"], "High")
         self.assertGreaterEqual(generate.call_args_list[0].args[0]["max_response_tokens"], 4_000)
         context = provider_context(generate.call_args_list[1].args[1])
-        self.assertIn("Platinum-blonde", context["attached_images"][0]["observed_visual_facts"])
-        self.assertIn("pink crop top", context["attached_images"][0]["observed_visual_facts"])
+        self.assertNotIn("observed_visual_facts", context["attached_images"][0])
+        self.assertEqual(context["subject_registry"][0]["token"], "<Subject 1>")
+        self.assertNotIn("visual_selectors", context["subject_registry"][0])
         self.assertEqual(result["vision_observations"][0]["usage"], "subject")
-        self.assertEqual(progress, [{
-            "phase": "vision_grounding",
-            "attempt": 1,
-            "maximum_attempts": 2,
-        }])
+        self.assertEqual(progress, [
+            {
+                "phase": "vision_grounding",
+                "attempt": 1,
+                "maximum_attempts": 2,
+            },
+            {
+                "phase": "director_generation",
+                "grounded_images": 1,
+            },
+        ])
+
+    def test_director_grounds_each_image_in_an_isolated_call(self):
+        document = director_document()
+        document["references"] = [
+            {"id": "reference-1", "kind": "image", "path": "one.png", "roles": ["subject"]},
+            {"id": "reference-2", "kind": "image", "path": "two.png", "roles": ["subject"]},
+        ]
+        attachments = [
+            {"id": "a1", "path": "one.png", "name": "One", "usage": "subject", "reference_id": "reference-1"},
+            {"id": "a2", "path": "two.png", "name": "Two", "usage": "subject", "reference_id": "reference-2"},
+        ]
+        images = [
+            {"data_uri": "data:image/png;base64,ONE", "base64": "ONE"},
+            {"data_uri": "data:image/png;base64,TWO", "base64": "TWO"},
+        ]
+        grounded_one = (
+            '{"images":[{"index":1,"observations":"A woman in a red coat.","subjects":['
+            '{"name":"woman","visual_selectors":["red coat"],'
+            '"grounded_attributes":{"clothing":"red coat"}}]}]}'
+        )
+        grounded_two = (
+            '{"images":[{"index":1,"observations":"A man in a blue shirt.","subjects":['
+            '{"name":"man","visual_selectors":["blue shirt"],'
+            '"grounded_attributes":{"clothing":"blue shirt"}}]}]}'
+        )
+        progress = []
+        with patch("video.director.load_vision_images", return_value=(attachments, images)), patch(
+            "video.director.generate_chat",
+            side_effect=[grounded_one, grounded_two, "The requested action is feasible."],
+        ) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "messages": [{"role": "user", "content": "Review the interaction."}],
+                "attachments": attachments,
+            }, progress.append)
+
+        self.assertEqual(generate.call_count, 3)
+        self.assertEqual(generate.call_args_list[0].args[2], [images[0]])
+        self.assertEqual(generate.call_args_list[1].args[2], [images[1]])
+        self.assertEqual([item["index"] for item in result["vision_observations"]], [1, 2])
+        grounding_progress = [
+            item for item in progress if item["phase"] == "vision_grounding"
+        ]
+        self.assertEqual([item["image_index"] for item in grounding_progress], [1, 2])
+        self.assertEqual(progress[-1], {
+            "phase": "director_generation",
+            "grounded_images": 2,
+        })
 
     def test_selected_shot_proposal_can_complete_reference_semantics(self):
         value = director_document()
@@ -871,7 +1268,7 @@ class DirectorTests(unittest.TestCase):
             '"relationship":"fully_preserved","detail":"Her identity, hair, and white dress are retained."}]}},'
             '{"op":"update_shot","shot_id":"shot-2","fields":{'
             '"subjects":"<Subject 1>, the blonde woman from <Picture 1>, stands beside the window.",'
-            '"action":"<Subject 1> looks toward the window while holding the letter."}}]}'
+            '"steps":[{"type":"action","text":"<Subject 1> looks toward the window while holding the letter."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         parsed = parse_director_response(raw, "shot-2", fingerprint)
@@ -936,12 +1333,16 @@ class DirectorTests(unittest.TestCase):
             }],
         }
         for shot_id in ("shot-1", "shot-2"):
+            steps = [{"type": "action", "text": long_action}]
+            if shot_id == "shot-1":
+                steps.extend(copy.deepcopy(dialogue_steps(document["shots"][0])))
             proposal["operations"].append({
                 "op": "update_shot", "shot_id": shot_id,
                 "fields": {
                     "composition": long_composition, "subjects": long_subjects,
                     "environment": long_environment, "lighting": long_lighting,
-                    "action": long_action, "sounds": ["Fabric shifts softly and the paper opens with a crisp rustle."],
+                    "steps": steps,
+                    "sounds": ["Fabric shifts softly and the paper opens with a crisp rustle."],
                 },
             })
         response = (
@@ -1135,9 +1536,11 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Compose a three-shot farewell","operations":['
             '{"op":"update_project","fields":{"overall_soundscape":"Train wheels, rain, and paper rustle."}},'
-            '{"op":"update_shot","shot_id":"shot-2","fields":{"start":3.0,"action":"She studies her reflection."}},'
+            '{"op":"update_shot","shot_id":"shot-2","fields":{"start":3.0,"steps":['
+            '{"type":"action","text":"She studies her reflection."}]}},'
             '{"op":"add_shot","shot":{"id":"shot-farewell","start":6.0,"transition":"the camera cuts to",'
-            '"composition":"Close-up of the folded letter.","action":"Her hand leaves the letter on the seat.",'
+            '"composition":"Close-up of the folded letter.","steps":['
+            '{"type":"action","text":"Her hand leaves the letter on the seat."}],'
             '"camera":{"type":"Push In","amplitude":"small","speed":"slow","target":"the letter"}}}]}'
             f"\n{CHANGESET_END}"
         )
@@ -1149,7 +1552,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(result["document"]["shots"][1]["start"], 3.0)
         self.assertIn("Train wheels", result["document"]["overall_soundscape"])
         self.assertIn("[Shot 3] At 00:06.000", result["compiled_prompt"])
-        self.assertEqual(result["document"]["shots"][0]["dialogue"][0]["text"], "Do not rewrite this.")
+        self.assertEqual(dialogue_steps(result["document"]["shots"][0])[0]["text"], "Do not rewrite this.")
 
     def test_project_proposal_cannot_remove_protected_dialogue(self):
         document = normalize_document(director_document())
@@ -1162,10 +1565,54 @@ class DirectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "protected dialogue"):
             preview_changeset(document, proposal)
 
+    def test_project_proposal_drops_a_placeholder_remove_operation(self):
+        document = normalize_document(director_document())
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Update the second shot",
+            "operations": [
+                {
+                    "op": "update_shot",
+                    "shot_id": "shot-2",
+                    "fields": {"steps": [{"type": "action", "text": "She turns toward the doorway."}]},
+                },
+                {"op": "remove_shot", "shot_id": "unneeded shot id"},
+            ],
+        }
+
+        result = preview_changeset(document, proposal)
+
+        self.assertEqual(action_text(result["document"]["shots"][1]), "She turns toward the doorway.")
+        self.assertEqual([item["op"] for item in result["proposal"]["operations"]], ["update_shot"])
+
+    def test_conflicting_remove_and_update_keeps_the_content_update(self):
+        document = normalize_document(director_document())
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Keep and update Shot 1",
+            "operations": [
+                {"op": "remove_shot", "shot_id": "shot-1"},
+                {"op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "steps": [{"type": "action", "text": "She opens the door."}],
+                }},
+            ],
+        }
+
+        result = preview_changeset(document, proposal)
+
+        shot = next(item for item in result["document"]["shots"] if item["id"] == "shot-1")
+        self.assertEqual(action_text(shot), "She opens the door.")
+        self.assertFalse(any(
+            operation["op"] == "remove_shot" and operation.get("shot_id") == "shot-1"
+            for operation in result["proposal"]["operations"]
+        ))
+
     def test_complete_rewrite_can_replace_every_unprotected_shot(self):
         value = director_document()
         for item in value["shots"]:
-            item["dialogue"] = []
+            item["steps"] = [step for step in item["steps"] if step["type"] == "action"]
             item["visible_text"] = []
         document = normalize_document(value)
         replacement = {
@@ -1174,7 +1621,7 @@ class DirectorTests(unittest.TestCase):
             "subjects": "A baker stands behind the counter.",
             "environment": "A small bakery before sunrise.",
             "lighting": "Warm practical light meets cool window light.",
-            "action": "The baker opens the shutters.",
+            "steps": [{"type": "action", "text": "The baker opens the shutters."}],
             "sounds": ["Wooden shutters scrape open."],
         }
         proposal = {
@@ -1195,7 +1642,7 @@ class DirectorTests(unittest.TestCase):
     def test_project_proposal_rejects_an_empty_resulting_timeline(self):
         value = director_document()
         for item in value["shots"]:
-            item["dialogue"] = []
+            item["steps"] = [step for step in item["steps"] if step["type"] == "action"]
             item["visible_text"] = []
         document = normalize_document(value)
         proposal = {
@@ -1240,8 +1687,26 @@ class DirectorTests(unittest.TestCase):
             "messages": [{"role": "user", "content": "Create the full prompt."}],
         })
 
-        self.assertIn("I2VA FIRST-FRAME LOCK", messages[0]["content"])
+        self.assertIn("FIRST-FRAME LOCK", messages[0]["content"])
         self.assertIn("A request for a complete/full prompt does not authorize", messages[0]["content"])
+
+    def test_mixed_reference_mode_rejects_first_shot_background_rewrite(self):
+        value = self.i2va_document()
+        value["references"].append({
+            "id": "reference-2", "kind": "image", "path": "subject.png",
+            "roles": ["subject"],
+        })
+        document = normalize_document(value)
+        self.assertEqual(document["resolved_mode"], "ref2va")
+
+        with self.assertRaisesRegex(ValueError, "First-frame lock.*environment"):
+            _validate_first_frame_proposal_lock(document, {
+                "operations": [{
+                    "op": "update_shot",
+                    "shot_id": document["shots"][0]["id"],
+                    "fields": {"environment": "The background from Picture 2."},
+                }],
+            })
 
     def test_i2va_rejects_fabricated_anchor_and_inherited_scene_fields(self):
         original = self.i2va_document()
@@ -1301,6 +1766,26 @@ class DirectorTests(unittest.TestCase):
             "messages": [{"role": "user", "content": "Create the complete video prompt."}],
         })
 
+    def test_complete_mixed_reference_keeps_first_frame_visual_fields_pixel_owned(self):
+        document = self.i2va_document()
+        document["references"].append({
+            "id": "reference-subject",
+            "kind": "image",
+            "path": "subject.png",
+            "roles": ["subject"],
+        })
+        document = normalize_document(document)
+        self.assertEqual(document["resolved_mode"], "ref2va")
+        for shot in document["shots"]:
+            shot["composition"] = ""
+            shot["subjects"] = ""
+            shot["environment"] = ""
+            shot["lighting"] = ""
+
+        _validate_requested_project_result(document, {
+            "messages": [{"role": "user", "content": "Create the complete video prompt."}],
+        })
+
     def test_explicit_full_prompt_request_retries_missing_proposal_once(self):
         proposal_response = (
             "I have prepared the complete structured production.\n"
@@ -1311,7 +1796,7 @@ class DirectorTests(unittest.TestCase):
             '"subjects":"A woman and a letter","environment":"Train carriage","lighting":"Cool window light"}},'
             '{"op":"update_shot","shot_id":"shot-2","fields":{"composition":"Close-up",'
             '"subjects":"The woman","environment":"Train carriage","lighting":"Cool window light",'
-            '"action":"She watches the city lights recede."}}]}'
+            '"steps":[{"type":"action","text":"She watches the city lights recede."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         with patch(
@@ -1338,21 +1823,30 @@ class DirectorTests(unittest.TestCase):
         retry_messages = generate.call_args.args[1]
         self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
         self.assertIn(CHANGESET_BEGIN, retry_messages[-1]["content"])
-        self.assertEqual(progress, [{
-            "phase": "proposal_correction",
-            "attempt": 1,
-            "maximum_attempts": 3,
-        }])
+        self.assertEqual(progress, [
+            {
+                "phase": "director_generation",
+                "grounded_images": 0,
+            },
+            {
+                "phase": "proposal_correction",
+                "attempt": 1,
+                "maximum_attempts": 3,
+            },
+        ])
 
     def test_explicit_shot_count_retries_structurally_incomplete_proposal(self):
         document = normalize_document(director_document())
         document["shots"] = document["shots"][:1]
+        document["shots"][0]["steps"] = [
+            step for step in document["shots"][0]["steps"] if step["type"] == "action"
+        ]
         first_response = (
             "I composed the requested progression.\n"
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Compose the progression","operations":['
             '{"op":"update_shot","shot_id":"shot-1","fields":'
-            '{"action":"The woman stands and reveals the note."}}]}'
+            '{"steps":[{"type":"action","text":"The woman stands and reveals the note."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         corrected_response = (
@@ -1360,13 +1854,13 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Compose two distinct shots","operations":['
             '{"op":"update_shot","shot_id":"shot-1","fields":'
-            '{"action":"The woman rises from the red armchair."}},'
+            '{"steps":[{"type":"action","text":"The woman rises from the red armchair."}]}},'
             '{"op":"add_shot","shot":{"id":"shot-note-reveal","start":4.0,'
             '"transition":"the camera cuts to","composition":"A close-up frames the note.",'
             '"subjects":"The woman holds the unfolded note toward the camera.",'
             '"environment":"The same room remains softly visible behind her.",'
             '"lighting":"Soft window light keeps the handwriting legible.",'
-            '"action":"She reveals the handwritten message.",'
+            '"steps":[{"type":"action","text":"She reveals the handwritten message."}],'
             '"camera":{"type":"Push In","amplitude":"small","speed":"slow","target":"the note"},'
             '"sounds":["Paper opens with a crisp rustle."]}}]}'
             f"\n{CHANGESET_END}"
@@ -1378,6 +1872,7 @@ class DirectorTests(unittest.TestCase):
             result = director_chat({
                 "scope": "project",
                 "document": document,
+                "require_proposal": True,
                 "messages": [{
                     "role": "user",
                     "content": "Split the action and note reveal into two distinct shots.",
@@ -1400,13 +1895,60 @@ class DirectorTests(unittest.TestCase):
             })
         self.assertEqual(generate.call_count, 4)
         self.assertIsNone(result["proposal"])
-        self.assertEqual(result["status"], "needs_clarification")
+        self.assertEqual(result["status"], "ready")
+        self.assertIn("required structured proposal", result["proposal_error"])
+        self.assertIn("Nothing was changed", result["message"])
+        self.assertIsNone(result["pending_plan"])
+
+    def test_failed_proposal_keeps_validation_error_without_requesting_clarification(self):
+        invalid = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage a greeting","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":["She says hello."]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        with patch("video.director.generate_chat", side_effect=[invalid, "Only prose.", "Still prose.", "No JSON."]):
+            result = director_chat({
+                "scope": "shot",
+                "document": director_document(),
+                "selected_shot_id": "shot-1",
+                "messages": [{"role": "user", "content": "Make her say hello, then wave."}],
+            })
+
+        self.assertIsNone(result["proposal"])
+        self.assertEqual(result["status"], "ready")
+        self.assertIn("step 1 must be an object", result["proposal_error"])
+        self.assertIsNone(result["clarification"])
+        self.assertIsNone(result["pending_plan"])
+
+    def test_legacy_validation_pending_plan_does_not_force_proposal_mode(self):
+        with patch("video.director.generate_chat", return_value="The prior proposal had invalid step structure.") as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": director_document(),
+                "pending_plan": {
+                    "clarification_id": "proposal-validation",
+                    "original_request": "Make her say hello, then wave.",
+                    "validation_issue": "step 1 must be an object",
+                },
+                "messages": [
+                    {"role": "user", "content": "Make her say hello, then wave."},
+                    {"role": "assistant", "content": "Please clarify what should be changed."},
+                    {"role": "user", "content": "What specifically needs clarification?"},
+                ],
+            })
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(result["message"], "The prior proposal had invalid step structure.")
+        self.assertIsNone(result["proposal"])
         self.assertFalse(result["proposal_error"])
-        self.assertIn("kept the draft", result["message"])
-        self.assertIn("required structured proposal", result["pending_plan"]["validation_issue"])
+        self.assertIsNone(result["pending_plan"])
 
     def test_ambiguous_subject_binding_asks_then_continues_pending_plan(self):
         value = director_document()
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "women.png",
             "name": "Women", "roles": ["subject"],
@@ -1436,7 +1978,7 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Seat the selected subject","operations":['
             '{"op":"update_shot","shot_id":"shot-1","fields":'
-            '{"action":"<Subject 1> sits down on a chair."}}]}'
+            '{"steps":[{"type":"action","text":"<Subject 1> sits down on a chair."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         continued_request = {
@@ -1457,12 +1999,15 @@ class DirectorTests(unittest.TestCase):
         preview = preview_changeset(document, result["proposal"])
         self.assertEqual(
             preview["document"]["subject_definitions"][0]["text"],
-            "is the young woman on the left in <Picture 1>.",
+            "is only the young woman on the left in <Picture 1>.",
         )
         self.assertIn("<Subject 1> sits down on a chair", preview["compiled_prompt"])
 
     def test_visual_identifiers_resolve_two_private_subjects_without_prompt_leakage(self):
         value = director_document()
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "people.png",
             "name": "People", "roles": ["subject"],
@@ -1484,7 +2029,7 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Stage both subjects","operations":['
             '{"op":"update_shot","shot_id":"shot-1","fields":'
-            '{"action":"<Subject 1> sits down while <Subject 2> opens the door."}}]}'
+            '{"steps":[{"type":"action","text":"<Subject 1> sits down while <Subject 2> opens the door."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         request = {
@@ -1502,16 +2047,21 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         context = provider_context(generate.call_args.args[1])
         self.assertEqual(
-            [item["token"] for item in context["private_subject_bindings"]],
+            [item["token"] for item in context["subject_registry"]],
             ["<Subject 1>", "<Subject 2>"],
         )
+        self.assertEqual(
+            generate.call_args.args[1][-1]["content"],
+            "<Subject 1> sits down; <Subject 2> opens the door.",
+        )
+        self.assertNotIn("visual_selectors", json.dumps(context))
         preview = preview_changeset(document, result["proposal"])
         definitions = preview["document"]["subject_definitions"]
         self.assertEqual(
             [item["text"] for item in definitions],
             [
-                "is the person on the left in <Picture 1>.",
-                "is the person on the right in <Picture 1>.",
+                "is only the person on the left in <Picture 1>.",
+                "is only the person on the right in <Picture 1>.",
             ],
         )
         prompt = preview["compiled_prompt"].casefold()
@@ -1522,8 +2072,110 @@ class DirectorTests(unittest.TestCase):
         self.assertNotIn("black outfit", prompt)
         self.assertNotIn("white outfit", prompt)
 
-    def test_private_visual_identifier_leak_is_corrected_to_subject_token(self):
+    def test_first_frame_and_subject_reference_keep_roles_isolated(self):
         value = director_document()
+        value["shots"] = [value["shots"][0]]
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
+        value["references"] = [
+            {
+                "id": "reference-1", "kind": "image", "path": "first.png",
+                "name": "First frame", "roles": ["first_frame"],
+                "observed_visual_facts": "A blonde woman in a grey top and white skirt stands outdoors.",
+                "subject_candidates": [{
+                    "name": "young woman", "location": "center",
+                    "visual_selectors": ["blonde hair", "grey top"],
+                    "grounded_attributes": {
+                        "hair": "long blonde hair",
+                        "clothing": "grey patterned top and white skirt",
+                    },
+                }],
+            },
+            {
+                "id": "reference-2", "kind": "image", "path": "second.png",
+                "name": "Second woman", "roles": ["subject"],
+                "observed_visual_facts": "A brunette woman wears a red dress.",
+                "subject_candidates": [{
+                    "name": "young woman", "location": "center",
+                    "visual_selectors": ["brunette woman", "red dress"],
+                    "grounded_attributes": {
+                        "hair": "long brown hair",
+                        "clothing": "red dress",
+                    },
+                }],
+            },
+        ]
+        document = normalize_document(value)
+        response = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Stage the greeting and entrance","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"dialogue","speaker":"<Subject 1>","speaker_id":"S1",'
+            '"language":"English","text":"Hello there"},'
+            '{"type":"action","text":"<Subject 2> walks into the frame from the left and smiles."},'
+            '{"type":"dialogue","speaker":"<Subject 1>","speaker_id":"S1",'
+            '"language":"English","text":"General kenobi"}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "require_proposal": True,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        'The girl in Picture 1 will say "Hello there", then the girl from Picture 2 '
+                        'will walk into the frame from the left, smile and say "General kenobi".'
+                    ),
+                }],
+            })
+
+        self.assertEqual(result["status"], "ready", result)
+        self.assertIsNotNone(result["proposal"], result)
+        self.assertEqual(
+            result["proposal"]["base_document_hash"],
+            document_fingerprint(document),
+            result["proposal"],
+        )
+        resolved_instruction = generate.call_args.args[1][-1]["content"]
+        self.assertIn('<Subject 1> will say "Hello there"', resolved_instruction)
+        self.assertIn("<Subject 2> will walk", resolved_instruction)
+        self.assertIn("FIRST-FRAME LOCK", generate.call_args.args[1][0]["content"])
+        context = provider_context(generate.call_args.args[1])
+        self.assertEqual(
+            [item["token"] for item in context["subject_registry"]],
+            ["<Subject 1>", "<Subject 2>"],
+        )
+        preview = preview_changeset(document, result["proposal"])
+        definitions = {
+            f"<{item['label']}>" if not item["label"].startswith("<") else item["label"]: item["text"]
+            for item in preview["document"]["subject_definitions"]
+        }
+        self.assertIn("supplied first frame of [Shot 1]", definitions["<Picture 1>"])
+        self.assertIn("only the young woman at center in <Picture 1>", definitions["<Subject 1>"])
+        self.assertIn("only the young woman at center in <Picture 2>", definitions["<Subject 2>"])
+        subject_2_retention = next(
+            item for item in preview["document"]["retention_analysis"]
+            if item["label"] == "<Subject 2>"
+        )
+        self.assertIn("background, environment, lighting, composition", subject_2_retention["detail"])
+        compiled = preview["compiled_prompt"]
+        detailed = compiled.split("detailed_description:\n", 1)[1].split("\n\noverall_soundscape:", 1)[0]
+        self.assertIn("<Subject 1> (S1) says", compiled)
+        self.assertIn("<Subject 2> walks into the frame from the left", compiled)
+        self.assertIn("<Subject 2> (S2) says: <d>[English] General kenobi</d>", compiled)
+        self.assertNotIn("Grounded reference appearance", compiled)
+        self.assertNotIn("red dress", detailed)
+        self.assertNotIn("long brown hair", detailed)
+        self.assertNotIn("grey patterned top", detailed)
+
+    def test_private_visual_identifier_leak_is_repaired_without_retry(self):
+        value = director_document()
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "people.png",
             "name": "People", "roles": ["subject"],
@@ -1542,46 +2194,82 @@ class DirectorTests(unittest.TestCase):
         leaked = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Seat the subject","operations":[{"op":"update_shot","shot_id":"shot-1",'
-            '"fields":{"action":"The person in black sits down."}}]}'
+            '"fields":{"steps":[{"type":"action","text":"The person in black sits down."}]}}]}'
             f"\n{CHANGESET_END}"
         )
-        corrected = (
-            f"{CHANGESET_BEGIN}\n"
-            '{"summary":"Seat the subject","operations":[{"op":"update_shot","shot_id":"shot-1",'
-            '"fields":{"action":"<Subject 1> sits down."}}]}'
-            f"\n{CHANGESET_END}"
-        )
-        with patch("video.director.generate_chat", side_effect=[leaked, corrected]) as generate:
+        with patch("video.director.generate_chat", return_value=leaked) as generate:
             result = director_chat({
                 "scope": "project",
                 "document": document,
                 "messages": [{"role": "user", "content": "Person in black sits down."}],
             })
 
-        self.assertEqual(generate.call_count, 2)
-        retry = generate.call_args_list[1].args[1][-1]["content"]
-        self.assertIn("only a private identifier", retry)
+        self.assertEqual(generate.call_count, 1)
         preview = preview_changeset(document, result["proposal"])
         self.assertIn("<Subject 1> sits down", preview["compiled_prompt"])
         self.assertNotIn("person in black", preview["compiled_prompt"].casefold())
 
+    def test_explicit_subject_attribute_request_preserves_attribute_prose(self):
+        value = director_document()
+        value["shots"][0]["steps"] = [
+            step for step in value["shots"][0]["steps"] if step["type"] == "action"
+        ]
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "person.png",
+            "name": "Person", "roles": ["subject"],
+            "subject_candidates": [{
+                "name": "person", "location": "",
+                "visual_selectors": ["blonde hair"],
+                "grounded_attributes": {
+                    "hair": "long blonde hair",
+                    "clothing": "red jacket",
+                },
+            }],
+        }]
+        document = normalize_document(value)
+        response = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Preserve the requested hair","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"action","text":"<Subject 1> keeps her blonde hair as she sits."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "messages": [{"role": "user", "content": "Keep her blonde hair as she sits."}],
+            })
+
+        context = provider_context(generate.call_args.args[1])
+        self.assertEqual(context["explicit_subject_attributes"], [{
+            "token": "<Subject 1>",
+            "attributes": {"hair": "long blonde hair"},
+        }])
+        preview = preview_changeset(document, result["proposal"])
+        self.assertIn("<Subject 1> keeps her blonde hair", preview["compiled_prompt"])
+
     def test_complete_project_gets_second_correction_for_an_incomplete_first_correction(self):
         document = normalize_document(director_document())
-        document["shots"][1]["action"] = ""
+        document["shots"][0]["steps"] = [
+            step for step in document["shots"][0]["steps"] if step["type"] == "action"
+        ]
+        document["shots"][1]["steps"] = []
         incomplete = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Only the opening","operations":[{"op":"update_shot","shot_id":"shot-1",'
-            '"fields":{"action":"She unfolds the letter."}}]}'
+            '"fields":{"steps":[{"type":"action","text":"She unfolds the letter."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         complete = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Complete both shots","operations":[{"op":"update_shot","shot_id":"shot-1",'
             '"fields":{"composition":"Medium shot","subjects":"A woman","environment":"Train carriage",'
-            '"lighting":"Cool window light","action":"She unfolds the letter."}},'
+            '"lighting":"Cool window light","steps":['
+            '{"type":"action","text":"She unfolds the letter."}]}},'
             '{"op":"update_shot","shot_id":"shot-2","fields":{"start":4.5,"composition":"Close-up",'
             '"subjects":"The letter","environment":"Train carriage","lighting":"Cool window light",'
-            '"action":"The letter text fills the frame."}}]}'
+            '"steps":[{"type":"action","text":"The letter text fills the frame."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         with patch(
@@ -1602,7 +2290,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(result["proposal"]["base_document_hash"], document_fingerprint(document))
         preview = preview_changeset(document, result["proposal"])["document"]
         self.assertEqual(preview["shots"][1]["start"], 4.5)
-        self.assertTrue(preview["shots"][1]["action"])
+        self.assertTrue(action_text(preview["shots"][1]))
 
     def test_complete_project_rejects_explicit_continuity_breaks(self):
         document = normalize_document({
@@ -1639,7 +2327,7 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Add the closing shot","operations":['
             '{"op":"add_shot","shot":{"id":"shot-closing","start":4.0,'
-            '"action":"The letter rests on the empty seat."}}]}'
+            '"steps":[{"type":"action","text":"The letter rests on the empty seat."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         corrected_response = (
@@ -1647,7 +2335,7 @@ class DirectorTests(unittest.TestCase):
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Add the closing shot","operations":['
             '{"op":"add_shot","shot":{"id":"shot-closing","start":6.0,'
-            '"action":"The letter rests on the empty seat."}}]}'
+            '"steps":[{"type":"action","text":"The letter rests on the empty seat."}]}}]}'
             f"\n{CHANGESET_END}"
         )
         with patch(

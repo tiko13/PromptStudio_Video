@@ -39,6 +39,7 @@ only receive capability detection, settings, and navigation integration.
 - Tests:
   `C:\EasyDiffusion\ComfyUI\venv\Scripts\python.exe -m unittest discover -s tests -v`
 - Frontend syntax:
-  `node --check web/js/promptstudio_video_director.js`
+  `node --check web/js/promptstudio_video_standalone.js`
+  `node --check web/js/promptstudio_video_studio.js`
 - Patch validation:
   `git diff --check`

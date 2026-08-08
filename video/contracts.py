@@ -248,6 +248,12 @@ def _normalize_reference(reference, index):
                     for selector in (item.get("visual_selectors") or [])
                     if _text(selector)
                 ][:16],
+                "grounded_attributes": {
+                    str(key): _text(value)
+                    for key, value in (item.get("grounded_attributes") or {}).items()
+                    if str(key) in {"hair", "face", "clothing", "footwear", "accessories", "body", "other"}
+                    and _text(value)
+                } if isinstance(item.get("grounded_attributes"), dict) else {},
             }
             for item in (reference.get("subject_candidates") or [])
             if isinstance(item, dict) and _text(item.get("name"))
@@ -268,7 +274,7 @@ def _normalize_dialogue(event, index):
         raise PromptDocumentError("Singing must use offscreen rather than voiceover")
     text = str(event.get("text") or "").strip()
     return {
-        "id": _identifier(event.get("id"), "dialogue"),
+        "id": _identifier(event.get("id") or f"dialogue-{index + 1}", "dialogue"),
         "speaker": _text(event.get("speaker"), "The speaker"),
         "speaker_id": speaker_id,
         "language": _text(event.get("language"), "English"),
@@ -288,7 +294,7 @@ def _normalize_step(step, index):
     step_type = _text(step.get("type")).lower()
     if step_type == "action":
         return {
-            "id": _identifier(step.get("id"), "step"),
+            "id": _identifier(step.get("id") or f"step-{index + 1}", "step"),
             "type": "action",
             "text": _text(step.get("text")),
         }
@@ -311,30 +317,36 @@ def _normalize_shot(shot, index):
         raise PromptDocumentError(f"Shot {index + 1} has invalid camera amplitude")
     if speed not in {"slow", "default", "fast"}:
         raise PromptDocumentError(f"Shot {index + 1} has invalid camera speed")
-    legacy_dialogue = [
-        _normalize_dialogue(event, event_index)
-        for event_index, event in enumerate(shot.get("dialogue") or [])
-    ]
     if "steps" in shot:
         raw_steps = shot.get("steps")
         if not isinstance(raw_steps, list):
             raise PromptDocumentError(f"Shot {index + 1} steps must be a list")
         steps = [_normalize_step(step, step_index) for step_index, step in enumerate(raw_steps)]
     else:
+        # One-way import for documents saved before ordered shot steps became
+        # canonical. Legacy fields are deliberately not retained in the
+        # normalized document.
         steps = []
         legacy_action = _text(shot.get("action"))
         if legacy_action:
-            steps.append({"id": _identifier(None, "step"), "type": "action", "text": legacy_action})
+            steps.append({"id": "step-1", "type": "action", "text": legacy_action})
+        legacy_dialogue = [
+            _normalize_dialogue(event, event_index)
+            for event_index, event in enumerate(shot.get("dialogue") or [])
+        ]
         steps.extend({**event, "type": "dialogue"} for event in legacy_dialogue)
-    action = " ".join(
-        step["text"] for step in steps
-        if step["type"] == "action" and step.get("text")
-    )
-    dialogue = [
-        {name: value for name, value in step.items() if name != "type"}
-        for step in steps
-        if step["type"] == "dialogue"
-    ]
+    used_step_ids = set()
+    for step_index, step in enumerate(steps):
+        candidate = step["id"]
+        if candidate in used_step_ids:
+            prefix = "dialogue" if step["type"] == "dialogue" else "step"
+            suffix = step_index + 1
+            candidate = f"{prefix}-{suffix}"
+            while candidate in used_step_ids:
+                suffix += 1
+                candidate = f"{prefix}-{suffix}"
+            step["id"] = candidate
+        used_step_ids.add(candidate)
     return {
         "id": _identifier(shot.get("id"), "shot"),
         "start": max(0.0, _number(shot.get("start"), 0.0 if index == 0 else index * 2.0)),
@@ -343,9 +355,6 @@ def _normalize_shot(shot, index):
         "subjects": _text(shot.get("subjects")),
         "environment": _text(shot.get("environment")),
         "lighting": _text(shot.get("lighting")),
-        # These two mirrors keep old workflows and Director change sets compatible.
-        # The ordered steps are authoritative for compilation and manual editing.
-        "action": action,
         "camera": {
             "type": camera_type,
             "amplitude": amplitude,
@@ -353,7 +362,6 @@ def _normalize_shot(shot, index):
             "target": _text(camera.get("target")),
         },
         "steps": steps,
-        "dialogue": dialogue,
         "visible_text": [str(value).strip() for value in (shot.get("visible_text") or []) if str(value).strip()],
         "sounds": [str(value).strip() for value in (shot.get("sounds") or []) if str(value).strip()],
         "notes": _text(shot.get("notes")),

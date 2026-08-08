@@ -75,10 +75,17 @@ MiniMax H3's required multiple of 32.
 
 Each shot owns an authoritative chronological `steps` list. Action and dialogue
 steps can be interleaved and are compiled in their exact top-to-bottom order;
-dialogue text remains verbatim inside MiniMax `<d>` tags. Legacy `action` and
-`dialogue` fields are retained as deterministic compatibility mirrors. Camera
-movement is stored as motion type, amplitude, speed, and target, then compiled
-into natural English.
+dialogue text remains verbatim inside MiniMax `<d>` tags. Normalized documents
+contain no parallel action or dialogue mirrors. Older saved documents receive
+a one-way conversion to `steps` when loaded. Camera movement is stored as
+motion type, amplitude, speed, and target, then compiled into natural English.
+
+Director proposals write performance changes only through `steps`; legacy shot
+sequence fields are rejected. Synchronized shot sounds remain separate
+from the chronological performance sequence, while the overall soundscape and
+non-diegetic music keep their guide-defined roles. **Complete silence**
+suppresses dialogue, shot sounds, ambience, and music in the compiled prompt
+without deleting the editable document content.
 
 The editable **Production brief** is a planning synopsis for the user and Grand
 Director. It is not compiled into the MiniMax prompt. The Grand Director uses it
@@ -170,14 +177,21 @@ image**. Each attachment has an explicit usage:
   usages add the uploaded image to project references with that semantic role
   and expose its canonical `<Picture N>` token to the Director.
 
-Image bytes are sent only to a short, deterministic grounding pass for the
-current turn. That pass extracts ordered pixel observations without seeing the
-requested video action; the structured Director then receives those validated
-facts as authoritative context instead of reinterpreting the image inside its
-larger schema prompt. Older turns retain compact attachment metadata and the
-Director's textual answer, avoiding repeated vision tokens. KoboldCpp requires
-an active vision model with MMProj and Jinja; Ollama must report the `vision`
-capability for the selected model.
+Each image is sent to its own short, deterministic grounding pass for the
+current turn, without the requested action or the other images. The pass
+extracts subject candidates, private matching aliases, and structured grounded
+appearance attributes, which are cached on the project reference. Subjects in
+first/last-frame anchors receive stable `<Subject N>` tokens too. Before the
+larger Director call, natural identifiers are resolved to those tokens and the
+private aliases and raw subject observations are removed from its context.
+Subject definitions keep a concise source binding and explicitly exclude the
+source picture's background, scene, lighting, composition, and camera framing.
+Grounded attributes remain private unless the user explicitly requests an
+appearance detail or change; they are never pasted automatically into the
+compiled prompt. Older turns retain compact metadata and the Director's
+textual answer, avoiding repeated vision tokens. KoboldCpp requires an active
+vision model with MMProj and Jinja; Ollama must report the `vision` capability
+for the selected model.
 
 The compiler follows MiniMax's official guides:
 
@@ -230,7 +244,6 @@ complete executable workflow snapshot for exact replay.
 
 ```powershell
 C:\EasyDiffusion\ComfyUI\venv\Scripts\python.exe -m unittest discover -s tests -v
-node --check web\js\promptstudio_video_director.js
 node --check web\js\promptstudio_video_standalone.js
 node --check web\js\promptstudio_video_studio.js
 git diff --check

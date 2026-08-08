@@ -107,7 +107,7 @@ def _step_text(step):
     return ""
 
 
-def _shot_text(shot, index, *, include_style="", first_frame_lock=False):
+def _shot_text(shot, index, *, include_style="", first_frame_lock=False, suppress_audio=False):
     if index == 0:
         prefix = "[Shot 1]"
     else:
@@ -132,11 +132,15 @@ def _shot_text(shot, index, *, include_style="", first_frame_lock=False):
     camera = _camera_sentence(shot.get("camera") or {})
     if camera:
         parts.append(camera)
-    parts.extend(_step_text(step) for step in shot.get("steps") or [])
+    parts.extend(
+        _step_text(step) for step in shot.get("steps") or []
+        if not suppress_audio or step.get("type") != "dialogue"
+    )
     for visible in shot.get("visible_text") or []:
         escaped = visible.replace('"', '\\"')
         parts.append(_sentence(f'A visible text element reads "{escaped}"'))
-    parts.extend(_sentence(_canonical_tokens(sound)) for sound in shot.get("sounds") or [])
+    if not suppress_audio:
+        parts.extend(_sentence(_canonical_tokens(sound)) for sound in shot.get("sounds") or [])
     body = " ".join(part for part in parts if part)
     return f"{prefix} {body}".strip()
 
@@ -148,9 +152,9 @@ def _base_alignment(mode, final_shot, duration):
         return "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
     if mode == "fl2va":
         return (
-            "How the reference pictures align with the target video — Picture 1 (from Shot 1) "
-            "aligns with the 0.00-second mark of the target video; Picture 2 "
-            f"(from Shot {final_shot}) aligns with the {duration:.2f}-second mark of the target video."
+            "How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) "
+            "aligns with the 0.00-second mark of the target video; <Picture 2> "
+            f"(from [Shot {final_shot}]) aligns with the {duration:.2f}-second mark of the target video."
         )
     return (
         "How the reference pictures align with the target video — <Picture 1> "
@@ -165,15 +169,16 @@ def _compile_base(document):
         _shot_text(
             shot,
             index,
-            include_style=document["style"] if index == 0 and mode != "i2va" else "",
-            first_frame_lock=mode == "i2va",
+            include_style=document["style"] if index == 0 and mode not in {"i2va", "fl2va"} else "",
+            first_frame_lock=mode in {"i2va", "fl2va"},
+            suppress_audio=document["complete_silence"],
         )
         for index, shot in enumerate(document["shots"])
     )
     fields = [
         f"integrated_multimodal_description: {shots}",
         f"overall_soundscape: {_canonical_tokens('N/A' if document['complete_silence'] else document['overall_soundscape'])}",
-        f"non_diegetic_music: {_canonical_tokens(document['non_diegetic_music'] or 'N/A')}",
+        f"non_diegetic_music: {_canonical_tokens('N/A' if document['complete_silence'] else (document['non_diegetic_music'] or 'N/A'))}",
     ]
     alignment = _base_alignment(mode, len(document["shots"]), duration)
     return f"{alignment}\n\n" + "\n\n".join(fields) if alignment else "\n\n".join(fields)
@@ -202,11 +207,23 @@ def _compile_reference(document):
     summary = _canonical_tokens(f"[{' + '.join(task_types)}] {document['summary']}".rstrip())
     retention = "\n".join(_retention_lines(document))
     shots = " ".join(
-        _shot_text(shot, index)
+        _shot_text(
+            shot,
+            index,
+            first_frame_lock=bool(index == 0 and any(
+                "first_frame" in reference.get("roles", [])
+                for reference in document.get("references") or []
+            )),
+            suppress_audio=document["complete_silence"],
+        )
         for index, shot in enumerate(document["shots"])
     )
+    has_first_frame = any(
+        "first_frame" in reference.get("roles", [])
+        for reference in document.get("references") or []
+    )
     detailed = " ".join(part for part in (
-        _sentence(_canonical_tokens(document["style"])),
+        "" if has_first_frame else _sentence(_canonical_tokens(document["style"])),
         shots,
     ) if part)
     return "\n\n".join([
@@ -215,7 +232,7 @@ def _compile_reference(document):
         f"retention_analysis:\n{retention}".rstrip(),
         f"detailed_description:\n{detailed}".rstrip(),
         f"overall_soundscape:\n{_canonical_tokens('N/A' if document['complete_silence'] else document['overall_soundscape'])}".rstrip(),
-        f"non_diegetic_music:\n{_canonical_tokens(document['non_diegetic_music'] or 'N/A')}",
+        f"non_diegetic_music:\n{_canonical_tokens('N/A' if document['complete_silence'] else (document['non_diegetic_music'] or 'N/A'))}",
     ])
 
 
@@ -324,16 +341,54 @@ def _reference_semantic_issues(document):
     # main_description is a planning synopsis for the user and Grand Director,
     # not part of the generated prompt. Reference tokens must be grounded in a
     # compiled shot or audio field to count as active.
-    detailed_parts = [document["style"]]
+    has_first_frame = any(
+        "first_frame" in reference.get("roles", [])
+        for reference in document.get("references") or []
+    )
+    detailed_parts = [] if has_first_frame else [document["style"]]
+    detailed_parts.extend(
+        reference.get("label", "")
+        for reference in document.get("references") or []
+        if "first_frame" in reference.get("roles", [])
+    )
     for shot in document["shots"]:
         detailed_parts.extend(
             shot.get(name, "")
-            for name in ("composition", "subjects", "environment", "lighting", "action", "notes")
+            for name in ("composition", "subjects", "environment", "lighting", "notes")
         )
-        detailed_parts.extend(shot.get("sounds") or [])
+        if not document["complete_silence"]:
+            detailed_parts.extend(shot.get("sounds") or [])
         detailed_parts.append((shot.get("camera") or {}).get("target", ""))
-    detailed_parts.extend((document["overall_soundscape"], document["non_diegetic_music"]))
+        for step in shot.get("steps") or []:
+            if step.get("type") != "dialogue" or not document["complete_silence"]:
+                detailed_parts.append(step.get("text", ""))
+            if step.get("type") == "dialogue" and not document["complete_silence"]:
+                detailed_parts.append(step.get("speaker", ""))
+    if not document["complete_silence"]:
+        detailed_parts.extend((document["overall_soundscape"], document["non_diegetic_music"]))
     detailed = _canonical_tokens(" ".join(str(value or "") for value in detailed_parts)).casefold()
+    allowed_tokens = {
+        _canonical_tokens(reference.get("label", "")).casefold()
+        for reference in document.get("references") or []
+    } | {token.casefold() for token in definition_tokens}
+    all_prompt_content = _canonical_tokens(" ".join((
+        document.get("summary", ""),
+        *definition_blob_parts,
+        *(item.get("where", "") for item in retention),
+        *(item.get("detail", "") for item in retention),
+        *detailed_parts,
+    )))
+    used_tokens = {
+        f"<{kind.title()} {number}>".casefold()
+        for kind, number in re.findall(
+            r"<\s*(Picture|Video|Audio|Subject)\s+(\d+)\s*>",
+            all_prompt_content,
+            re.IGNORECASE,
+        )
+    }
+    unknown_tokens = sorted(used_tokens - allowed_tokens)
+    if unknown_tokens:
+        issues.append("undefined reference labels in prompt content: " + ", ".join(unknown_tokens))
     for token in definition_tokens:
         if token.casefold() not in summary:
             issues.append(f"summary does not use {token}")
@@ -359,4 +414,22 @@ def compile_prompt(value, *, use_override=True):
     if document["resolved_mode"] == "ref2va":
         validate_reference_semantics(document)
         return _compile_reference(document)
-    return _compile_base(document)
+    compiled = _compile_base(document)
+    allowed = {
+        _canonical_tokens(reference.get("label", "")).casefold()
+        for reference in document.get("references") or []
+    }
+    used = {
+        _canonical_tokens(token)
+        for token in re.findall(
+            r"<\s*(?:Picture|Video|Audio|Subject)\s+\d+\s*>",
+            compiled,
+            re.IGNORECASE,
+        )
+    }
+    invented = sorted(token for token in used if token.casefold() not in allowed)
+    if invented:
+        raise PromptDocumentError(
+            "Reference labels require REF2VA source definitions: " + ", ".join(invented)
+        )
+    return compiled

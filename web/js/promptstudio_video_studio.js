@@ -361,6 +361,9 @@ function directorSession(projectId = state.activeProjectId, scope = state.direct
   }
   sessions[id].scope = normalizedScope;
   if (!Array.isArray(sessions[id].draft_attachments)) sessions[id].draft_attachments = [];
+  if (sessions[id].pending_plan?.clarification_id === "proposal-validation") {
+    sessions[id].pending_plan = null;
+  }
   return sessions[id];
 }
 
@@ -425,8 +428,9 @@ function directorProposalFields(proposal) {
   for (const operation of proposal?.operations || []) {
     if (operation.op === "add_shot") {
       const shot = operation.shot || {};
-      rows.push({ name: `Add shot at ${Number(shot.start || 0).toFixed(3)}s`, value: shot.action || JSON.stringify(shot) });
-      for (const event of shot.dialogue || []) {
+      const steps = Array.isArray(shot.steps) ? shot.steps : [];
+      rows.push({ name: `Add shot at ${Number(shot.start || 0).toFixed(3)}s`, value: steps[0]?.text || JSON.stringify(shot) });
+      for (const event of steps.filter(step => step?.type === "dialogue")) {
         const speaker = [event.speaker, event.speaker_id ? `(${event.speaker_id})` : ""].filter(Boolean).join(" ");
         rows.push({ name: `New dialogue${speaker ? ` · ${speaker}` : ""}`, value: event.text || "" });
       }
@@ -523,8 +527,12 @@ function directorRequestAttachments(project, draftAttachments) {
     if (result.length >= DIRECTOR_MAX_IMAGES) break;
     if (reference.kind !== "image" || !reference.path || paths.has(reference.path)) continue;
     const usage = (reference.roles || [])[0] || "describe";
-    const needsSubjectCandidates = usage === "subject" && !reference.subject_candidates?.length;
-    if (reference.observed_visual_facts && !needsSubjectCandidates) continue;
+    const needsSubjectProfile = ["subject", "first_frame", "last_frame"].includes(usage)
+      && (!reference.subject_candidates?.length
+        || reference.subject_candidates.some(candidate =>
+          !candidate?.grounded_attributes
+          || !Object.keys(candidate.grounded_attributes).length));
+    if (reference.observed_visual_facts && !needsSubjectProfile) continue;
     result.push({
       id: `project-grounding-${reference.id}`,
       path: reference.path,
@@ -556,6 +564,11 @@ function cacheDirectorVisionObservations(project, attachments, observations) {
           visual_selectors: Array.isArray(item?.visual_selectors)
             ? item.visual_selectors.map(value => String(value || "").trim()).filter(Boolean).slice(0, 16)
             : [],
+          grounded_attributes: item?.grounded_attributes && typeof item.grounded_attributes === "object"
+            ? Object.fromEntries(Object.entries(item.grounded_attributes)
+                .map(([key, value]) => [String(key), String(value || "").trim()])
+                .filter(([, value]) => value))
+            : {},
         })).filter(item => item.name)
       : [];
     if (facts && reference.observed_visual_facts !== facts) {
@@ -866,6 +879,8 @@ function renderDirectorDialog() {
     if (message.clarification) {
       const clarification = el("section", "psvstudio-director-clarification");
       clarification.append(el("strong", "", "Clarification needed"));
+      const reason = String(message.clarification.reason || "").trim();
+      if (reason) clarification.append(el("div", "psvstudio-help", reason));
       const choices = el("div", "psvstudio-inline");
       for (const choice of message.clarification.choices || []) {
         const choose = button(choice, () => {
@@ -879,7 +894,7 @@ function renderDirectorDialog() {
       clarification.append(el("small", "psvstudio-help", "Your answer continues the existing request; no proposal has been discarded or applied."));
       card.append(clarification);
     } else if (message.proposal_error) {
-      card.append(el("small", "psvstudio-director-error", `Proposal omitted: ${message.proposal_error}`));
+      card.append(el("small", "psvstudio-director-error", `Proposal not applied: ${message.proposal_error}`));
     }
     const canNavigateResponses = message.role === "assistant"
       && messageIndex === session.messages.length - 1
@@ -1109,7 +1124,26 @@ function directorJobStatusText(job) {
     const activity = job.provider_status?.busy ? "generating" : "queued";
     return `Proposal omitted or invalid · automatic correction ${attempt} of ${maximum} is ${activity}…`;
   }
+  if (progress.phase === "vision_grounding") {
+    const imageIndex = Math.max(1, Number(progress.image_index) || 1);
+    const totalImages = Math.max(imageIndex, Number(progress.total_images) || imageIndex);
+    const attempt = Math.max(1, Number(progress.attempt) || 1);
+    const maximum = Math.max(attempt, Number(progress.maximum_attempts) || attempt);
+    const imageLabel = totalImages > 1 ? `image ${imageIndex} of ${totalImages}` : "the reference image";
+    return `Grounding ${imageLabel} independently · attempt ${attempt} of ${maximum}…`;
+  }
   const provider = job.provider_status || {};
+  if (progress.phase === "director_generation") {
+    const groundedImages = Math.max(0, Number(progress.grounded_images) || 0);
+    const prefix = groundedImages
+      ? `Grounding complete for ${groundedImages} image${groundedImages === 1 ? "" : "s"} · `
+      : "";
+    const characters = Number(provider.generated_characters);
+    if (provider.busy && Number.isFinite(characters) && characters > 0) {
+      return `${prefix}Director is generating · ${characters.toLocaleString()} characters received…`;
+    }
+    return `${prefix}Director is generating the response…`;
+  }
   if (provider.provider !== "koboldcpp") return "The local Director is still working…";
   if (provider.reachable === false) return "Director is running; KoboldCpp status is temporarily unavailable…";
   if (provider.busy) {
@@ -1865,38 +1899,25 @@ function newActionStep(text = "") {
 
 function newDialogueStep(shot = null) {
   const existing = ensureShotSteps(shot).filter(step => step.type === "dialogue");
+  const previous = existing.at(-1);
   return {
-    id: makeId("dialogue"), type: "dialogue", speaker: "The speaker",
-    speaker_id: `S${existing.length + 1}`, language: "English", performance: "speech", text: "", delivery: "",
+    id: makeId("dialogue"), type: "dialogue", speaker: previous?.speaker || "The speaker",
+    speaker_id: previous?.speaker_id || "S1", language: previous?.language || "English",
+    performance: previous?.performance || "speech", text: "", delivery: "",
     voiceover: false, offscreen: false, crosses_cut: false, cutoff: false,
   };
-}
-
-function syncShotLegacyFields(shot) {
-  if (!shot) return shot;
-  shot.steps = Array.isArray(shot.steps) ? shot.steps : [];
-  shot.action = shot.steps
-    .filter(step => step?.type === "action" && String(step.text || "").trim())
-    .map(step => String(step.text).trim())
-    .join(" ");
-  shot.dialogue = shot.steps
-    .filter(step => step?.type === "dialogue")
-    .map(step => {
-      const event = clone(step);
-      delete event.type;
-      return event;
-    });
-  return shot;
 }
 
 function ensureShotSteps(shot) {
   if (!shot) return [];
   if (!Array.isArray(shot.steps)) {
+    // One-way browser migration for projects cached before ordered steps.
     shot.steps = [];
     if (String(shot.action || "").trim()) shot.steps.push(newActionStep(String(shot.action).trim()));
     for (const event of shot.dialogue || []) shot.steps.push({ ...clone(event), id: event.id || makeId("dialogue"), type: "dialogue" });
   }
-  syncShotLegacyFields(shot);
+  delete shot.action;
+  delete shot.dialogue;
   return shot.steps;
 }
 
@@ -2077,6 +2098,70 @@ function duplicateProject() {
   markProjectChanged({ render: true });
 }
 
+function resetProjectReference(project, reference) {
+  return {
+    id: reference.id,
+    kind: reference.kind,
+    path: reference.path,
+    name: reference.name,
+    roles: defaultReferenceRoles(project, reference.kind),
+    prompt: "",
+    label: "",
+    trim_start: 0,
+    trim_end: null,
+    use_embedded_audio: false,
+    source_width: Number(reference.source_width) || 0,
+    source_height: Number(reference.source_height) || 0,
+    observed_visual_facts: "",
+    subject_candidates: [],
+  };
+}
+
+function resetProject() {
+  const project = activeProject();
+  if (!project || projectPendingGenerationCount(project) || state.directorBusy) return;
+  const view = state.panel?.ownerDocument.defaultView;
+  const referenceCount = project.document?.references?.length || 0;
+  const mediaSummary = referenceCount
+    ? `${referenceCount} reference media item${referenceCount === 1 ? "" : "s"} will remain, with fresh default roles.`
+    : "The project has no reference media to retain.";
+  if (!view?.confirm(
+    `Reset "${project.name || "Untitled video"}"?\n\nThis clears its brief, shots, generation settings, render history, and Director conversations. ${mediaSummary}`,
+  )) return;
+
+  closeShotEditor({ force: true });
+  if (state.directorDialog?.open) state.directorDialog.close();
+
+  const references = clone(project.document?.references || []);
+  for (const reference of references) state.mediaDimensionLoads.delete(reference.id);
+  for (const generation of project.generations || []) {
+    stopGenerationPolling(generation.prompt_id);
+    state.generationFailures.delete(String(generation.prompt_id || ""));
+  }
+  for (const key of state.loopingGenerations) {
+    if (key.startsWith(`${project.id}:`)) state.loopingGenerations.delete(key);
+  }
+
+  const document = clone(state.config.default_document);
+  document.shots[0].id = makeId("shot");
+  document.references = [];
+  project.document = document;
+  for (const reference of references) {
+    project.document.references.push(resetProjectReference(project, reference));
+  }
+  synchronizeGeometryCanvas(project);
+  project.brief = "";
+  project.workflow_id = state.workflows[0]?.id || "";
+  project.generations = [];
+  state.selectedShotId = document.shots[0].id;
+
+  delete directorSessions()[project.id];
+  delete directorSessions()[`${project.id}:project`];
+  persistDirectorSessions();
+  markProjectChanged({ render: true });
+  setStatus(`Project reset. Kept ${referenceCount} reference media item${referenceCount === 1 ? "" : "s"}.`, "ready");
+}
+
 function addShot() {
   const project = activeProject();
   if (!project) return;
@@ -2090,8 +2175,8 @@ function addShot() {
   }
   const shot = {
     id: makeId("shot"), start, transition: "the camera cuts to", composition: "", subjects: "",
-    environment: "", lighting: "", action: "", camera: { type: "Static Shot", amplitude: "default", speed: "default", target: "" },
-    steps: [], dialogue: [], visible_text: [], sounds: [], notes: "",
+    environment: "", lighting: "", camera: { type: "Static Shot", amplitude: "default", speed: "default", target: "" },
+    steps: [], visible_text: [], sounds: [], notes: "",
   };
   shots.push(shot);
   state.selectedShotId = shot.id;
@@ -3584,7 +3669,6 @@ function moveShotStep(shot, stepId, destination) {
   const [step] = steps.splice(source, 1);
   const adjusted = source < destination ? destination - 1 : destination;
   steps.splice(Math.max(0, Math.min(steps.length, adjusted)), 0, step);
-  syncShotLegacyFields(shot);
   renderShotEditorDialog();
 }
 
@@ -3677,13 +3761,11 @@ function renderShotSteps(container, shot) {
       steps.splice(index + 1, 0, copy);
       state.shotEditorExpandedStepIds.add(copy.id);
       state.shotEditorRevealStepId = copy.id;
-      syncShotLegacyFields(shot);
       renderShotEditorDialog();
     });
     const remove = button("Remove", () => {
       steps.splice(index, 1);
       state.shotEditorExpandedStepIds.delete(step.id);
-      syncShotLegacyFields(shot);
       renderShotEditorDialog();
     }, "psvstudio-button psvstudio-button-danger");
     controls.append(up, down, duplicate, remove);
@@ -3750,7 +3832,6 @@ function saveShotEditor({ askDirector = false } = {}) {
     state.panel.ownerDocument.defaultView?.alert("Speaker IDs must use S1, S2, or a compound ID such as S1,S2.");
     return;
   }
-  syncShotLegacyFields(draft);
   project.document.shots[index] = clone(draft);
   state.selectedShotId = draft.id;
   closeShotEditor({ force: true });
@@ -3805,10 +3886,28 @@ function renderShotEditorDialog() {
     start.step = String(1 / 24);
     essentials.body.append(field("Cut time", start));
   }
-  appendDraftShotTextField(essentials.body, "Subjects and positions", draft, "subjects");
-  appendDraftShotTextField(essentials.body, "Environment", draft, "environment");
-  appendDraftShotTextField(essentials.body, "Composition and framing", draft, "composition");
-  appendDraftShotTextField(essentials.body, "Lighting", draft, "lighting");
+  const firstFrameLocked = index === 0 && (project.document.references || []).some(reference =>
+    (reference.roles || []).includes("first_frame"));
+  const setupFields = [
+    ["Subjects and positions", "subjects"],
+    ["Environment", "environment"],
+    ["Composition and framing", "composition"],
+    ["Lighting", "lighting"],
+  ];
+  if (firstFrameLocked) {
+    essentials.body.append(el(
+      "div",
+      "psvstudio-help",
+      "Picture 1 owns the opening subjects, environment, composition, lighting, and style. These fields are shown for compatibility but are not compiled.",
+    ));
+    for (const [label, name] of setupFields) {
+      const input = textArea(draft[name] || "", () => {}, 3, PLACEHOLDERS[name] || "");
+      input.disabled = true;
+      essentials.body.append(field(label, input));
+    }
+  } else {
+    for (const [label, name] of setupFields) appendDraftShotTextField(essentials.body, label, draft, name);
+  }
   if (index > 0) essentials.body.append(field("Transition", textInput(draft.transition, value => { draft.transition = value; }, "text", PLACEHOLDERS.transition)));
   setup.append(essentials.details);
 
@@ -4183,6 +4282,7 @@ function renderHeader() {
   const title = state.panel?.querySelector("#psvstudio-project-title");
   const generate = state.panel?.querySelector("#psvstudio-generate");
   const duplicate = state.panel?.querySelector("#psvstudio-duplicate");
+  const reset = state.panel?.querySelector("#psvstudio-reset");
   const preview = state.panel?.querySelector("#psvstudio-compile-preview");
   if (title) {
     title.disabled = !project;
@@ -4190,6 +4290,7 @@ function renderHeader() {
   }
   if (generate) generate.disabled = !project || !state.workflows.length;
   if (duplicate) duplicate.disabled = !project;
+  if (reset) reset.disabled = !project || Boolean(projectPendingGenerationCount(project)) || state.directorBusy;
   if (preview) preview.disabled = !project;
   if (preview) {
     const overridden = Boolean(project?.document?.prompt_override);
@@ -4250,6 +4351,7 @@ function buildPanel() {
         <label class="psvstudio-inline psvstudio-help"><input id="psvstudio-new-seed" type="checkbox" checked /> New seed</label>
         <button id="psvstudio-compile-preview" class="psvstudio-button" type="button">Prompt</button>
         <button id="psvstudio-duplicate" class="psvstudio-button" type="button">Duplicate</button>
+        <button id="psvstudio-reset" class="psvstudio-button psvstudio-button-danger" type="button" title="Reset this project while retaining its reference media">Reset</button>
         <button id="psvstudio-mobile-inspector" class="psvstudio-button psvstudio-icon-button" type="button" title="Shots" aria-label="Shots">☷</button>
       </header>
       <div class="psvstudio-workspace">
@@ -4314,6 +4416,7 @@ function buildPanel() {
   });
   panel.querySelector("#psvstudio-generate").addEventListener("click", generateProject);
   panel.querySelector("#psvstudio-duplicate").addEventListener("click", duplicateProject);
+  panel.querySelector("#psvstudio-reset").addEventListener("click", resetProject);
   panel.querySelector("#psvstudio-compile-preview").addEventListener("click", compilePreview);
   panel.querySelector("#psvstudio-refresh-workflows").addEventListener("click", () => refreshWorkflows());
   panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopKoboldGeneration);

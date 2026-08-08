@@ -58,14 +58,13 @@ def shot(shot_id, start, marker=""):
         "subjects": f"{marker} subject".strip(),
         "environment": f"{marker} environment".strip(),
         "lighting": f"{marker} lighting".strip(),
-        "action": f"{marker} action".strip(),
+        "steps": [{"type": "action", "text": f"{marker} action".strip()}],
         "camera": {
             "type": "Static Shot",
             "amplitude": "default",
             "speed": "default",
             "target": f"{marker} subject".strip(),
         },
-        "dialogue": [],
         "visible_text": [],
         "sounds": [f"{marker} room tone".strip()],
         "notes": "",
@@ -272,6 +271,42 @@ def cases():
             "observation_terms": [["blonde", "pink", "boots"]],
             "observation_forbidden_terms": [[]],
         },
+        "ref2va_first_frame_subject_steps": {
+            "document": document(
+                mode="auto",
+                references=[
+                    reference(1, FIRST_FRAME_IMAGE, "first_frame"),
+                    reference(2, SUBJECT_IMAGE, "subject"),
+                ],
+                shots=[shot("shot-1", 0)],
+                duration=5,
+            ),
+            "attachments": [
+                attachment(1, FIRST_FRAME_IMAGE, "first_frame"),
+                attachment(2, SUBJECT_IMAGE, "subject"),
+            ],
+            "prompt": (
+                'The girl from Picture 1 says "Come here dear". Then the girl from Picture 2 enters '
+                "from frame right and smiles. Create a complete, directly usable MiniMax H3 proposal "
+                "for this five-second video."
+            ),
+            "mode": "ref2va",
+            "shots": 1,
+            "starts": [0],
+            "reference_tokens": ["<Picture 1>", "<Picture 2>"],
+            "shot_reference_tokens": ["<Subject 1>", "<Subject 2>"],
+            "expected_step_types": ["dialogue", "action"],
+            "first_frame_lock": True,
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "observation_terms": [
+                ["woman", "dress", "door"],
+                ["blonde", "pink", "boots"],
+            ],
+            "observation_forbidden_terms": [[], []],
+        },
         "selected_shot_t2va": {
             "document": document(mode="t2va"),
             "scope": "shot",
@@ -305,15 +340,44 @@ def validate(name, case, result, preview):
     starts = [float(item.get("start", 0)) for item in result_document.get("shots") or []]
     if "starts" in case and starts != [float(value) for value in case["starts"]]:
         errors.append(f"shot starts {starts} != {case['starts']}")
-    for shot_value in result_document.get("shots") or []:
+    has_first_frame = any(
+        "first_frame" in reference_value.get("roles", [])
+        for reference_value in case["document"].get("references") or []
+    )
+    for shot_index, shot_value in enumerate(result_document.get("shots") or []):
+        required_fields = () if has_first_frame and shot_index == 0 else (
+            "composition", "subjects", "environment", "lighting"
+        )
         missing_fields = [
-            field for field in ("composition", "subjects", "environment", "lighting", "action")
+            field for field in required_fields
             if not str(shot_value.get(field) or "").strip()
         ]
+        if not any(
+            step.get("type") == "action" and str(step.get("text") or "").strip()
+            for step in shot_value.get("steps") or []
+        ):
+            missing_fields.append("action step")
         if missing_fields:
             errors.append(f"{shot_value.get('id')} has empty fields {missing_fields}")
-        if not shot_value.get("sounds"):
+        if "sound" in case["prompt"].casefold() and not shot_value.get("sounds"):
             errors.append(f"{shot_value.get('id')} has no synchronized sounds")
+    expected_steps = case.get("expected_step_types")
+    if expected_steps:
+        actual_steps = [
+            step.get("type") for step in result_document["shots"][0].get("steps") or []
+        ]
+        if actual_steps != expected_steps:
+            errors.append(f"step order {actual_steps} != {expected_steps}")
+    if case.get("first_frame_lock"):
+        first = result_document["shots"][0]
+        leaked = [
+            field for field in ("composition", "subjects", "environment", "lighting")
+            if first.get(field) != case["document"]["shots"][0].get(field)
+        ]
+        if leaked:
+            errors.append(f"first-frame-owned fields changed: {leaked}")
+    if len(compiled.split()) > 650:
+        errors.append(f"compiled prompt is unexpectedly verbose: {len(compiled.split())} words")
     if case.get("prompt_prefix") and not compiled.startswith(case["prompt_prefix"]):
         errors.append(f"compiled prompt does not start with {case['prompt_prefix']!r}")
     forbidden = case.get("forbidden")
@@ -381,6 +445,7 @@ def validate(name, case, result, preview):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", action="append", dest="selected")
+    parser.add_argument("--show-prompt", action="store_true")
     args = parser.parse_args()
     matrix = cases()
     selected = args.selected or list(matrix)
@@ -413,7 +478,10 @@ def main():
                 "resolved_mode": preview.get("document", {}).get("resolved_mode"),
                 "vision_observations": result.get("vision_observations") or [],
                 "errors": errors,
+                "compiled_words": len(preview.get("compiled_prompt", "").split()),
             }
+            if args.show_prompt:
+                summary["compiled_prompt"] = preview.get("compiled_prompt", "")
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
             if errors:
                 failures += 1

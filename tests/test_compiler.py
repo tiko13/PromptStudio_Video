@@ -47,6 +47,12 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("\noverall_soundscape:", prompt)
         self.assertIn("\nnon_diegetic_music:", prompt)
 
+    def test_base_modes_reject_reference_tokens_without_ref2va_sources(self):
+        value = base_document()
+        value["shots"][0]["composition"] = "<Subject 1> opens the shutters."
+        with self.assertRaisesRegex(PromptDocumentError, "require REF2VA source definitions"):
+            compile_prompt(value)
+
     def test_i2va_instruction_is_first_and_dialogue_is_verbatim(self):
         value = base_document(references=[{
             "kind": "image", "path": "first.png", "roles": ["first_frame"],
@@ -78,6 +84,51 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("The subject raises one hand.", prompt)
         self.assertIn("The camera pushes in", prompt)
 
+    def test_complete_silence_suppresses_every_audio_layer(self):
+        value = base_document(complete_silence=True)
+        value["shots"][0]["action"] = "The baker opens the shutters."
+        value["shots"][0]["sounds"] = ["The shutters scrape loudly."]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("The baker opens the shutters.", prompt)
+        self.assertNotIn("First batch of the morning", prompt)
+        self.assertNotIn("shutters scrape", prompt.casefold())
+        self.assertIn("overall_soundscape: N/A", prompt)
+        self.assertIn("non_diegetic_music: N/A", prompt)
+
+    def test_ref2va_first_frame_keeps_anchored_visuals_pixel_owned(self):
+        value = base_document(
+            references=[
+                {"kind": "image", "path": "first.png", "roles": ["first_frame"]},
+                {"kind": "image", "path": "woman.png", "roles": ["subject"]},
+            ],
+            task_types=["keyframe completion", "reference generation"],
+            subject_definitions=[
+                {"label": "Picture 1", "text": "is the supplied opening frame for [Shot 1]."},
+                {"label": "Subject 1", "text": "is the woman in <Picture 2>."},
+            ],
+            summary="The target begins from <Picture 1> as <Subject 1> enters [Shot 1].",
+            retention_analysis=[
+                {"label": "<Picture 1>", "where": "anchors [Shot 1]", "relationship": "fully_preserved", "detail": "Its opening pixels are retained."},
+                {"label": "<Subject 1>", "where": "appears in [Shot 1]", "relationship": "fully_preserved", "detail": "Her identity is retained."},
+            ],
+        )
+        value["shots"][0].update({
+            "composition": "Invented composition that competes with the opening frame.",
+            "subjects": "Invented description of the opening subject.",
+            "environment": "Invented opening environment.",
+            "lighting": "Invented opening lighting.",
+            "action": "<Subject 1> enters from frame right.",
+        })
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("established by <Picture 1> remain fully preserved", prompt)
+        self.assertIn("<Subject 1> enters from frame right", prompt)
+        self.assertNotIn("Invented composition", prompt)
+        self.assertNotIn("Invented opening environment", prompt)
+
     def test_main_description_is_planning_only_and_not_compiled(self):
         prompt = compile_prompt(base_document())
         self.assertNotIn("A baker opens the street bakery before sunrise.", prompt)
@@ -99,8 +150,11 @@ class CompilerTests(unittest.TestCase):
             ],
         )
         prompt = compile_prompt(value)
-        self.assertIn("Picture 2 (from Shot 2) aligns with the 5.17-second mark", prompt)
+        self.assertIn("<Picture 2> (from [Shot 2]) aligns with the 5.17-second mark", prompt)
         self.assertIn("[Shot 2] At 00:03.000, the camera cuts to a new view.", prompt)
+        self.assertNotIn("Live-action, cinematic", prompt)
+        self.assertNotIn("The cyclist starts beside a bicycle", prompt)
+        self.assertIn("established by <Picture 1> remain fully preserved", prompt)
 
     def test_l2va_uses_last_frame_instruction(self):
         prompt = compile_prompt(base_document(references=[{
@@ -169,6 +223,22 @@ class CompilerTests(unittest.TestCase):
         )
         value["shots"][0]["subjects"] = "<Subject 1> stands beside the chair."
         with self.assertRaisesRegex(PromptDocumentError, r"references missing \[Shot 2\]"):
+            compile_prompt(value)
+
+    def test_ref2va_rejects_undefined_subject_tokens_in_prompt_content(self):
+        value = base_document(
+            references=[{"kind": "image", "path": "subject.png", "roles": ["subject"]}],
+            subject_definitions=[{
+                "label": "Subject 1", "text": "is the baker in <Picture 1>.",
+            }],
+            summary="The target follows <Subject 1>.",
+            retention_analysis=[{
+                "label": "<Subject 1>", "where": "appears in [Shot 1]",
+                "relationship": "fully_preserved", "detail": "The baker is retained.",
+            }],
+        )
+        value["shots"][0]["action"] = "<Subject 3> opens the shutters beside <Subject 1>."
+        with self.assertRaisesRegex(PromptDocumentError, "undefined reference labels.*subject 3"):
             compile_prompt(value)
 
     def test_ref2va_tracks_multiple_references_across_multiple_shots(self):

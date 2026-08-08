@@ -95,6 +95,7 @@ class ContractTests(unittest.TestCase):
                 "name": "young woman",
                 "location": "center",
                 "visual_selectors": ["person in black", "black jacket"],
+                "grounded_attributes": {"hair": "long blonde hair", "clothing": "black jacket"},
             }],
         }
         normalized = normalize_document(document(references=[subject]))
@@ -107,6 +108,7 @@ class ContractTests(unittest.TestCase):
                 "name": "young woman",
                 "location": "center",
                 "visual_selectors": ["person in black", "black jacket"],
+                "grounded_attributes": {"hair": "long blonde hair", "clothing": "black jacket"},
             }],
         )
 
@@ -156,7 +158,7 @@ class ContractTests(unittest.TestCase):
             "start": 0,
             "dialogue": [{"speaker_id": "S1", "performance": "singing", "text": "Hold on."}],
         }]))
-        self.assertEqual(normalized["shots"][0]["dialogue"][0]["performance"], "singing")
+        self.assertEqual(normalized["shots"][0]["steps"][0]["performance"], "singing")
         with self.assertRaisesRegex(PromptDocumentError, "offscreen rather than voiceover"):
             normalize_document(document(shots=[{
                 "start": 0,
@@ -173,10 +175,12 @@ class ContractTests(unittest.TestCase):
         }]))
         shot = normalized["shots"][0]
         self.assertEqual([step["type"] for step in shot["steps"]], ["action", "dialogue"])
-        self.assertEqual(shot["action"], "She picks up the letter.")
-        self.assertEqual(shot["dialogue"][0]["text"], "This came yesterday.")
+        self.assertNotIn("action", shot)
+        self.assertNotIn("dialogue", shot)
+        self.assertEqual(shot["steps"][0]["text"], "She picks up the letter.")
+        self.assertEqual(shot["steps"][1]["text"], "This came yesterday.")
 
-    def test_steps_are_authoritative_and_keep_legacy_mirrors(self):
+    def test_steps_are_authoritative_and_discard_legacy_mirrors(self):
         normalized = normalize_document(document(shots=[{
             "start": 0,
             "action": "Obsolete action.",
@@ -188,8 +192,8 @@ class ContractTests(unittest.TestCase):
             ],
         }]))
         shot = normalized["shots"][0]
-        self.assertEqual(shot["action"], "She opens the letter. She freezes.")
-        self.assertEqual([item["text"] for item in shot["dialogue"]], ["It is his handwriting."])
+        self.assertNotIn("action", shot)
+        self.assertNotIn("dialogue", shot)
         self.assertEqual([step["id"] for step in shot["steps"]], ["step-1", "line-1", "step-2"])
 
     def test_step_types_are_validated(self):
@@ -198,6 +202,20 @@ class ContractTests(unittest.TestCase):
                 "start": 0,
                 "steps": [{"type": "pause", "text": "A pause."}],
             }]))
+
+    def test_generated_step_ids_are_stable_and_duplicates_are_repaired(self):
+        value = document(shots=[{
+            "start": 0,
+            "steps": [
+                {"id": "same", "type": "action", "text": "She turns."},
+                {"id": "same", "type": "dialogue", "speaker_id": "S1", "text": "Hello."},
+                {"type": "action", "text": "She waves."},
+            ],
+        }])
+        first = normalize_document(value)["shots"][0]["steps"]
+        second = normalize_document(value)["shots"][0]["steps"]
+        self.assertEqual([step["id"] for step in first], ["same", "dialogue-2", "step-3"])
+        self.assertEqual([step["id"] for step in first], [step["id"] for step in second])
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ document
 │   ├── composition, subjects, environment, and lighting
 │   ├── authoritative chronological action/dialogue steps
 │   ├── camera motion, amplitude, speed, and target
-│   ├── compatibility action/dialogue mirrors and immutable visible text
+│   ├── immutable visible text
 │   └── synchronized sound events
 ├── overall soundscape and non-diegetic music
 └── REF2VA definitions, summary, and retention analysis
@@ -41,8 +41,9 @@ The standalone right panel is a compact Shots navigator. Detailed shot setup
 and the ordered performance sequence live in a transactional popup editor. The
 compiler follows the step list exactly, allowing action, dialogue, subsequent
 action, and later dialogue to remain causally ordered without artificial
-timestamps. Documents without steps migrate deterministically by placing the
-legacy action first and existing dialogue after it.
+timestamps. Documents without steps receive a one-way import migration that
+places the old action first and old dialogue after it, then discards those old
+fields.
 
 ## AI Directors
 
@@ -55,18 +56,18 @@ structured reference definitions and retention analysis required by REF2VA.
 
 The shot popup editor opens a separate shot-scoped Director. It receives
 the selected shot, its immediate neighbors, and the same compact constraints.
-Its write contract remains limited to descriptive, sound, camera, and new
-dialogue additions on that selected shot, plus reference-semantic fields when
-an attached reference must be activated for that shot. Neither scope receives
+Its write contract remains limited to descriptive, sound, camera, and complete
+chronological `steps` replacements on that selected shot, plus reference-semantic
+fields when an attached reference must be activated for that shot. Neither scope receives
 the compiled queue prompt or unlimited conversation history.
 
 Conversational answers do not mutate project state. Requested edits use a
 video-specific change set whose base-document hash, scope, target IDs, field
 allowlists, camera vocabulary, timing, reference coverage, and normalized
 result are validated on the server. Reference assets and visible text remain
-outside both write scopes. Dialogue proposals are append-only: the Director may
-add newly requested lines but cannot rewrite or remove existing dialogue or
-speaker IDs. Reference analysis may describe and activate already-committed
+outside both write scopes. The Director must preserve existing dialogue text and
+speaker IDs when replacing a steps sequence unless the user explicitly requests
+that protected dialogue change. Reference analysis may describe and activate already-committed
 assets but cannot replace them. A project proposal cannot remove a shot that
 contains protected dialogue or visible text. The browser applies the validated
 document only after explicit user approval and rejects proposals made against
@@ -108,13 +109,18 @@ loaded only through validated paths beneath that directory. A per-image usage
 separates visual description from conditioning: `describe` images are current-
 turn vision context only, while explicit first-frame, last-frame, subject,
 scene, style, pose, camera, and storyboard usages become normal project
-references before the request. Image bytes go first through a low-temperature,
-vision-only grounding request that has no access to the requested video action.
-Its validated observations are inserted into the production context as
-authoritative visual facts, and the larger structured Director request receives
-those facts without the image bytes. This keeps schema examples and story text
-from contaminating pixel observations. Images are never replayed with older chat
-history.
+references before the request. Each image goes through its own low-temperature
+vision-only grounding request, which has no access to the requested video action
+or any other attached image. Validated subject candidates, private matching
+aliases, and structured grounded appearance attributes are cached on the project
+reference. People in first/last-frame anchors join the same stable `<Subject N>`
+registry as ordinary subject references. Before the larger Director request,
+deterministic code resolves natural identifiers to tokens and removes private
+selectors and raw subject observations from model context. Subject definitions
+keep the source binding while excluding the source picture's background, scene,
+lighting, composition, and camera framing. Grounded attributes are exposed only
+for an explicit appearance edit and are not automatically compiled into prompt
+prose. Images are never replayed with older chat history.
 
 ## Runtime dispatch
 
