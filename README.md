@@ -1,33 +1,55 @@
 # PromptStudio_Video
 
-`PromptStudio_Video` is the standalone video companion for
-[`ComfyUI_PromptStudio`](https://github.com/tiko13/ComfyUI_PromptStudio). It
-provides a structured shot, reference, dialogue, camera, and sound editor for
-MiniMax H3 without depending on ComfyUI-DaSiWa-Nodes.
+Build MiniMax H3 videos in a visual, shot-based studio that keeps timing, references, dialogue, camera, and sound under your control.
 
-This repository is under active development. The current vertical slice contains:
+`PromptStudio_Video` is the standalone video companion for [`ComfyUI_PromptStudio`](https://github.com/tiko13/ComfyUI_PromptStudio) and works directly with current native ComfyUI MiniMax nodes.
 
-- `Prompt Studio MiniMax H3 Director`, a ComfyUI custom node;
-- automatic T2VA, I2VA, FL2VA, L2VA, and REF2VA routing;
-- a deterministic prompt compiler following MiniMax's official base and
-  full-reference formats;
-- native ComfyUI MiniMax conditioning and latent creation;
-- lazy FL2VA/REF2VA model selection;
-- first-frame, last-frame, image, video, and audio reference loading;
-- a transactional full-screen Director Canvas with frame-snapped shot trimming,
-  drag-to-reorder editing, media drag-and-drop, camera direction, dialogue,
-  visible text, sound, and media roles; and
-- a standalone Video Studio with durable projects, authoritative manual shot
-  editing, a docked proportional timeline with pointer reordering, frame-snapped
-  trimming, a compact Shots navigator, transactional per-shot popup editors,
-  draggable chronological action/dialogue steps, zoom and fit controls,
-  screen-wide media drop, draggable reference ordering, explicit MiniMax media roles, `[PSV]` workflow discovery,
-  deterministic prompt preview, ComfyUI queueing, progress, video history, and
-  exact workflow replay;
-- a context-budgeted selected-shot AI Director for KoboldCpp or Ollama, with
-  conversational advice, validated structured proposals, stale-document
-  protection, and explicit apply/discard review; and
-- a versioned capability and document API for Prompt Studio integration.
+## Direct the video on a real timeline
+
+Plan multiple shots on a proportional, frame-snapped timeline. Reorder and trim them visually, then edit each shot's setup, camera, sound, visible text, and chronological action or dialogue steps.
+
+<!-- Hero screenshot slot: full Video Studio with preview, timeline, and shot navigator.
+Suggested file: docs/images/video-studio-timeline.png
+![Video Studio timeline and shot editor](docs/images/video-studio-timeline.png)
+-->
+
+## Collaborate with two local AI Directors
+
+Ask the **Grand Director** to critique or compose the whole production, or use the shot-level **Director** for a focused change. Both return reviewable structured proposals; nothing changes until you explicitly apply it.
+
+<!-- Screenshot slot: Grand Director proposal with apply/discard review.
+Suggested file: docs/images/grand-director.png
+![Grand Director reviewing a multi-shot video](docs/images/grand-director.png)
+-->
+
+## Use every MiniMax H3 generation mode from one project
+
+Drop in first and last frames, images, video, or audio, assign clear semantic roles, and let the project route T2VA, I2VA, FL2VA, L2VA, or REF2VA automatically. Reference labels, dialogue, lyrics, and visible text remain explicit and protected.
+
+<!-- Screenshot slot: media library with several references and MiniMax roles.
+Suggested file: docs/images/reference-modes.png
+![MiniMax reference media and automatic generation modes](docs/images/reference-modes.png)
+-->
+
+## Preview exact prompts and replay exact generations
+
+The structured project document remains authoritative while a deterministic compiler builds the guide-compliant MiniMax prompt. Every result keeps its prompt, project state, routing, and executable workflow snapshot for inspection and replay.
+
+<!-- Screenshot slot: compiled prompt preview beside generation history and replay.
+Suggested file: docs/images/prompt-preview-and-replay.png
+![Deterministic prompt preview and video replay history](docs/images/prompt-preview-and-replay.png)
+-->
+
+## Move seamlessly from still image to video
+
+With the companion image extension installed, send a Prompt Studio result straight into the active video project and assign it as a frame or reference without exporting and re-importing it manually.
+
+<!-- Screenshot slot: imported Prompt Studio image in the Video Studio media library.
+Suggested file: docs/images/image-studio-handoff.png
+![Prompt Studio image received by Video Studio](docs/images/image-studio-handoff.png)
+-->
+
+This repository is under active development. The sections below cover requirements, the Director document, AI behavior, workflows, integration, and development details.
 
 ## Requirements
 
@@ -48,6 +70,21 @@ ComfyUI/custom_nodes/PromptStudio_Video
 ```
 
 Restart ComfyUI after installation.
+
+## Current capabilities
+
+The current vertical slice contains:
+
+- `Prompt Studio MiniMax H3 Director`, a ComfyUI custom node;
+- automatic T2VA, I2VA, FL2VA, L2VA, and REF2VA routing;
+- a deterministic prompt compiler following MiniMax's official base and full-reference formats;
+- native ComfyUI MiniMax conditioning and latent creation;
+- lazy FL2VA/REF2VA model selection;
+- first-frame, last-frame, image, video, and audio reference loading;
+- a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
+- a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
+- context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp or Ollama, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
+- a versioned capability and document API for Prompt Studio integration.
 
 ## Director document
 

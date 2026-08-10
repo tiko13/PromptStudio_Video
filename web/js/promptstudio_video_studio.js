@@ -270,8 +270,10 @@ function renderKoboldStatus(status = {}) {
   const control = state.panel?.querySelector("#psvstudio-kobold-control");
   const label = control?.querySelector("#psvstudio-kobold-status-label");
   const detail = control?.querySelector("#psvstudio-kobold-status-detail");
+  const model = control?.querySelector("#psvstudio-kobold-model");
+  const vision = control?.querySelector("#psvstudio-kobold-vision");
   const stop = control?.querySelector("#psvstudio-kobold-stop");
-  if (!control || !label || !detail || !stop) return;
+  if (!control || !label || !detail || !model || !vision || !stop) return;
   const reachable = status.reachable === true;
   const busy = reachable && status.busy === true;
   const stateName = busy ? "busy" : (reachable ? "idle" : (status.checking ? "checking" : "offline"));
@@ -281,6 +283,11 @@ function renderKoboldStatus(status = {}) {
   detail.textContent = status.message || (busy
     ? `Generation active${Number.isFinite(characters) && characters > 0 ? ` · ${characters.toLocaleString()} characters` : ""}`
     : (reachable ? "Ready for local requests." : "KoboldCpp could not be reached."));
+  const modelName = typeof status.model === "string" ? status.model.trim() : "";
+  model.textContent = modelName || (reachable ? "Unavailable" : "—");
+  model.title = modelName;
+  vision.textContent = status.vision === true ? "Yes" : (status.vision === false ? "No" : (reachable ? "Unknown" : "—"));
+  vision.dataset.state = status.vision === true ? "available" : (status.vision === false ? "unavailable" : "unknown");
   stop.disabled = !busy || state.koboldAbortBusy;
   stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Stop generation";
 }
@@ -4344,6 +4351,10 @@ function buildPanel() {
           <div class="psvstudio-kobold-popover">
             <strong>KoboldCpp</strong>
             <span id="psvstudio-kobold-status-detail" role="status" aria-live="polite">Checking local status…</span>
+            <dl class="psvstudio-kobold-metadata">
+              <div><dt>Model</dt><dd id="psvstudio-kobold-model">Checking…</dd></div>
+              <div><dt>Vision</dt><dd id="psvstudio-kobold-vision" data-state="unknown">Checking…</dd></div>
+            </dl>
             <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Stop generation</button>
             <small>Stops text generation only. KoboldCpp stays loaded.</small>
           </div>

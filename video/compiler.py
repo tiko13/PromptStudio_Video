@@ -107,7 +107,16 @@ def _step_text(step):
     return ""
 
 
-def _shot_text(shot, index, *, include_style="", first_frame_lock=False, suppress_audio=False):
+def _shot_text(
+    shot,
+    index,
+    *,
+    include_style="",
+    first_frame_lock=False,
+    first_frame_token="<Picture 1>",
+    reference_scope="",
+    suppress_audio=False,
+):
     if index == 0:
         prefix = "[Shot 1]"
     else:
@@ -119,8 +128,10 @@ def _shot_text(shot, index, *, include_style="", first_frame_lock=False, suppres
     if first_frame_lock and index == 0:
         parts.append(_sentence(
             "The style, subjects, composition, scene, lighting, clothing, colors, key objects, and spatial "
-            "relationships established by <Picture 1> remain fully preserved"
+            f"relationships established by {first_frame_token} remain fully preserved"
         ))
+        if reference_scope:
+            parts.append(_sentence(reference_scope))
     if include_style:
         parts.append(_sentence(_canonical_tokens(include_style)))
     visual_fields = () if first_frame_lock and index == 0 else (
@@ -201,11 +212,61 @@ def _retention_lines(document):
     return lines
 
 
+def _first_frame_reference_scope(document):
+    """State precedence when subject-only pictures accompany a first-frame anchor."""
+    first_frame = next(
+        (
+            reference for reference in document.get("references") or []
+            if reference.get("kind") == "image"
+            and "first_frame" in set(reference.get("roles") or [])
+        ),
+        None,
+    )
+    if not first_frame:
+        return "", ""
+
+    definitions = document.get("subject_definitions") or []
+    subject_sources = []
+    for reference in document.get("references") or []:
+        roles = set(reference.get("roles") or [])
+        if (
+            reference is first_frame
+            or reference.get("kind") != "image"
+            or not roles
+            or not roles <= {"subject"}
+        ):
+            continue
+        source_token = reference.get("label") or ""
+        subjects = [
+            f"<{definition['label'].strip('<>')}>"
+            for definition in definitions
+            if definition.get("label", "").casefold().startswith("subject")
+            and source_token.casefold() in definition.get("text", "").casefold()
+        ]
+        if subjects:
+            subject_sources.append((source_token, subjects))
+
+    if not subject_sources:
+        return first_frame.get("label") or "<Picture 1>", ""
+
+    scopes = []
+    for source_token, subjects in subject_sources:
+        subject_text = " and ".join(subjects)
+        scopes.append(f"{source_token} supplies only {subject_text}'s identity and appearance")
+    return first_frame.get("label") or "<Picture 1>", (
+        f"{first_frame.get('label') or '<Picture 1>'} remains the sole source for this shot's background, "
+        "environment, lighting, composition, camera framing, and spatial relationships; "
+        + "; ".join(scopes)
+        + ", with no source-picture scene or framing transferred"
+    )
+
+
 def _compile_reference(document):
     definitions = "\n".join(_definition_lines(document))
     task_types = document["task_types"] or ["reference generation"]
     summary = _canonical_tokens(f"[{' + '.join(task_types)}] {document['summary']}".rstrip())
     retention = "\n".join(_retention_lines(document))
+    first_frame_token, reference_scope = _first_frame_reference_scope(document)
     shots = " ".join(
         _shot_text(
             shot,
@@ -214,6 +275,8 @@ def _compile_reference(document):
                 "first_frame" in reference.get("roles", [])
                 for reference in document.get("references") or []
             )),
+            first_frame_token=first_frame_token or "<Picture 1>",
+            reference_scope=reference_scope if index == 0 else "",
             suppress_audio=document["complete_silence"],
         )
         for index, shot in enumerate(document["shots"])

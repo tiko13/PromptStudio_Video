@@ -144,6 +144,10 @@ The supplied first-frame image is the sole authority for everything already visi
 For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields."""
 
 
+BASE_KEYFRAME_DIRECTOR_POLICY = """BASE KEYFRAME MODE (I2VA / FL2VA / L2VA):
+This project uses the base keyframe prompt contract, not REF2VA's six-section reference contract. Use the supplied <Picture N> tokens where the keyframe path needs them, but never create or use <Subject N> tokens, subject_definitions, retention_analysis, or REF2VA task_types. Describe people and objects with ordinary nouns. In L2VA, build a plausible preceding state and a concrete motion path that converges on the supplied final-frame <Picture 1> in the final shot."""
+
+
 def _text(value, maximum=MAX_MESSAGE_CHARS):
     return str(value or "").strip()[:maximum]
 
@@ -228,7 +232,7 @@ def _repair_json_structure(value):
 
 def _reference_tokens(document):
     tokens = {item["label"].casefold(): item["label"] for item in document["references"]}
-    if document["references"]:
+    if document["references"] and document.get("resolved_mode") == "ref2va":
         for item in document["subject_definitions"]:
             token = f"<{item['label'].strip('<>')}>"
             tokens[token.casefold()] = token
@@ -411,7 +415,11 @@ def _requested_subject_attribute_fields(data):
 def _provider_request_data(data, document):
     """Build the reduced, tokenized request seen by the main Director call."""
     result = copy.deepcopy(data)
-    bindings = _reference_subject_bindings(document, data)
+    bindings = (
+        _reference_subject_bindings(document, data)
+        if document.get("resolved_mode") == "ref2va"
+        else []
+    )
     preserve_attributes = _explicit_subject_attribute_request(data)
     messages = []
     for message in data.get("messages") or []:
@@ -493,6 +501,11 @@ def _director_scope(data):
 
 
 def _base_context(data, document, attachments, duration):
+    reference_subjects = (
+        _reference_subject_bindings(document, data)
+        if document.get("resolved_mode") == "ref2va"
+        else []
+    )
     references = [
         {
             "id": item["id"],
@@ -577,7 +590,11 @@ def _base_context(data, document, attachments, duration):
         "minimax_tokens": {
             "shots": [f"[Shot {index + 1}]" for index in range(len(document["shots"]))],
             "references": [item["label"] for item in document["references"]],
-            "subjects": [f"<{item['label'].strip('<>')}>" for item in document["subject_definitions"]],
+            "subjects": (
+                [f"<{item['label'].strip('<>')}>" for item in document["subject_definitions"]]
+                if document.get("resolved_mode") == "ref2va"
+                else []
+            ),
         },
         "camera_types": sorted(CAMERA_TYPES),
         "references": references,
@@ -587,7 +604,7 @@ def _base_context(data, document, attachments, duration):
                 key: copy.deepcopy(binding[key])
                 for key in ("token", "source_token", "name", "location")
             }
-            for binding in _reference_subject_bindings(document, data)
+            for binding in reference_subjects
         ],
         "explicit_subject_attributes": copy.deepcopy(data.get("_explicit_subject_attributes") or []),
         "pending_plan": pending_context,
@@ -680,6 +697,8 @@ def build_provider_messages(data):
     history_budget = int(min(DEFAULT_HISTORY_CHARS, context_budget - len(context_json)))
     history, omitted, history_chars = _bounded_history(provider_data.get("messages"), history_budget)
     system_message = PROJECT_SYSTEM_MESSAGE if scope == "project" else SHOT_SYSTEM_MESSAGE
+    if document["resolved_mode"] in {"i2va", "fl2va", "l2va"}:
+        system_message += "\n\n" + BASE_KEYFRAME_DIRECTOR_POLICY
     if _has_first_frame_anchor(document):
         system_message += "\n\n" + I2VA_DIRECTOR_POLICY
     messages = [{
@@ -1303,7 +1322,27 @@ def _shot_fields(value, allow_start=False):
             if (text := str(item or "").strip()[:8_000])
         ][:32]
     if "steps" in value:
-        result["steps"] = _shot_steps(value["steps"])
+        if not isinstance(value["steps"], list):
+            raise ValueError("steps must be a chronological list")
+        chronological_steps = []
+        lifted_sounds = []
+        for index, item in enumerate(value["steps"]):
+            step_type = _text(item.get("type"), 40).casefold() if isinstance(item, dict) else ""
+            if step_type != "sound":
+                chronological_steps.append(item)
+                continue
+            sound = next((
+                candidate
+                for name in ("text", "description", "sound")
+                if (candidate := _audible_sound(item.get(name)))
+            ), "")
+            if not sound:
+                raise ValueError(f"sound step {index + 1} has no audible text")
+            lifted_sounds.append(sound)
+        result["steps"] = _shot_steps(chronological_steps)
+        if lifted_sounds:
+            combined_sounds = [*result.get("sounds", []), *lifted_sounds]
+            result["sounds"] = list(dict.fromkeys(combined_sounds))[:32]
     if "camera" in value:
         result["camera"] = _camera(value["camera"])
     return result
@@ -1520,7 +1559,7 @@ def _canonicalize_project_operations(document, proposal):
     return {**proposal, "operations": operations}
 
 
-def _sanitize_proposal_tokens(proposal, allowed_tokens):
+def _sanitize_proposal_tokens(proposal, allowed_tokens, *, allow_reference_semantics=True):
     proposal = copy.deepcopy(proposal)
     allowed_tokens = dict(allowed_tokens)
     has_source_reference = any(
@@ -1530,7 +1569,7 @@ def _sanitize_proposal_tokens(proposal, allowed_tokens):
     for operation in proposal["operations"]:
         if operation.get("op") != "update_project":
             continue
-        if not has_source_reference:
+        if not has_source_reference or not allow_reference_semantics:
             for name in PROJECT_REFERENCE_FIELDS:
                 operation.get("fields", {}).pop(name, None)
             continue
@@ -1538,6 +1577,10 @@ def _sanitize_proposal_tokens(proposal, allowed_tokens):
             token = f"<{item['label'].strip('<>')}>"
             allowed_tokens[token.casefold()] = token
     inferred_tokens = _inferred_model_tokens(proposal, allowed_tokens)
+    proposal["operations"] = [
+        operation for operation in proposal["operations"]
+        if operation.get("op") != "update_project" or operation.get("fields")
+    ]
     proposal["summary"] = _sanitize_model_tokens(proposal["summary"], allowed_tokens, inferred_tokens)
     for operation in proposal["operations"]:
         operation_type = operation["op"]
@@ -2164,7 +2207,27 @@ def _complete_grounded_reference_semantics(document, proposal, data):
         retention_order.get(_text(item.get("label"), 80).casefold(), len(retention_order)),
         _text(item.get("label"), 80).casefold(),
     ))
-    if subject_bindings and required_tokens:
+    first_frame = next(
+        (
+            reference for reference in document.get("references") or []
+            if reference.get("kind") == "image"
+            and "first_frame" in set(reference.get("roles") or [])
+        ),
+        None,
+    )
+    subject_only_references = [
+        reference for reference in document.get("references") or []
+        if reference.get("kind") == "image"
+        and set(reference.get("roles") or []) == {"subject"}
+    ]
+    if subject_bindings and required_tokens and first_frame and subject_only_references:
+        semantic["summary"] = (
+            "The target video develops from "
+            f"{first_frame['label']} with {', '.join(required_tokens[1:])}; "
+            f"only {first_frame['label']} supplies [Shot 1]'s background, environment, lighting, "
+            "composition, camera framing, and spatial relationships."
+        )
+    elif subject_bindings and required_tokens:
         semantic["summary"] = "The target video uses " + ", ".join(required_tokens) + "."
     elif not semantic["summary"]:
         semantic["summary"] = "The target video uses " + ", ".join(required_tokens) + "."
@@ -2741,7 +2804,11 @@ def preview_changeset(document_value, proposal_value):
     )
     if proposal["scope"]["type"] == "project":
         proposal = _canonicalize_project_operations(document, proposal)
-    proposal = _sanitize_proposal_tokens(proposal, _reference_tokens(document))
+    proposal = _sanitize_proposal_tokens(
+        proposal,
+        _reference_tokens(document),
+        allow_reference_semantics=document.get("resolved_mode") == "ref2va",
+    )
     updated = copy.deepcopy(document)
     for operation in proposal["operations"]:
         operation_type = operation["op"]
@@ -2776,14 +2843,15 @@ def preview_changeset(document_value, proposal_value):
         raise ValueError("The video must keep at least one shot in the resulting timeline")
     if proposal["scope"]["type"] == "project":
         updated["shots"].sort(key=lambda item: float(item.get("start", 0)))
-    _bind_unambiguous_reference_source(updated)
-    _canonicalize_direct_visual_definitions(updated)
-    _canonicalize_subject_source_aliases(updated)
-    _canonicalize_reference_definition_grammar(updated)
-    _canonicalize_subject_token_prose(updated)
-    _canonicalize_retention_shot_mentions(updated)
-    _ensure_defined_labels_in_summary(updated)
-    _ground_reference_definitions(updated)
+    if document.get("resolved_mode") == "ref2va":
+        _bind_unambiguous_reference_source(updated)
+        _canonicalize_direct_visual_definitions(updated)
+        _canonicalize_subject_source_aliases(updated)
+        _canonicalize_reference_definition_grammar(updated)
+        _canonicalize_subject_token_prose(updated)
+        _canonicalize_retention_shot_mentions(updated)
+        _ensure_defined_labels_in_summary(updated)
+        _ground_reference_definitions(updated)
     normalized = normalize_document(updated)
     compiled_prompt = compile_prompt(normalized, use_override=False)
     _synchronize_reference_project_operation(proposal, normalized)

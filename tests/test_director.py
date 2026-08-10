@@ -966,6 +966,26 @@ class DirectorTests(unittest.TestCase):
             ["The woman remains still as three knocks strike the door."],
         )
 
+    def test_sound_step_is_lifted_into_synchronized_sounds(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add synchronized sound","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She turns toward the window."},'
+            '{"type":"sound","description":"A soft footstep lands on the carriage floor."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+
+        self.assertFalse(parsed["proposal_error"], parsed)
+        fields = parsed["proposal"]["operations"][0]["fields"]
+        self.assertEqual(fields["steps"], [{"type": "action", "text": "She turns toward the window."}])
+        self.assertEqual(fields["sounds"], ["A soft footstep lands on the carriage floor."])
+        preview = preview_changeset(document, parsed["proposal"])
+        self.assertIn("A soft footstep lands on the carriage floor.", preview["compiled_prompt"])
+
     def test_project_proposal_can_update_planning_synopsis_without_compiling_it(self):
         document = normalize_document(director_document())
         fingerprint = document_fingerprint(document)
@@ -1690,6 +1710,53 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("FIRST-FRAME LOCK", messages[0]["content"])
         self.assertIn("A request for a complete/full prompt does not authorize", messages[0]["content"])
 
+    def test_l2va_director_keeps_ref2va_subject_tokens_out_of_base_mode(self):
+        value = director_document()
+        value["references"] = [{
+            "id": "reference-1", "kind": "image", "path": "last.png",
+            "name": "Last frame", "roles": ["last_frame"],
+            "subject_candidates": [{
+                "name": "young woman", "location": "center",
+                "visual_selectors": ["woman in red"],
+            }],
+        }]
+        # Simulate reference semantics left over from an earlier REF2VA role.
+        value["subject_definitions"] = [{
+            "label": "Subject 1", "text": "is the young woman in <Picture 1>.",
+        }]
+        document = normalize_document(value)
+        self.assertEqual(document["resolved_mode"], "l2va")
+        response = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Converge on the final frame","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"<Subject 1> settles into the final pose in <Picture 1>."},'
+            '{"type":"sound","text":"Her last footstep lands softly."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "require_proposal": True,
+                "messages": [{
+                    "role": "user",
+                    "content": "Have the woman in red approach and settle into the last frame.",
+                }],
+            })
+
+        self.assertEqual(generate.call_count, 1, result)
+        self.assertIsNotNone(result["proposal"], result)
+        context = provider_context(generate.call_args.args[1])
+        self.assertEqual(context["subject_registry"], [])
+        self.assertEqual(context["minimax_tokens"]["subjects"], [])
+        self.assertIn("BASE KEYFRAME MODE", generate.call_args.args[1][0]["content"])
+        self.assertNotIn("<Subject 1>", generate.call_args.args[1][-1]["content"])
+        preview = preview_changeset(document, result["proposal"])
+        self.assertNotIn("<Subject 1>", preview["compiled_prompt"])
+        self.assertIn("The subject settles into the final pose in <Picture 1>.", preview["compiled_prompt"])
+        self.assertIn("Her last footstep lands softly.", preview["compiled_prompt"])
+
     def test_mixed_reference_mode_rejects_first_shot_background_rewrite(self):
         value = self.i2va_document()
         value["references"].append({
@@ -2156,6 +2223,11 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("supplied first frame of [Shot 1]", definitions["<Picture 1>"])
         self.assertIn("only the young woman at center in <Picture 1>", definitions["<Subject 1>"])
         self.assertIn("only the young woman at center in <Picture 2>", definitions["<Subject 2>"])
+        self.assertIn(
+            "only <Picture 1> supplies [Shot 1]'s background, environment, lighting, composition, "
+            "camera framing, and spatial relationships",
+            preview["document"]["summary"],
+        )
         subject_2_retention = next(
             item for item in preview["document"]["retention_analysis"]
             if item["label"] == "<Subject 2>"
@@ -2163,6 +2235,10 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("background, environment, lighting, composition", subject_2_retention["detail"])
         compiled = preview["compiled_prompt"]
         detailed = compiled.split("detailed_description:\n", 1)[1].split("\n\noverall_soundscape:", 1)[0]
+        self.assertIn(
+            "<Picture 2> supplies only <Subject 2>'s identity and appearance",
+            detailed,
+        )
         self.assertIn("<Subject 1> (S1) says", compiled)
         self.assertIn("<Subject 2> walks into the frame from the left", compiled)
         self.assertIn("<Subject 2> (S2) says: <d>[English] General kenobi</d>", compiled)

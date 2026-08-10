@@ -60,6 +60,22 @@ class LlmProviderTests(unittest.TestCase):
         self.assertTrue(status["busy"])
         self.assertIsNone(status["generated_characters"])
 
+    def test_kobold_generation_status_reports_loaded_model_and_vision(self):
+        def get_json(url, _timeout):
+            if url.endswith("/api/extra/perf"):
+                return {"idle": 1, "queue": 0}
+            if url.endswith("/api/v1/model"):
+                return {"result": "koboldcpp/Qwen2.5-VL-7B-Q4_K_M"}
+            if url.endswith("/api/extra/version"):
+                return {"vision": True}
+            return None
+
+        with patch("video.llm_provider._get_json", side_effect=get_json):
+            status = generation_status({"llm_provider": "koboldcpp"})
+
+        self.assertEqual(status["model"], "koboldcpp/Qwen2.5-VL-7B-Q4_K_M")
+        self.assertIs(status["vision"], True)
+
     def test_kobold_auto_response_budget_uses_remaining_context(self):
         posted = []
 

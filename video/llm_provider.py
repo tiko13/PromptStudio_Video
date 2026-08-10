@@ -125,6 +125,20 @@ def generation_status(data):
             "busy": busy,
             "queue": max(0, int(perf.get("queue") or 0)),
         }
+        model_info = _get_json(
+            urllib.parse.urljoin(base_url + "/", "api/v1/model"),
+            3,
+        )
+        model_name = model_info.get("result") if isinstance(model_info, dict) else None
+        status["model"] = (
+            model_name.strip() if isinstance(model_name, str) and model_name.strip() else None
+        )
+        capabilities = _get_json(
+            urllib.parse.urljoin(base_url + "/", "api/extra/version"),
+            3,
+        )
+        vision = capabilities.get("vision") if isinstance(capabilities, dict) else None
+        status["vision"] = vision if isinstance(vision, bool) else None
         if busy:
             try:
                 partial = _post_json(

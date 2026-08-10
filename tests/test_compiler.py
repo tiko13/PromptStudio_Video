@@ -125,6 +125,16 @@ class CompilerTests(unittest.TestCase):
         prompt = compile_prompt(value)
 
         self.assertIn("established by <Picture 1> remain fully preserved", prompt)
+        self.assertIn(
+            "<Picture 1> remains the sole source for this shot's background, environment, lighting, "
+            "composition, camera framing, and spatial relationships",
+            prompt,
+        )
+        self.assertIn(
+            "<Picture 2> supplies only <Subject 1>'s identity and appearance",
+            prompt,
+        )
+        self.assertIn("with no source-picture scene or framing transferred", prompt)
         self.assertIn("<Subject 1> enters from frame right", prompt)
         self.assertNotIn("Invented composition", prompt)
         self.assertNotIn("Invented opening environment", prompt)
