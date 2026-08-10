@@ -29,7 +29,12 @@ def _video_components(path):
         raise PromptDocumentError("Video reference has no uploaded input path")
     from comfy_extras.nodes_video import LoadVideo
 
-    output = LoadVideo.execute(video=path).result
+    try:
+        output = LoadVideo.execute(file=path).result
+    except TypeError:
+        # Compatibility with ComfyUI builds whose legacy LoadVideo input was
+        # still named `video` rather than `file`.
+        output = LoadVideo.execute(video=path).result
     if not output:
         raise PromptDocumentError(f"ComfyUI could not load video reference '{path}'")
     components = output[0].get_components()

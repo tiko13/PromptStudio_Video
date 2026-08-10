@@ -124,7 +124,70 @@ def _normalize_generation(value, index):
         raise ValueError(f"Generation {index + 1} workflow snapshot must be an object")
     if "outputs" in result and not isinstance(result["outputs"], list):
         raise ValueError(f"Generation {index + 1} outputs must be a list")
+    kind = str(result.get("kind") or ("extension" if result.get("parent_generation_id") else "base")).strip().lower()
+    if kind not in {"base", "extension"}:
+        raise ValueError(f"Generation {index + 1} has invalid kind")
+    parent_id = str(result.get("parent_generation_id") or "").strip()
+    if parent_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", parent_id):
+        raise ValueError(f"Generation {index + 1} has an invalid parent identifier")
+    if kind == "extension" and not parent_id:
+        raise ValueError(f"Generation {index + 1} extension has no parent")
+    result["kind"] = kind
+    result["parent_generation_id"] = parent_id
+    result["root_generation_id"] = str(result.get("root_generation_id") or "").strip()
+    result["depth"] = max(0, int(result.get("depth") or 0))
+    result["total_effective_duration"] = max(
+        0.0,
+        float(result.get("total_effective_duration") or result.get("effective_duration") or 0),
+    )
+    if "segment_outputs" in result and not isinstance(result["segment_outputs"], list):
+        raise ValueError(f"Generation {index + 1} segment outputs must be a list")
+    result.setdefault("segment_outputs", [])
+    if "continuation" in result and not isinstance(result["continuation"], dict):
+        raise ValueError(f"Generation {index + 1} continuation metadata must be an object")
     return result
+
+
+def _normalize_generation_lineage(generations, project_index):
+    by_id = {generation["id"]: generation for generation in generations}
+    if len(by_id) != len(generations):
+        raise ValueError(f"Project {project_index + 1} generation identifiers must be unique")
+    resolved = {}
+
+    def lineage(generation_id, trail=()):
+        if generation_id in resolved:
+            return resolved[generation_id]
+        if generation_id in trail:
+            raise ValueError(f"Project {project_index + 1} generation lineage contains a cycle")
+        generation = by_id[generation_id]
+        parent_id = generation["parent_generation_id"]
+        if not parent_id:
+            value = (generation_id, 0)
+        else:
+            if parent_id not in by_id:
+                # History is intentionally capped.  Keep the persisted lineage
+                # coordinates when an older ancestor has fallen out of the
+                # retained window; continuation metadata carries the source
+                # segment descriptors needed to assemble the full version.
+                saved_root = generation.get("root_generation_id") or generation_id
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", str(saved_root)):
+                    saved_root = generation_id
+                value = (str(saved_root), max(1, int(generation.get("depth") or 1)))
+                resolved[generation_id] = value
+                return value
+            if parent_id == generation_id:
+                raise ValueError(f"Project {project_index + 1} generation cannot parent itself")
+            root_id, parent_depth = lineage(parent_id, (*trail, generation_id))
+            value = (root_id, parent_depth + 1)
+        resolved[generation_id] = value
+        return value
+
+    for generation in generations:
+        root_id, depth = lineage(generation["id"])
+        generation["root_generation_id"] = root_id
+        generation["depth"] = depth
+        generation["kind"] = "extension" if depth else "base"
+    return generations
 
 
 def _normalize_project(value, index):
@@ -149,13 +212,18 @@ def _normalize_project(value, index):
         ):
             shots[0]["action"] = ""
     document = normalize_document(document_value)
+    normalized_generations = [
+        _normalize_generation(item, item_index)
+        for item_index, item in enumerate(generations)
+    ]
+    _normalize_generation_lineage(normalized_generations, index)
     return {
         "id": project_id,
         "name": _text(value.get("name") or "Untitled video", MAX_PROJECT_NAME_CHARS, "Project name"),
         "brief": document["main_description"],
         "document": document,
         "workflow_id": str(value.get("workflow_id") or "").strip()[:1024],
-        "generations": [_normalize_generation(item, item_index) for item_index, item in enumerate(generations)],
+        "generations": normalized_generations,
         "created_at": created_at,
         "updated_at": _timestamp(value.get("updated_at") or created_at),
     }

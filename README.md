@@ -35,6 +35,15 @@ Suggested file: docs/images/reference-modes.png
 
 The structured project document remains authoritative while a deterministic compiler builds the guide-compliant MiniMax prompt. Every result keeps its prompt, project state, routing, and executable workflow snapshot for inspection and replay.
 
+Completed renders also expose **Continue video**. Video Studio sends the final
+22 frames and their synchronized audio latents into the head of a new MiniMax H3
+sample, trims that repeated context after decoding, saves the newly generated
+segment independently, and losslessly assembles a new cumulative MP4. Every
+generation stores its own compact continuation tail. Parent generations are
+never overwritten, so any shorter version can still be played or used as the
+start of an alternate continuation. This path is implemented in this repository
+and does not require a motion-context or looping node pack.
+
 <!-- Screenshot slot: compiled prompt preview beside generation history and replay.
 Suggested file: docs/images/prompt-preview-and-replay.png
 ![Deterministic prompt preview and video replay history](docs/images/prompt-preview-and-replay.png)
@@ -81,6 +90,7 @@ The current vertical slice contains:
 - native ComfyUI MiniMax conditioning and latent creation;
 - lazy FL2VA/REF2VA model selection;
 - first-frame, last-frame, image, video, and audio reference loading;
+- dependency-free native H3 audiovisual motion-context continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
 - context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp or Ollama, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and

@@ -37,6 +37,23 @@ the user's production brief, selected `[PSV]` workflow, and immutable generation
 snapshots. Manual controls and AI Director patches operate on the same
 document; there is no separate simplified prompt state.
 
+Completed generations form an immutable lineage. A native continuation is a
+new child generation with its own segment-local document, compiled prompt,
+workflow snapshot, and raw segment output. Its parent remains unchanged. The
+parent lineage's raw segments are losslessly remuxed into a new cumulative MP4,
+allowing repeated continuation and branches while every shorter version stays
+playable.
+
+Video Studio instruments queued prompts without changing their durable workflow
+snapshots. Every render writes a compact 22-frame H3 video-latent tail together
+with the aligned audio-latent tail. An extension uses the FL2VA/base model and a
+T2VA prompt, places those parent condition latents on the first 22 frames of the
+new target timeline, and trims the repeated audiovisual head after decode. The
+new raw segment therefore starts immediately after its parent. A saved MP4 is
+decoded only as a compatibility fallback for generations created before latent
+capture existed. The runtime patch is guarded against incompatible third-party
+H3 patches and is owned entirely by this repository.
+
 The standalone right panel is a compact Shots navigator. Detailed shot setup
 and the ordered performance sequence live in a transactional popup editor. The
 compiler follows the step list exactly, allowing action, dialogue, subsequent

@@ -9,6 +9,8 @@ const PROJECTS_ENDPOINT = "/promptstudio-video/projects";
 const WORKFLOWS_ENDPOINT = "/promptstudio-video/workflows";
 const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
+const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
+const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
 const KOBOLD_STATUS_ENDPOINT = "/promptstudio-video/kobold/status";
 const KOBOLD_ABORT_ENDPOINT = "/promptstudio-video/kobold/abort";
 const DIRECTOR_JOB_POLL_MS = 1000;
@@ -33,6 +35,7 @@ const DIRECTOR_IMAGE_USAGES = Object.freeze([
 ]);
 const DISCONNECTED_GENERATION_GRACE_MS = 15 * 1000;
 const GENERATION_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+const CONTINUATION_CONTEXT_FRAMES = 22;
 const STUDIO_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 const PLACEHOLDERS = Object.freeze({
@@ -2339,6 +2342,166 @@ function outputUrl(reference) {
   return `/view?${params}`;
 }
 
+function outputDescriptor(reference) {
+  if (!reference?.filename) return null;
+  return {
+    filename: reference.filename,
+    subfolder: reference.subfolder || "",
+    type: reference.type || "output",
+  };
+}
+
+function continuationSourceOutput(generation) {
+  return outputDescriptor(generation?.segment_outputs?.[0] || generation?.outputs?.[0]);
+}
+
+function continuationLineageOutputs(generation) {
+  const current = continuationSourceOutput(generation);
+  if (!current) throw new Error("The selected generation has no saved video output to continue.");
+  if (generation?.kind !== "extension" && !generation?.parent_generation_id) return [current];
+  const savedSources = generation?.continuation?.source_segments;
+  if (!Array.isArray(savedSources) || !savedSources.length) {
+    throw new Error("This extension has no saved source-segment lineage.");
+  }
+  const lineage = savedSources.map(outputDescriptor);
+  if (lineage.some(output => !output)) {
+    throw new Error("A source segment in this continuation lineage is no longer available.");
+  }
+  return [...lineage, current];
+}
+
+function workflowSupportsMotionContext(snapshot, directorNodeId) {
+  const inputs = snapshot?.output?.[directorNodeId]?.inputs || {};
+  return Boolean(inputs.fl2va_model && inputs.video_vae && inputs.audio_vae);
+}
+
+function continuationLatentPath(projectId, generationId) {
+  const safe = value => String(value || "").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 100);
+  return `video/PromptStudio_Video/latents/${safe(projectId)}/${safe(generationId)}.safetensors`;
+}
+
+function nextPromptNodeId(output) {
+  return String(Math.max(0, ...Object.keys(output || {}).map(value => Number(value) || 0)) + 1);
+}
+
+function linkedPromptNode(output, reference, label) {
+  const id = Array.isArray(reference) ? String(reference[0]) : "";
+  const node = id ? output?.[id] : null;
+  if (!node) throw new Error(`The saved workflow has no connected ${label}.`);
+  return [id, node];
+}
+
+function instrumentGenerationSnapshot(snapshot, workflow, project, generationId, metadata) {
+  const output = snapshot?.output;
+  if (!output) throw new Error("The saved workflow has no executable prompt graph.");
+  const directorId = String(workflow.director_node_id || "");
+  const director = output[directorId];
+  if (!director || director.class_type !== DIRECTOR_TYPE) {
+    throw new Error("The saved workflow no longer contains its Prompt Studio Video Director.");
+  }
+  const isExtension = (metadata.kind || "base") === "extension";
+  if (!workflowSupportsMotionContext(snapshot, directorId)) {
+    if (isExtension) {
+      throw new Error("Video continuation requires connected MiniMax H3 FL2VA, video VAE, and audio VAE inputs.");
+    }
+    return "";
+  }
+
+  const samplerEntry = Object.entries(output).find(([, node]) => (
+    node?.class_type === "SamplerCustomAdvanced"
+    && Array.isArray(node.inputs?.latent_image)
+    && String(node.inputs.latent_image[0]) === directorId
+  ));
+  if (!samplerEntry) {
+    if (isExtension) {
+      throw new Error("The workflow must connect the Director latent directly to SamplerCustomAdvanced.");
+    }
+    return "";
+  }
+  const [samplerId, sampler] = samplerEntry;
+  let nextId = Number(nextPromptNodeId(output));
+  const allocate = () => {
+    while (output[String(nextId)]) nextId += 1;
+    return String(nextId++);
+  };
+  const contextPath = continuationLatentPath(project.id, generationId);
+  const saveContextId = allocate();
+  output[saveContextId] = {
+    inputs: {
+      latent: [String(samplerId), 0],
+      project_id: project.id,
+      generation_id: generationId,
+      context_frames: CONTINUATION_CONTEXT_FRAMES,
+    },
+    class_type: "PSV_H3SaveContext",
+    _meta: { title: "Prompt Studio Save H3 Context" },
+  };
+  if (!isExtension) return contextPath;
+
+  const [, guider] = linkedPromptNode(output, sampler.inputs?.guider, "sampler guider");
+  if (!Array.isArray(guider.inputs?.conditioning) || String(guider.inputs.conditioning[0]) !== directorId) {
+    throw new Error("The workflow must connect the Director conditioning directly to the sampler guider.");
+  }
+  const videoDecoderEntry = Object.entries(output).find(([, node]) => (
+    node?.class_type === "VAEDecode" && String(node.inputs?.samples?.[0]) === samplerId
+  ));
+  const audioDecoderEntry = Object.entries(output).find(([, node]) => (
+    node?.class_type === "VAEDecodeAudio" && String(node.inputs?.samples?.[0]) === samplerId
+  ));
+  if (!videoDecoderEntry || !audioDecoderEntry) {
+    throw new Error("The workflow must decode both video and audio directly from the H3 sampler output.");
+  }
+  const [videoDecoderId] = videoDecoderEntry;
+  const [audioDecoderId] = audioDecoderEntry;
+  const createVideoEntry = Object.entries(output).find(([, node]) => (
+    node?.class_type === "CreateVideo"
+    && String(node.inputs?.images?.[0]) === videoDecoderId
+    && String(node.inputs?.audio?.[0]) === audioDecoderId
+  ));
+  if (!createVideoEntry) throw new Error("The workflow must combine the decoded H3 video and audio in CreateVideo.");
+  const [, createVideo] = createVideoEntry;
+
+  if (isExtension) {
+    const continuation = metadata.continuation || {};
+    const contextId = allocate();
+    output[contextId] = {
+      inputs: {
+        conditioning: [directorId, 1],
+        latent: [directorId, 2],
+        video_vae: clone(director.inputs.video_vae),
+        audio_vae: clone(director.inputs.audio_vae),
+        context_latent_path: continuation.parent_context_latent_path || "",
+        context_video: continuation.source_video || "",
+        context_frames: CONTINUATION_CONTEXT_FRAMES,
+      },
+      class_type: "PSV_H3MotionContext",
+      _meta: { title: "Prompt Studio H3 Motion Context" },
+    };
+    guider.inputs.conditioning = [contextId, 0];
+    sampler.inputs.latent_image = [contextId, 1];
+
+    const trimId = allocate();
+    output[trimId] = {
+      inputs: {
+        images: [videoDecoderId, 0],
+        audio: [audioDecoderId, 0],
+        trim_frames: [contextId, 2],
+        fps: Number(createVideo.inputs.fps || 24),
+      },
+      class_type: "PSV_H3TrimContext",
+      _meta: { title: "Prompt Studio Trim H3 Context" },
+    };
+    createVideo.inputs.images = [trimId, 0];
+    createVideo.inputs.audio = [trimId, 1];
+    for (const node of Object.values(output)) {
+      if (node?.class_type === "SpectrumApplyMiniMaxH3" && "enabled" in (node.inputs || {})) {
+        node.inputs.enabled = false;
+      }
+    }
+  }
+  return contextPath;
+}
+
 function collectHistoryOutputs(historyItem, resultNodeIds = [], resultFields = []) {
   const outputs = [];
   const selected = new Set(resultNodeIds.map(String));
@@ -2482,6 +2645,34 @@ async function promptWorkerStopped() {
   return state.promptWorkerHealthRequest;
 }
 
+async function assembleContinuation(record, segmentOutputs) {
+  const { project, generation } = record;
+  const segment = outputDescriptor(segmentOutputs?.[0]);
+  const sources = generation.continuation?.source_segments || [];
+  if (!segment || !sources.length) throw new Error("Continuation assembly is missing its source segments.");
+  state.generationProgress.set(String(generation.prompt_id), { phase: "assembling" });
+  updateGeneration(generation.prompt_id, { segment_outputs: clone(segmentOutputs) });
+  setStatus("The extension is rendered. Assembling its cumulative video…", "working");
+  const response = await api.fetchApi(CONTINUATION_ASSEMBLE_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project_id: project.id,
+      generation_id: generation.id,
+      sources: [...sources, segment],
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.output) throw new Error(data.error || "The cumulative continuation could not be assembled.");
+  updateGeneration(generation.prompt_id, {
+    status: "complete",
+    outputs: [data.output],
+    segment_outputs: clone(segmentOutputs),
+    error: "",
+  });
+  setStatus("Video continuation completed and the cumulative version was saved.", "ready");
+}
+
 function pollGeneration(promptId) {
   const id = String(promptId || "");
   if (!id || state.generationPollers.has(id)) return;
@@ -2514,12 +2705,26 @@ function pollGeneration(promptId) {
             return;
           }
           if (item.status?.completed) {
-            updateGeneration(id, {
-              status: outputs.length ? "complete" : "error",
-              outputs,
-              error: outputs.length ? "" : "Generation completed without a saved video output.",
-            });
-            setStatus(outputs.length ? "Video generation completed." : "Generation completed without a saved video output.", outputs.length ? "ready" : "error");
+            if (outputs.length && record.generation.kind === "extension") {
+              try {
+                await assembleContinuation(record, outputs);
+              } catch (error) {
+                updateGeneration(id, {
+                  status: "error",
+                  outputs,
+                  segment_outputs: outputs,
+                  error: `The extension rendered, but cumulative assembly failed: ${error.message || error}`,
+                });
+                setStatus(`The extension rendered, but cumulative assembly failed: ${error.message || error}`, "error");
+              }
+            } else {
+              updateGeneration(id, {
+                status: outputs.length ? "complete" : "error",
+                outputs,
+                error: outputs.length ? "" : "Generation completed without a saved video output.",
+              });
+              setStatus(outputs.length ? "Video generation completed." : "Generation completed without a saved video output.", outputs.length ? "ready" : "error");
+            }
             stopGenerationPolling(id);
             renderAll();
             return;
@@ -2541,11 +2746,17 @@ function pollGeneration(promptId) {
 }
 
 async function queueSnapshot(project, workflow, snapshot, metadata) {
-  const queued = await api.queuePrompt(-1, snapshot);
+  const generationId = makeId("generation");
+  const savedSnapshot = clone(snapshot);
+  const queuedSnapshot = clone(snapshot);
+  const contextLatentPath = instrumentGenerationSnapshot(
+    queuedSnapshot, workflow, project, generationId, metadata,
+  );
+  const queued = await api.queuePrompt(-1, queuedSnapshot);
   const promptId = queued?.prompt_id;
   if (!promptId) throw new Error("ComfyUI did not return a prompt ID.");
   const generation = {
-    id: makeId("generation"),
+    id: generationId,
     prompt_id: String(promptId),
     status: "queued",
     error: "",
@@ -2556,10 +2767,18 @@ async function queueSnapshot(project, workflow, snapshot, metadata) {
     effective_duration: metadata.effective_duration,
     workflow_id: workflow.id,
     workflow_name: workflow.name,
-    workflow_snapshot: clone(snapshot),
+    workflow_snapshot: savedSnapshot,
+    context_latent_path: contextLatentPath,
     result_node_ids: clone(workflow.result_node_ids),
     result_fields: clone(workflow.result_fields),
     outputs: [],
+    segment_outputs: [],
+    kind: metadata.kind || "base",
+    parent_generation_id: metadata.parent_generation_id || "",
+    root_generation_id: metadata.root_generation_id || generationId,
+    depth: Math.max(0, Number(metadata.depth || 0)),
+    total_effective_duration: Number(metadata.total_effective_duration || metadata.effective_duration || 0),
+    ...(metadata.continuation ? { continuation: clone(metadata.continuation) } : {}),
     created_at: Date.now(),
     updated_at: Date.now(),
   };
@@ -2631,10 +2850,148 @@ async function replayGeneration(generation) {
       resolved_mode: generation.resolved_mode,
       frame_count: generation.frame_count,
       effective_duration: generation.effective_duration,
+      kind: generation.kind,
+      parent_generation_id: generation.parent_generation_id,
+      root_generation_id: generation.root_generation_id,
+      depth: generation.depth,
+      total_effective_duration: generation.total_effective_duration,
+      continuation: generation.continuation,
     });
   } catch (error) {
     setStatus(error.message || String(error), "error");
   }
+}
+
+function savedGenerationWorkflow(generation) {
+  const snapshot = clone(generation.workflow_snapshot);
+  const director = Object.entries(snapshot?.output || {}).find(([, node]) => node?.class_type === DIRECTOR_TYPE);
+  if (!director) throw new Error("The saved generation workflow has no Prompt Studio Video Director.");
+  if (!workflowSupportsMotionContext(snapshot, director[0])) {
+    throw new Error("This saved workflow has no connected MiniMax H3 FL2VA model and audiovisual VAEs for continuation.");
+  }
+  return {
+    workflow: {
+      id: generation.workflow_id,
+      name: generation.workflow_name,
+      director_node_id: String(director[0]),
+      result_node_ids: clone(generation.result_node_ids || []),
+      result_fields: clone(generation.result_fields || []),
+    },
+    snapshot,
+  };
+}
+
+async function queueContinuation(project, parent, brief, durationSeconds, dialog, submit) {
+  const source = continuationSourceOutput(parent);
+  if (!source) throw new Error("The selected generation has no saved video output to continue.");
+  const lineage = continuationLineageOutputs(parent);
+  const { workflow, snapshot } = savedGenerationWorkflow(parent);
+  submit.disabled = true;
+  setStatus("Preparing the native MiniMax continuation prompt…", "working");
+  try {
+    const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        document: parent.document,
+        source,
+        brief,
+        duration_seconds: durationSeconds,
+        context_frames: CONTINUATION_CONTEXT_FRAMES,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The continuation prompt could not be prepared.");
+    const director = snapshot.output?.[workflow.director_node_id];
+    director.inputs ||= {};
+    director.inputs.document_json = JSON.stringify(data.document);
+    randomizeSnapshotSeeds(snapshot);
+    await queueSnapshot(project, workflow, snapshot, {
+      ...data,
+      kind: "extension",
+      parent_generation_id: parent.id,
+      root_generation_id: parent.root_generation_id || parent.id,
+      depth: Number(parent.depth || 0) + 1,
+      total_effective_duration: Number(parent.total_effective_duration || parent.effective_duration || 0)
+        + Number(data.effective_duration || 0),
+      continuation: {
+        ...data.continuation,
+        source_generation_id: parent.id,
+        source_segments: lineage,
+        parent_context_latent_path: parent.context_latent_path
+          || continuationLatentPath(project.id, parent.id),
+        brief,
+      },
+    });
+    dialog.close();
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+function showContinueVideo(generation) {
+  const project = activeProject();
+  if (!project || generation.status !== "complete" || !continuationSourceOutput(generation)) return;
+  const dialog = el("dialog", "psvstudio-continuation-dialog");
+  const heading = el("div", "psvstudio-continuation-heading");
+  heading.append(
+    el("h2", "", "Continue video"),
+    el("small", "", `Extend this ${Number(generation.total_effective_duration || generation.effective_duration || 0).toFixed(2)}s version using its final ${CONTINUATION_CONTEXT_FRAMES} audiovisual frames.`),
+  );
+  let brief = "Continue the action naturally from the exact ending, preserving the established subjects, environment, camera motion, lighting, and sound.";
+  let duration = 5;
+  const body = el("div", "psvstudio-continuation-body");
+  const briefInput = textArea(brief, value => { brief = value; }, 7, "Describe only what should happen next.");
+  const durationInput = textInput(duration, value => { duration = value; }, "number");
+  durationInput.min = "5";
+  durationInput.max = "15";
+  durationInput.step = "0.1";
+  body.append(
+    field("What happens next?", briefInput, "The continuation starts from the selected render's actual ending. Describe new action rather than repeating the previous video."),
+    field("Added duration (seconds)", durationInput, "MiniMax snaps the result to its native frame grid."),
+    el("div", "psvstudio-continuation-note", "Native H3 motion context · 22 pinned audiovisual frames · repeated context trimmed before saving"),
+  );
+  const footer = el("footer", "psvstudio-continuation-actions");
+  const cancel = button("Cancel", () => dialog.close());
+  const submit = button("Generate extension", async () => {
+    try {
+      if (!brief.trim()) throw new Error("Describe what should happen in the extension.");
+      if (!Number.isFinite(duration) || duration < 5 || duration > 15) {
+        throw new Error("Continuation duration must be between 5 and 15 seconds.");
+      }
+      await queueContinuation(project, generation, brief.trim(), duration, dialog, submit);
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    }
+  }, "psvstudio-button psvstudio-button-primary");
+  footer.append(cancel, submit);
+  dialog.append(heading, body, footer);
+  dialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    if (!submit.disabled) dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.showModal();
+  briefInput.focus();
+  briefInput.select();
+}
+
+function showGenerationOutput(output, title) {
+  const dialog = el("dialog", "psvstudio-media-preview-dialog");
+  const header = el("header", "psvstudio-media-preview-header");
+  header.append(el("h2", "", title), button("Close", () => dialog.close()));
+  const body = el("div", "psvstudio-media-preview-body");
+  const video = document.createElement("video");
+  video.src = outputUrl(output);
+  video.controls = true;
+  video.preload = "metadata";
+  enforceSingleVideoPlayback(video);
+  body.append(video);
+  dialog.append(header, body);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.showModal();
 }
 
 function renderProjectList() {
@@ -4124,12 +4481,16 @@ function renderGenerations() {
     }
     const body = el("div", "psvstudio-generation-body");
     const head = el("div", "psvstudio-generation-head");
+    const isExtension = generation.kind === "extension" || Boolean(generation.parent_generation_id);
     head.append(
-      el("strong", "", generation.workflow_name || "Video workflow"),
+      el("strong", "", `${generation.workflow_name || "Video workflow"}${isExtension ? ` · Extension ${Number(generation.depth || 1)}` : ""}`),
       el("span", "psvstudio-status-chip", generation.status),
     );
     head.lastElementChild.dataset.status = generation.status;
     body.append(head, el("small", "psvstudio-help", `${String(generation.resolved_mode || "").toUpperCase()} · ${Number(generation.effective_duration || 0).toFixed(2)}s · ${generation.frame_count || 0} frames`));
+    if (isExtension) {
+      body.append(el("small", "psvstudio-help", `Continuation ${Number(generation.depth || 1)} · ${Number(generation.total_effective_duration || generation.effective_duration || 0).toFixed(2)}s cumulative duration`));
+    }
     if (["queued", "generating"].includes(generation.status)) {
       const progress = state.generationProgress.get(String(generation.prompt_id)) || {};
       const percent = Number.isFinite(progress.value) && Number.isFinite(progress.max) && progress.max > 0
@@ -4140,6 +4501,7 @@ function renderGenerations() {
       fill.style.setProperty("--progress", `${percent}%`);
       bar.append(fill);
       body.append(bar);
+      if (progress.phase === "assembling") body.append(el("small", "psvstudio-help", "Extension rendered · assembling the cumulative version…"));
     }
     if (generation.error) body.append(el("div", "psvstudio-help", generation.error));
     const actions = el("div", "psvstudio-inline");
@@ -4155,6 +4517,12 @@ function renderGenerations() {
       loop.setAttribute("aria-pressed", String(video.loop));
       loop.title = "Toggle continuous playback for this video";
       actions.append(loop);
+    }
+    if (generation.status === "complete" && output && generation.document && generation.workflow_snapshot) {
+      actions.append(button("Continue video", () => showContinueVideo(generation), "psvstudio-button psvstudio-button-primary"));
+    }
+    if (isExtension && generation.segment_outputs?.[0]) {
+      actions.append(button("View extension", () => showGenerationOutput(generation.segment_outputs[0], `Extension ${Number(generation.depth || 1)} segment`)));
     }
     actions.append(button("Replay exact", () => replayGeneration(generation)));
     if (generation.compiled_prompt) actions.append(button("View prompt", () => showCompiledPrompt(generation.compiled_prompt)));

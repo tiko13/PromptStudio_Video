@@ -97,6 +97,16 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("steps array is its only writable performance sequence", system_message)
             self.assertIn("Never emit the legacy action or dialogue mirror fields", system_message)
 
+    def test_both_directors_make_concurrency_and_sync_explicit(self):
+        for system_message in (SHOT_SYSTEM_MESSAGE, PROJECT_SYSTEM_MESSAGE):
+            self.assertIn("TEMPORAL INTENT, CONCURRENCY, AND SYNCHRONIZATION", system_message)
+            self.assertIn("She smiles throughout the wave", system_message)
+            self.assertIn("Do not split concurrent behaviors into adjacent action steps", system_message)
+            self.assertIn("Dialogue and singing are timeline events, not pauses in the visuals", system_message)
+            self.assertIn("Every synchronized sounds item must identify its audible source", system_message)
+            self.assertIn("Do not rely on the sounds array's position to imply timing", system_message)
+            self.assertIn("Use relative synchronization cues rather than per-event timestamps", system_message)
+
     def test_document_fingerprint_ignores_cached_vision_grounding(self):
         document = normalize_document({
             **director_document(),

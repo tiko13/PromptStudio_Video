@@ -11,6 +11,16 @@ from aiohttp import web
 from server import PromptServer
 
 from .video.compiler import compile_prompt
+from .video.continuation import (
+    CONTINUATION_CONTEXT_FRAMES,
+    CONTINUATION_CONTEXT_SECONDS,
+    annotated_output_path,
+    assemble_generation_outputs,
+    build_continuation_document,
+    continuation_frame_plan,
+    probe_video,
+    resolve_output_path,
+)
 from .video.contracts import (
     ANCHOR_ROLES,
     AUDIO_RETENTION,
@@ -57,9 +67,11 @@ MAX_DOCUMENT_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_PROJECT_REQUEST_BYTES = 100 * 1024 * 1024
 MAX_WORKFLOW_REQUEST_BYTES = 100 * 1024 * 1024
 MAX_DIRECTOR_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_CONTINUATION_REQUEST_BYTES = 256 * 1024
 PROJECT_LOCK = asyncio.Lock()
 WORKFLOW_LOCK = asyncio.Lock()
 DIRECTOR_LLM_LOCK = asyncio.Lock()
+CONTINUATION_ASSEMBLY_LOCK = asyncio.Lock()
 DIRECTOR_JOBS = {}
 DIRECTOR_TASKS = set()
 MAX_DIRECTOR_JOBS = 32
@@ -82,6 +94,8 @@ CAPABILITY = {
         "director_vision_attachments",
         "kobold_control",
         "studio_image_handoff",
+        "native_video_continuation",
+        "native_h3_motion_context",
     ],
     "standalone_page": "/extensions/PromptStudio_Video/prompt_studio_video.html",
 }
@@ -323,6 +337,72 @@ async def promptstudio_video_compile(request):
         return web.json_response({"valid": False, "error": str(exc), "code": "invalid_document"}, status=400)
 
 
+async def promptstudio_video_continuation_prepare(request):
+    try:
+        if request.content_length is not None and request.content_length > MAX_CONTINUATION_REQUEST_BYTES:
+            raise ValueError("Continuation request exceeds the 256 KB limit")
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        source_path, source = await asyncio.to_thread(resolve_output_path, data.get("source"))
+        source_info = await asyncio.to_thread(probe_video, source_path)
+        timing = continuation_frame_plan(
+            data.get("duration_seconds", 5),
+            data.get("context_frames", CONTINUATION_CONTEXT_FRAMES),
+        )
+        document = build_continuation_document(
+            data.get("document"),
+            data.get("brief"),
+            data.get("duration_seconds", 5),
+            timing["context_frames"],
+        )
+        response = _document_response(document, include_prompt=True)
+        # The Director/sampler renders the context-prefixed sample duration.
+        # Video Studio presents and accounts for only the newly generated tail.
+        response["sample_frame_count"] = response["frame_count"]
+        response["sample_effective_duration"] = response["effective_duration"]
+        response["frame_count"] = timing["delivered_frames"]
+        response["effective_duration"] = timing["delivered_duration"]
+        response["continuation"] = {
+            "engine": "native_h3_motion_context",
+            "context_frames": CONTINUATION_CONTEXT_FRAMES,
+            "context_seconds": CONTINUATION_CONTEXT_SECONDS,
+            "trim_frames": CONTINUATION_CONTEXT_FRAMES,
+            "source_video": annotated_output_path(source),
+            "source_duration": source_info["duration"],
+            "source_has_audio": source_info["has_audio"],
+        }
+        return web.json_response(response)
+    except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"valid": False, "error": str(exc), "code": "invalid_continuation"}, status=400)
+    except Exception as exc:
+        return web.json_response({"valid": False, "error": str(exc), "code": "continuation_failed"}, status=500)
+
+
+async def promptstudio_video_continuation_assemble(request):
+    try:
+        if request.content_length is not None and request.content_length > MAX_CONTINUATION_REQUEST_BYTES:
+            raise ValueError("Continuation assembly request exceeds the 256 KB limit")
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        sources = data.get("sources")
+        if not isinstance(sources, list):
+            raise ValueError("Continuation assembly sources must be a list")
+        async with CONTINUATION_ASSEMBLY_LOCK:
+            output = await asyncio.to_thread(
+                assemble_generation_outputs,
+                sources,
+                data.get("project_id"),
+                data.get("generation_id"),
+            )
+        return web.json_response({"ok": True, "output": output})
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "invalid_assembly"}, status=400)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "assembly_failed"}, status=500)
+
+
 async def promptstudio_video_projects_get(_request):
     try:
         async with PROJECT_LOCK:
@@ -520,6 +600,8 @@ def register_routes():
     routes.get("/promptstudio-video/runtime-health")(promptstudio_video_runtime_health)
     routes.post("/promptstudio-video/document/validate")(promptstudio_video_validate)
     routes.post("/promptstudio-video/document/compile")(promptstudio_video_compile)
+    routes.post("/promptstudio-video/continuations/prepare")(promptstudio_video_continuation_prepare)
+    routes.post("/promptstudio-video/continuations/assemble")(promptstudio_video_continuation_assemble)
     routes.get("/promptstudio-video/projects")(promptstudio_video_projects_get)
     routes.put("/promptstudio-video/projects")(promptstudio_video_projects_put)
     routes.get("/promptstudio-video/workflows")(promptstudio_video_workflows_get)

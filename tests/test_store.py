@@ -154,6 +154,70 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["workflow_snapshot"], generation["workflow_snapshot"])
             self.assertEqual(restored["outputs"][0]["filename"], "video.mp4")
 
+    def test_generation_continuation_lineage_is_normalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "projects.json")
+            document = default_document()
+            base = {
+                "id": "generation-base", "prompt_id": "prompt-base", "status": "complete",
+                "document": document, "outputs": [{"filename": "base.mp4", "type": "output"}],
+                "effective_duration": 5.17, "created_at": 1, "updated_at": 1,
+            }
+            extension = {
+                "id": "generation-extension", "prompt_id": "prompt-extension", "status": "complete",
+                "kind": "extension", "parent_generation_id": "generation-base",
+                "document": document, "outputs": [{"filename": "cumulative.mp4", "type": "output"}],
+                "segment_outputs": [{"filename": "segment.mp4", "type": "output"}],
+                "effective_duration": 5.17, "total_effective_duration": 10.34,
+                "context_latent_path": "video/PromptStudio_Video/latents/project-1/generation-extension.safetensors",
+                "continuation": {"engine": "native_h3_motion_context", "context_frames": 22},
+                "created_at": 2, "updated_at": 2,
+            }
+            update_project_store(path, {
+                "version": 2, "revision": 0, "active_project_id": "project-1",
+                "projects": [{
+                    "id": "project-1", "name": "Continuation", "brief": "", "document": document,
+                    "workflow_id": "", "generations": [extension, base], "created_at": 1, "updated_at": 2,
+                }],
+            })
+
+            generations = read_project_store(path)["projects"][0]["generations"]
+            restored_extension = next(item for item in generations if item["id"] == "generation-extension")
+            self.assertEqual(restored_extension["root_generation_id"], "generation-base")
+            self.assertEqual(restored_extension["depth"], 1)
+            self.assertEqual(restored_extension["kind"], "extension")
+            self.assertEqual(restored_extension["segment_outputs"][0]["filename"], "segment.mp4")
+            self.assertTrue(restored_extension["context_latent_path"].endswith(".safetensors"))
+
+    def test_pruned_continuation_parent_preserves_saved_lineage_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "projects.json")
+            document = default_document()
+            extension = {
+                "id": "generation-late", "prompt_id": "prompt-late", "status": "complete",
+                "kind": "extension", "parent_generation_id": "generation-pruned",
+                "root_generation_id": "generation-original", "depth": 27,
+                "document": document, "outputs": [{"filename": "cumulative.mp4", "type": "output"}],
+                "segment_outputs": [{"filename": "segment.mp4", "type": "output"}],
+                "continuation": {
+                    "source_segments": [{"filename": "base.mp4", "type": "output"}],
+                },
+                "created_at": 27, "updated_at": 27,
+            }
+            update_project_store(path, {
+                "version": 2, "revision": 0, "active_project_id": "project-1",
+                "projects": [{
+                    "id": "project-1", "name": "Long continuation", "brief": "",
+                    "document": document, "workflow_id": "", "generations": [extension],
+                    "created_at": 1, "updated_at": 27,
+                }],
+            })
+
+            restored = read_project_store(path)["projects"][0]["generations"][0]
+            self.assertEqual(restored["root_generation_id"], "generation-original")
+            self.assertEqual(restored["depth"], 27)
+            self.assertEqual(restored["kind"], "extension")
+
     def test_workflow_store_requires_director_and_result(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "workflows.json")
