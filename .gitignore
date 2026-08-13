@@ -2,11 +2,49 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+coverage.xml
+htmlcov/
+
+# Local environments and dependency caches
+.venv/
+venv/
+env/
+.python-version
+node_modules/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime project, media, and workflow state
 promptstudio_video_projects.json
 promptstudio_video_projects.json.bak
 promptstudio_video_projects/
 promptstudio_video_workflows.json
 promptstudio_video_workflows.json.bak
+
+# Build and editor state
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+.agents/
+.codex/
+.ruff_cache/
+.mypy_cache/
+
+# Temporary files and operating-system metadata
 *.tmp
 *.log
 .DS_Store
