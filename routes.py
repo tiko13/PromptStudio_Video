@@ -96,6 +96,7 @@ CAPABILITY = {
         "studio_image_handoff",
         "native_video_continuation",
         "native_h3_motion_context",
+        "unified_studio_shell",
     ],
     "standalone_page": "/extensions/PromptStudio_Video/prompt_studio_video.html",
 }
@@ -469,7 +470,7 @@ def _prune_director_jobs():
         (
             (job_id, job)
             for job_id, job in DIRECTOR_JOBS.items()
-            if job["status"] in {"complete", "failed"}
+            if job["status"] in {"complete", "failed", "cancelled"}
         ),
         key=lambda item: item[1].get("finished_at", item[1]["created_at"]),
     )
@@ -485,20 +486,36 @@ async def _run_director_job(job_id, data):
 
     try:
         async with DIRECTOR_LLM_LOCK:
+            if job.get("cancelled"):
+                raise asyncio.CancelledError()
             job["status"] = "running"
             job["started_at"] = time.time()
-            job["result"] = await asyncio.to_thread(director_chat, data, update_progress)
-        job["status"] = "complete"
+            result = await asyncio.to_thread(director_chat, data, update_progress)
+        if not job.get("cancelled"):
+            job["result"] = result
+            job["status"] = "complete"
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
     except Exception as exc:
-        job["status"] = "failed"
-        job["error"] = str(exc) or exc.__class__.__name__
+        if not job.get("cancelled"):
+            job["status"] = "failed"
+            job["error"] = str(exc) or exc.__class__.__name__
     finally:
         job["finished_at"] = time.time()
 
 
 def _start_director_job(data):
+    requested_job_id = str(data.get("job_id") or "").strip()
+    if requested_job_id:
+        if len(requested_job_id) > 128 or not all(
+            character.isascii() and (character.isalnum() or character == "-")
+            for character in requested_job_id
+        ):
+            raise ValueError("Director job ID is invalid")
+        if requested_job_id in DIRECTOR_JOBS:
+            return requested_job_id
     _prune_director_jobs()
-    job_id = str(uuid.uuid4())
+    job_id = requested_job_id or str(uuid.uuid4())
     DIRECTOR_JOBS[job_id] = {
         "status": "queued",
         "created_at": time.time(),
@@ -508,9 +525,29 @@ def _start_director_job(data):
         },
     }
     task = asyncio.create_task(_run_director_job(job_id, data))
+    DIRECTOR_JOBS[job_id]["task"] = task
     DIRECTOR_TASKS.add(task)
     task.add_done_callback(DIRECTOR_TASKS.discard)
     return job_id
+
+
+async def _cancel_director_job(job_id):
+    job = DIRECTOR_JOBS.get(job_id)
+    if job is None:
+        raise ValueError("Director job was not found")
+    previous_status = job.get("status", "queued")
+    job["cancelled"] = True
+    job["status"] = "cancelled"
+    job["finished_at"] = time.time()
+    task = job.get("task")
+    if previous_status == "queued" and task and not task.done():
+        task.cancel()
+    if previous_status == "running" and str(job.get("provider_settings", {}).get("llm_provider") or "koboldcpp").casefold() == "koboldcpp":
+        try:
+            await asyncio.to_thread(abort_generation, job["provider_settings"])
+        except Exception:
+            pass
+    return {"job_id": job_id, "status": "cancelled"}
 
 
 async def promptstudio_video_director_chat(request):
@@ -549,9 +586,16 @@ async def promptstudio_video_director_status(request):
             }
     elif job["status"] == "complete":
         response["result"] = job.get("result")
-    elif job["status"] == "failed":
+    elif job["status"] in {"failed", "cancelled"}:
         response["error"] = job.get("error") or "Director request failed"
     return web.json_response(response)
+
+
+async def promptstudio_video_director_cancel(request):
+    try:
+        return web.json_response(await _cancel_director_job(request.match_info.get("job_id", "")))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=404)
 
 
 async def promptstudio_video_director_preview(request):
@@ -608,6 +652,7 @@ def register_routes():
     routes.put("/promptstudio-video/workflows")(promptstudio_video_workflows_put)
     routes.post("/promptstudio-video/director/chat")(promptstudio_video_director_chat)
     routes.get("/promptstudio-video/director/chat/{job_id}")(promptstudio_video_director_status)
+    routes.post("/promptstudio-video/director/chat/{job_id}/cancel")(promptstudio_video_director_cancel)
     routes.post("/promptstudio-video/director/preview")(promptstudio_video_director_preview)
     routes.post("/promptstudio-video/kobold/status")(promptstudio_video_kobold_status)
     routes.post("/promptstudio-video/kobold/abort")(promptstudio_video_kobold_abort)

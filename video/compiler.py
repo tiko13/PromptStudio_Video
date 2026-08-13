@@ -79,8 +79,42 @@ def _camera_sentence(camera):
     return _sentence(phrase)
 
 
-def _dialogue_text(event):
+GENERIC_ONSCREEN_SPEAKER_RE = re.compile(
+    r"^(?:the\s+)?(?:speaker|subject|character|person|woman|young\s+woman|girl|"
+    r"man|young\s+man|boy|she|he|they)$",
+    re.IGNORECASE,
+)
+
+
+def _first_frame_speaker_anchor(document):
+    """Identify an unambiguous S1 speaker directly from a base-mode keyframe."""
+    reference = next(
+        (
+            item for item in document.get("references") or []
+            if item.get("kind") == "image"
+            and "first_frame" in set(item.get("roles") or [])
+        ),
+        None,
+    )
+    candidates = (reference or {}).get("subject_candidates") or []
+    if len(candidates) != 1:
+        return ""
+    name = str(candidates[0].get("name") or "").strip().rstrip(" .")
+    name = re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.IGNORECASE)
+    source = str(reference.get("label") or "<Picture 1>").strip()
+    return f"The {name} shown in {source}" if name and source else ""
+
+
+def _dialogue_text(event, *, speaker_anchor=""):
     speaker = event["speaker"]
+    if (
+        speaker_anchor
+        and event.get("speaker_id") == "S1"
+        and not event.get("voiceover")
+        and not event.get("offscreen")
+        and GENERIC_ONSCREEN_SPEAKER_RE.fullmatch(str(speaker or "").strip())
+    ):
+        speaker = speaker_anchor
     speaker_id = event["speaker_id"]
     delivery = f" {event['delivery']}" if event.get("delivery") else ""
     dialogue = event["text"]
@@ -99,9 +133,9 @@ def _dialogue_text(event):
     return _sentence(f"{speaker} ({speaker_id}) {verb}{location}{delivery}: {block}")
 
 
-def _step_text(step):
+def _step_text(step, *, speaker_anchor=""):
     if step.get("type") == "dialogue":
-        return _dialogue_text(step) if step.get("text") else ""
+        return _dialogue_text(step, speaker_anchor=speaker_anchor) if step.get("text") else ""
     if step.get("type") == "action" and step.get("text"):
         return _sentence(_canonical_tokens(step["text"]))
     return ""
@@ -115,7 +149,9 @@ def _shot_text(
     first_frame_lock=False,
     first_frame_token="<Picture 1>",
     reference_scope="",
+    first_frame_preserve_style=True,
     suppress_audio=False,
+    speaker_anchor="",
 ):
     if index == 0:
         prefix = "[Shot 1]"
@@ -126,9 +162,13 @@ def _shot_text(
         prefix = f"[Shot {index + 1}] At {_cut_time(shot['start'])}, {_sentence(transition, capitalize=False)}"
     parts = []
     if first_frame_lock and index == 0:
+        preserved = (
+            "style, subjects, composition, scene, lighting, clothing, colors, key objects, and spatial relationships"
+            if first_frame_preserve_style
+            else "subjects, composition, scene, lighting, clothing, colors, key objects, and spatial relationships"
+        )
         parts.append(_sentence(
-            "The style, subjects, composition, scene, lighting, clothing, colors, key objects, and spatial "
-            f"relationships established by {first_frame_token} remain fully preserved"
+            f"The {preserved} established by {first_frame_token} remain fully preserved"
         ))
         if reference_scope:
             parts.append(_sentence(reference_scope))
@@ -144,7 +184,7 @@ def _shot_text(
     if camera:
         parts.append(camera)
     parts.extend(
-        _step_text(step) for step in shot.get("steps") or []
+        _step_text(step, speaker_anchor=speaker_anchor) for step in shot.get("steps") or []
         if not suppress_audio or step.get("type") != "dialogue"
     )
     for visible in shot.get("visible_text") or []:
@@ -176,6 +216,7 @@ def _base_alignment(mode, final_shot, duration):
 def _compile_base(document):
     mode = document["resolved_mode"]
     duration = effective_duration(document)
+    speaker_anchor = _first_frame_speaker_anchor(document)
     shots = " ".join(
         _shot_text(
             shot,
@@ -183,6 +224,7 @@ def _compile_base(document):
             include_style=document["style"] if index == 0 and mode not in {"i2va", "fl2va"} else "",
             first_frame_lock=mode in {"i2va", "fl2va"},
             suppress_audio=document["complete_silence"],
+            speaker_anchor=speaker_anchor,
         )
         for index, shot in enumerate(document["shots"])
     )
@@ -267,6 +309,26 @@ def _compile_reference(document):
     summary = _canonical_tokens(f"[{' + '.join(task_types)}] {document['summary']}".rstrip())
     retention = "\n".join(_retention_lines(document))
     first_frame_token, reference_scope = _first_frame_reference_scope(document)
+    external_style_tokens = []
+    for reference in document.get("references") or []:
+        if "style" not in set(reference.get("roles") or []):
+            continue
+        source_token = str(reference.get("label") or "").strip()
+        definition = next(
+            (
+                item for item in document.get("subject_definitions") or []
+                if source_token.casefold() in str(item.get("text") or "").casefold()
+            ),
+            None,
+        )
+        if definition:
+            external_style_tokens.append(f"<{str(definition.get('label') or '').strip('<>')}>")
+    external_style_tokens = list(dict.fromkeys(token for token in external_style_tokens if token != "<>"))
+    if external_style_tokens:
+        style_scope = "The visual treatment throughout the target video follows " + " and ".join(
+            external_style_tokens
+        ) + "."
+        reference_scope = " ".join(part for part in (reference_scope, style_scope) if part)
     shots = " ".join(
         _shot_text(
             shot,
@@ -277,6 +339,7 @@ def _compile_reference(document):
             )),
             first_frame_token=first_frame_token or "<Picture 1>",
             reference_scope=reference_scope if index == 0 else "",
+            first_frame_preserve_style=not external_style_tokens,
             suppress_audio=document["complete_silence"],
         )
         for index, shot in enumerate(document["shots"])
@@ -408,7 +471,12 @@ def _reference_semantic_issues(document):
         "first_frame" in reference.get("roles", [])
         for reference in document.get("references") or []
     )
-    detailed_parts = [] if has_first_frame else [document["style"]]
+    has_external_style = any(
+        "style" in set(reference.get("roles") or [])
+        and "first_frame" not in set(reference.get("roles") or [])
+        for reference in document.get("references") or []
+    )
+    detailed_parts = [document["style"]] if (not has_first_frame or has_external_style) else []
     detailed_parts.extend(
         reference.get("label", "")
         for reference in document.get("references") or []

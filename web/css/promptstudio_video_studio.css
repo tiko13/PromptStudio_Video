@@ -82,7 +82,14 @@ button { color: inherit; }
 .psvstudio-brand div { display: grid; line-height: 1.2; }
 .psvstudio-brand strong { font-size: 15px; }
 .psvstudio-brand small, .psvstudio-help { color: var(--psv-muted); font-size: 11px; line-height: 1.45; }
+.psvstudio-inspector-brand { justify-content: flex-start; }
+.psvstudio-inspector-brand > div:nth-child(2) { min-width: 0; }
+.psvstudio-studio-switch { flex: 0 0 auto; display: inline-grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 116px; padding: 3px; background: rgba(255, 255, 255, .045); border: 1px solid var(--psv-border); border-radius: 11px; }
+.psvstudio-studio-switch button { min-height: 28px; padding: 0 9px; color: var(--psv-muted); background: transparent; border: 0; border-radius: 8px; font-size: 10px; font-weight: 750; cursor: pointer; }
+.psvstudio-studio-switch button[aria-pressed="true"] { color: #fff; background: var(--psv-accent); }
+.psvstudio-mobile-studio-switch { display: none; }
 .psvstudio-sidebar-header, .psvstudio-inspector-header { justify-content: space-between; padding: 12px 14px; }
+.psvstudio-sidebar > .psvstudio-sidebar-header { min-height: 66px; border-bottom: 1px solid var(--psv-border); background: rgba(16, 18, 26, .84); backdrop-filter: blur(20px); }
 .psvstudio-sidebar-header h2, .psvstudio-inspector-header h2 { margin: 0; font-size: 13px; }
 
 .psvstudio-button {
@@ -104,6 +111,30 @@ button { color: inherit; }
 .psvstudio-button-danger:not(:disabled) { color: var(--psv-error); border-color: rgba(255, 133, 142, .3); }
 .psvstudio-icon-button { display: grid; place-items: center; width: 36px; padding: 0; font-size: 17px; }
 #psvstudio-mobile-projects, #psvstudio-mobile-inspector, #psvstudio-close-inspector { display: none; }
+
+.psvstudio-studio-settings { position: absolute; z-index: 100; top: 78px; right: 18px; bottom: 18px; left: 18px; display: flex; flex-direction: column; overflow-y: auto; background: rgba(20, 22, 31, .98); border: 1px solid rgba(169, 145, 255, .26); border-radius: 13px; box-shadow: 0 18px 55px rgba(0, 0, 0, .58); backdrop-filter: blur(18px); }
+.psvstudio-studio-settings[hidden] { display: none; }
+.psvstudio-studio-settings-header { position: sticky; z-index: 2; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 20px; min-height: 78px; padding: 16px 22px; background: rgba(20, 22, 31, .94); border-bottom: 1px solid var(--psv-border); backdrop-filter: blur(18px); }
+.psvstudio-studio-settings-header > div, .psvstudio-studio-setting-copy { display: grid; gap: 3px; }
+.psvstudio-studio-settings-header strong { font-size: 16px; line-height: 1.2; }
+.psvstudio-studio-settings-header > div > span, .psvstudio-studio-setting-copy small { color: var(--psv-muted); font-size: 11px; font-weight: 500; }
+.psvstudio-studio-settings-context { flex: 0 0 auto; padding: 5px 9px; color: var(--psv-accent-strong); background: rgba(141, 115, 255, .1); border: 1px solid rgba(141, 115, 255, .2); border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.psvstudio-studio-settings-layout { width: min(680px, 100%); margin: 0 auto; padding: 22px; }
+.psvstudio-studio-settings-card { background: rgba(16, 18, 26, .72); border: 1px solid var(--psv-border); border-radius: 12px; box-shadow: 0 10px 28px rgba(0, 0, 0, .14); }
+.psvstudio-studio-settings-card-header { padding: 15px 17px 13px; background: rgba(255, 255, 255, .018); border-bottom: 1px solid var(--psv-border); }
+.psvstudio-studio-settings-card-header strong { font-size: 13px; }
+.psvstudio-studio-setting { display: flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 78px; padding: 14px 17px; }
+.psvstudio-studio-setting-copy { min-width: 0; }
+.psvstudio-studio-setting-title { display: flex; align-items: center; gap: 7px; }
+.psvstudio-studio-setting-toggle > input[role="switch"] { position: relative; flex: 0 0 auto; width: 42px; height: 24px; margin: 0; appearance: none; background: rgba(255, 255, 255, .09); border: 1px solid var(--psv-border); border-radius: 999px; cursor: pointer; transition: background 120ms ease, border-color 120ms ease; }
+.psvstudio-studio-setting-toggle > input[role="switch"]::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; background: var(--psv-muted); border-radius: 50%; transition: transform 120ms ease, background 120ms ease; }
+.psvstudio-studio-setting-toggle > input[role="switch"]:checked { background: rgba(141, 115, 255, .42); border-color: var(--psv-accent); }
+.psvstudio-studio-setting-toggle > input[role="switch"]:checked::after { background: #fff; transform: translateX(18px); }
+.psvstudio-studio-setting-toggle > input[role="switch"]:focus-visible { outline: 2px solid var(--psv-accent-strong); outline-offset: 3px; }
+.psvstudio-setting-tooltip { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 17px; height: 17px; color: #d8ceff; background: rgba(141, 115, 255, .14); border: 1px solid rgba(169, 145, 255, .35); border-radius: 50%; font-size: 11px; font-weight: 800; line-height: 1; cursor: help; }
+.psvstudio-setting-tooltip:focus-visible { outline: 2px solid var(--psv-accent-strong); outline-offset: 2px; }
+.psvstudio-setting-tooltip-content { position: absolute; z-index: 5; bottom: calc(100% + 9px); left: 50%; width: min(330px, calc(100vw - 54px)); padding: 9px 10px; color: var(--psv-text); background: #090b11; border: 1px solid var(--psv-border-strong); border-radius: 9px; box-shadow: 0 12px 32px rgba(0, 0, 0, .5); font-size: 10px; font-weight: 500; line-height: 1.45; opacity: 0; pointer-events: none; transform: translate(-50%, 4px); transition: opacity 100ms ease, transform 100ms ease; }
+.psvstudio-setting-tooltip:hover .psvstudio-setting-tooltip-content, .psvstudio-setting-tooltip:focus .psvstudio-setting-tooltip-content, .psvstudio-setting-tooltip:focus-within .psvstudio-setting-tooltip-content { opacity: 1; transform: translate(-50%, 0); }
 
 .psvstudio-project-list { display: grid; gap: 5px; padding: 0 9px 14px; }
 .psvstudio-project-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: 1px solid transparent; border-radius: 11px; }
@@ -446,6 +477,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-director-message.is-user { justify-self: end; background: rgba(103, 78, 188, .2); border-color: rgba(151, 126, 255, .34); }
 .psvstudio-director-message.is-assistant { justify-self: start; }
 .psvstudio-director-message.is-pending { color: var(--psv-muted); border-style: dashed; }
+.psvstudio-director-message.is-pending .psvstudio-director-cancel { margin-top: 10px; }
 .psvstudio-director-message > small { color: var(--psv-muted); font-size: 9px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
 .psvstudio-director-message-text { white-space: pre-wrap; }
 .psvstudio-director-message-attachments { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -513,6 +545,10 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
   .psvstudio-app[data-drawer="inspector"] .psvstudio-inspector { transform: none; }
   #psvstudio-mobile-inspector, #psvstudio-close-inspector { display: grid; }
   .psvstudio-topbar { flex-wrap: wrap; }
+  .psvstudio-studio-settings { top: max(74px, calc(env(safe-area-inset-top) + 66px)); right: max(8px, env(safe-area-inset-right)); bottom: max(8px, env(safe-area-inset-bottom)); left: max(8px, env(safe-area-inset-left)); }
+  .psvstudio-studio-settings-header { min-height: 68px; padding: 13px 15px; }
+  .psvstudio-studio-settings-layout { padding: 14px; }
+  .psvstudio-mobile-studio-switch { display: inline-grid; }
   .psvstudio-workflow-select { min-width: 150px; }
   .psvstudio-editor-scroll { padding: 10px 10px 0; }
   .psvstudio-timeline-card { margin: 10px; }

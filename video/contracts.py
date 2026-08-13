@@ -273,6 +273,13 @@ def _normalize_dialogue(event, index):
     if performance == "singing" and bool(event.get("voiceover", False)):
         raise PromptDocumentError("Singing must use offscreen rather than voiceover")
     text = str(event.get("text") or "").strip()
+    delivery = _text(event.get("delivery")).strip(" :,-")
+    delivery = re.sub(
+        r"^(?:says?\s+in\s+an\s+off[- ]screen\s+voiceover|says?|sings?)\b\s*",
+        "",
+        delivery,
+        flags=re.IGNORECASE,
+    ).strip(" :,-")
     return {
         "id": _identifier(event.get("id") or f"dialogue-{index + 1}", "dialogue"),
         "speaker": _text(event.get("speaker"), "The speaker"),
@@ -280,7 +287,7 @@ def _normalize_dialogue(event, index):
         "language": _text(event.get("language"), "English"),
         "performance": performance,
         "text": text,
-        "delivery": _text(event.get("delivery")),
+        "delivery": delivery,
         "voiceover": bool(event.get("voiceover", False)),
         "offscreen": bool(event.get("offscreen", False)),
         "crosses_cut": bool(event.get("crosses_cut", False)),

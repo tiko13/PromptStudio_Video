@@ -14,6 +14,10 @@ from video.llm_provider import _messages_with_kobold_images, _messages_with_olla
 
 
 class DirectorVisionTests(unittest.TestCase):
+    def test_action_is_a_supported_grounding_usage(self):
+        normalized = normalize_attachments([{"path": "motion.png", "usage": "action"}])
+        self.assertEqual(normalized[0]["usage"], "action")
+
     def test_attachment_usage_is_normalized_and_limited(self):
         normalized = normalize_attachments([{
             "id": "image-1",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -29,13 +30,14 @@ FIRST_FRAME_IMAGE = "ComfyUI_00061_.webp"
 LAST_FRAME_IMAGE = "ComfyUI_00066_.webp"
 
 
-def reference(index, path, role):
+def reference(index, path, role, kind="image", prompt=""):
     return {
         "id": f"reference-{index}",
-        "kind": "image",
+        "kind": kind,
         "path": path,
         "name": Path(path).stem,
         "roles": [role],
+        "prompt": prompt,
     }
 
 
@@ -93,7 +95,10 @@ def document(mode="auto", references=None, shots=None, duration=9):
     }
 
 
-def request(document_value, prompt, attachments=None, scope="project", selected_shot_id=""):
+def request(
+    document_value, prompt, attachments=None, scope="project", selected_shot_id="",
+    optimize_prompt_generation=False,
+):
     return {
         "llm_provider": "koboldcpp",
         "kobold_url": "http://localhost:5001",
@@ -116,6 +121,7 @@ def request(document_value, prompt, attachments=None, scope="project", selected_
         "attachments": attachments or [],
         "messages": [{"role": "user", "content": prompt}],
         "require_proposal": True,
+        "optimize_prompt_generation": optimize_prompt_generation,
     }
 
 
@@ -202,10 +208,12 @@ def cases():
                 "Completely rewrite the full production into exactly three resulting shots at 0, 3, and 6 seconds. "
                 "Use Picture 1 only for the platinum-blonde woman's identity, pink outfit, and black boots; Picture 2 "
                 "only for the burgundy wingback chair and sparse pale studio setting; and Picture 3 only for the flat "
-                "childlike drawing style, simple shapes, blue sky, green hill, and bright palette. Across all three "
-                "shots she approaches the chair, performs a joyful dance around it, then sits and raises both hands. "
-                "Keep every reference assignment distinct and repeat each applicable reference label and its concrete "
-                "traits in every affected shot. Populate all six REF2VA sections, synchronized sounds, soundscape, and music."
+                "childlike drawing style, simple shapes, blue sky, green hill, and bright palette. Apply all three "
+                "references throughout all three shots. Across all three "
+                "shots she approaches the chair, performs a joyful dance around it, then sits on the chair and raises both hands. "
+                "Keep every reference assignment distinct, define its traits once, and reuse each applicable canonical "
+                "label naturally in every affected shot without repeating trait catalogs. Populate all six REF2VA "
+                "sections, synchronized sounds, soundscape, and music."
             ),
             "mode": "ref2va",
             "shots": 3,
@@ -229,6 +237,11 @@ def cases():
             "definition_forbidden_terms": {
                 "<Picture 2>": ["dark brown hair", "white short-sleeved", "black skirt"],
             },
+            "shot_required_patterns": [
+                [r"approach(?:es|ing)?.*<Subject 2>"],
+                [r"danc(?:e|es|ing).*<Subject 2>"],
+                [r"sit(?:s|ting)?.*(?:on|in).*<Subject 2>", r"rais(?:e|es|ing).*both hands"],
+            ],
             "forbidden": "OBSOLETE",
         },
         "ref2va_single_natural": {
@@ -321,6 +334,314 @@ def cases():
             "starts": [0, 4],
             "selected_required_terms": ["package", "rain"],
         },
+        "selected_shot_i2va": {
+            "document": document(
+                mode="i2va", references=i2va_refs, shots=[shot("shot-1", 0)], duration=6,
+            ),
+            "scope": "shot",
+            "selected_shot_id": "shot-1",
+            "attachments": [attachment(1, FIRST_FRAME_IMAGE, "first_frame")],
+            "prompt": (
+                "Rewrite only the selected shot's steps, camera, and sounds. From the exact first frame, the woman "
+                "slowly turns her head toward camera while keeping both hands behind her back; use a small slow push-in "
+                "and synchronize one soft hair movement and dress-fabric rustle. Do not change pixel-owned setup fields."
+            ),
+            "mode": "i2va",
+            "shots": 1,
+            "starts": [0],
+            "first_frame_lock": True,
+            "prompt_prefix": "For the target video, at 0.00 seconds",
+            "selected_required_terms": ["turn", "behind"],
+            "observation_terms": [["woman", "dress", "door"]],
+            "observation_forbidden_terms": [[]],
+        },
+        "selected_shot_fl2va": {
+            "document": document(
+                mode="fl2va", references=fl2va_refs, shots=[shot("shot-1", 0)], duration=6,
+            ),
+            "scope": "shot",
+            "selected_shot_id": "shot-1",
+            "attachments": [
+                attachment(1, FIRST_FRAME_IMAGE, "first_frame"),
+                attachment(2, LAST_FRAME_IMAGE, "last_frame"),
+            ],
+            "prompt": (
+                "Rewrite only this selected shot's steps, camera, and sounds so it continuously interpolates from "
+                "<Picture 1> to <Picture 2>. The woman shifts her weight gradually without a cut; use a slow small "
+                "pull-out and synchronize subtle dress fabric and one final foot placement."
+            ),
+            "mode": "fl2va",
+            "shots": 1,
+            "starts": [0],
+            "first_frame_lock": True,
+            "prompt_prefix": "How the reference pictures align",
+            "selected_required_terms": ["weight"],
+            "compiled_required_terms": ["<Picture 2>"],
+            "observation_terms": [
+                ["woman", "dress", "door"], ["woman", "dress", "door"],
+            ],
+            "observation_forbidden_terms": [[], []],
+        },
+        "selected_shot_l2va": {
+            "document": document(
+                mode="l2va", references=l2va_refs, shots=[shot("shot-1", 0)], duration=6,
+            ),
+            "scope": "shot",
+            "selected_shot_id": "shot-1",
+            "attachments": [attachment(1, LAST_FRAME_IMAGE, "last_frame")],
+            "prompt": (
+                "Rewrite only this selected shot so the woman begins one step left of the final pose, takes one slow "
+                "step right, and lands exactly on <Picture 1>. Use a static camera and synchronized footstep and fabric sound."
+            ),
+            "mode": "l2va",
+            "shots": 1,
+            "starts": [0],
+            "prompt_prefix": "How the reference pictures align",
+            "selected_required_terms": ["Picture 1", "right"],
+            "observation_terms": [["woman", "dress", "door"]],
+            "observation_forbidden_terms": [[]],
+        },
+        "selected_shot_ref2va": {
+            "document": document(
+                mode="ref2va",
+                references=[reference(1, SUBJECT_IMAGE, "subject")],
+                shots=[shot("shot-1", 0)],
+                duration=6,
+            ),
+            "scope": "shot",
+            "selected_shot_id": "shot-1",
+            "attachments": [attachment(1, SUBJECT_IMAGE, "subject")],
+            "prompt": (
+                "Rewrite only this selected shot so the girl from <Picture 1> takes two measured steps forward while "
+                "smiling throughout, then stops. Add a slow small tracking shot and synchronized boot steps and clothing rustle."
+            ),
+            "mode": "ref2va",
+            "shots": 1,
+            "starts": [0],
+            "reference_tokens": ["<Picture 1>"],
+            "shot_reference_tokens": ["<Subject 1>"],
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "selected_required_terms": ["Subject 1", "forward"],
+            "observation_terms": [["blonde", "pink", "boots"]],
+            "observation_forbidden_terms": [[]],
+        },
+        "t2va_dialogue_voiceover_text": {
+            "document": document(
+                mode="t2va", shots=[shot("shot-1", 0), shot("shot-2", 4)], duration=8,
+            ),
+            "prompt": (
+                "Completely rewrite the full production as exactly two shots at 0 and 4 seconds. In Shot 1, a female "
+                "engineer smiles throughout a wave while saying exactly \"Wait—don't touch that.\"; the spoken line "
+                "continues across the cut. A console visibly reads \"CORE TEMP: 72°C\". In Shot 2, the same engineer "
+                "keeps her lips completely closed while her off-screen voiceover says exactly \"The signal is still alive.\" "
+                "and is cut off by the end of the video. Preserve both strings and punctuation verbatim. Add concrete "
+                "camera work and synchronized machinery, fabric, and hand-movement sounds, with no background music."
+            ),
+            "mode": "t2va",
+            "shots": 2,
+            "starts": [0, 4],
+            "forbidden": "OBSOLETE",
+            "expected_dialogue_texts": ["Wait—don't touch that.", "The signal is still alive."],
+            "expected_dialogue_flags": [
+                {
+                    "text": "Wait—don't touch that.", "crosses_cut": True,
+                    "voiceover": False, "cutoff": False,
+                },
+                {
+                    "text": "The signal is still alive.", "crosses_cut": False,
+                    "voiceover": True, "cutoff": True,
+                },
+            ],
+            "expected_visible_texts": ["CORE TEMP: 72°C"],
+            "compiled_required_terms": [
+                "<scenetrans>", "says in an off-screen voiceover", "lips remain completely closed",
+                "<cutoff>", '"CORE TEMP: 72°C"',
+            ],
+        },
+        "t2va_complete_silence": {
+            "document": document(mode="t2va", shots=[shot("shot-1", 0)], duration=6),
+            "prompt": (
+                "Completely rewrite the full production as one continuous silent shot. A paper crane slowly unfolds "
+                "itself on a black table under a narrow white spotlight. The entire video must be completely silent: "
+                "no dialogue, no physical sound, no ambience, and no music."
+            ),
+            "mode": "t2va",
+            "shots": 1,
+            "starts": [0],
+            "forbidden": "OBSOLETE",
+            "complete_silence": True,
+        },
+        "ref2va_video_edit_audio_reference": {
+            "document": document(
+                mode="ref2va",
+                references=[
+                    reference(
+                        1, "source_edit.mp4", "video_edit", "video",
+                        "A two-shot source: a courier enters at 0 seconds and opens a metal case after the 4-second cut.",
+                    ),
+                    reference(
+                        2, "calm_voice.wav", "audio_reference", "audio",
+                        "A low, calm alto voice timbre with measured pacing; words are not to be copied.",
+                    ),
+                ],
+                shots=[shot("shot-1", 0), shot("shot-2", 4)], duration=8,
+            ),
+            "prompt": (
+                "Create the complete two-shot REF2VA edit at 0 and 4 seconds. The target video is an edited version "
+                "of <Video 1>. Preserve its courier action, cut timing, and camera rhythm, but place the action in a "
+                "moonlit laboratory. In Shot 2 the courier says exactly \"Delivery confirmed.\" using only the voice "
+                "timbre and pacing referenced by <Audio 1>; do not copy any source words. Use no non-diegetic music."
+            ),
+            "mode": "ref2va",
+            "shots": 2,
+            "starts": [0, 4],
+            "reference_tokens": ["<Video 1>", "<Audio 1>"],
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "expected_task_types": ["video editing", "audio reference"],
+            "expected_dialogue_texts": ["Delivery confirmed."],
+            "compiled_required_terms": ["The target video is an edited version of <Video 1>"],
+            "forbidden": "OBSOLETE",
+        },
+        "ref2va_video_continue_audio_copy": {
+            "document": document(
+                mode="ref2va",
+                references=[
+                    reference(
+                        1, "source_continue.mp4", "video_continue", "video",
+                        "The source ends with a red train stopped at a wet platform, doors open, camera tracking right.",
+                    ),
+                    reference(
+                        2, "platform_rain.wav", "audio_copy", "audio",
+                        "A clean rain-and-platform ambience track without speech or music.",
+                    ),
+                ],
+                shots=[shot("shot-1", 0), shot("shot-2", 4)], duration=8,
+            ),
+            "prompt": (
+                "Create a complete two-shot continuation of <Video 1> at 0 and 4 seconds. Begin from its exact final "
+                "state and continue the rightward tracking move as one passenger exits and the red train doors close. "
+                "Fully copy <Audio 1> as the continuous diegetic ambience underneath both shots. Add no dialogue and "
+                "no non-diegetic music."
+            ),
+            "mode": "ref2va",
+            "shots": 2,
+            "starts": [0, 4],
+            "reference_tokens": ["<Video 1>", "<Audio 1>"],
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "expected_task_types": ["video continuation", "audio reuse"],
+            "compiled_required_terms": ["<Video 1>", "<Audio 1>"],
+            "forbidden": "OBSOLETE",
+        },
+        "t2va_describe_only_image": {
+            "document": document(mode="t2va", shots=[shot("shot-1", 0)], duration=6),
+            "attachments": [attachment(1, CHAIR_IMAGE, "describe")],
+            "prompt": (
+                "Completely rewrite the full production as one continuous shot. Inspect the attached image only as "
+                "visual context, not as a MiniMax reference. Create an original scene in which a woman approaches the "
+                "visible red chair and rests one hand on its rolled arm. Use concrete composition, setting, lighting, "
+                "camera, synchronized footsteps and upholstery contact, with no music."
+            ),
+            "mode": "t2va",
+            "shots": 1,
+            "starts": [0],
+            "observation_terms": [["red", "chair", "woman"]],
+            "observation_forbidden_terms": [[]],
+            "compiled_forbidden_terms": ["<Picture", "<Subject"],
+            "forbidden": "OBSOLETE",
+        },
+        "ref2va_image_role_matrix": {
+            "document": document(
+                mode="ref2va",
+                references=[
+                    reference(1, CHAIR_IMAGE, "action"),
+                    reference(2, SUBJECT_IMAGE, "pose"),
+                    reference(3, FIRST_FRAME_IMAGE, "camera"),
+                    reference(4, DRAWING_IMAGE, "storyboard"),
+                ],
+                shots=[shot("shot-1", 0), shot("shot-2", 4)], duration=8,
+            ),
+            "attachments": [
+                attachment(1, CHAIR_IMAGE, "action"),
+                attachment(2, SUBJECT_IMAGE, "pose"),
+                attachment(3, FIRST_FRAME_IMAGE, "camera"),
+                attachment(4, DRAWING_IMAGE, "storyboard"),
+            ],
+            "prompt": (
+                "Completely rewrite the full REF2VA production as exactly two shots at 0 and 4 seconds. Use Picture 1 "
+                "only as the action reference for lowering into the chair and crossing the legs; Picture 2 only for the "
+                "upright centered pose; Picture 3 only for camera height and centered doorway composition; and Picture 4 "
+                "as the concrete storyboard layout. Keep all roles distinct, define their reusable labels once, and use "
+                "all four references throughout both shots. Add synchronized chair, clothing, and foot sounds, no music."
+            ),
+            "mode": "ref2va",
+            "shots": 2,
+            "starts": [0, 4],
+            "reference_tokens": ["<Picture 1>", "<Picture 2>", "<Picture 3>", "<Picture 4>"],
+            "shot_reference_tokens": ["<Subject 1>", "<Subject 2>", "<Subject 3>", "<Picture 4>"],
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "observation_terms": [
+                ["chair", "crossed", "legs", "sits"],
+                ["standing", "upright", "arms", "legs"],
+                ["shot", "frame", "door", "sunlight"],
+                ["creature", "hill", "sky"],
+            ],
+            "observation_forbidden_terms": [[], [], [], []],
+            "forbidden": "OBSOLETE",
+        },
+        "ref2va_first_last_style": {
+            "document": document(
+                mode="ref2va",
+                references=[
+                    reference(1, FIRST_FRAME_IMAGE, "first_frame"),
+                    reference(2, LAST_FRAME_IMAGE, "last_frame"),
+                    reference(3, DRAWING_IMAGE, "style"),
+                ],
+                shots=[shot("shot-1", 0)], duration=8,
+            ),
+            "attachments": [
+                attachment(1, FIRST_FRAME_IMAGE, "first_frame"),
+                attachment(2, LAST_FRAME_IMAGE, "last_frame"),
+                attachment(3, DRAWING_IMAGE, "style"),
+            ],
+            "prompt": (
+                "Create the complete one-shot REF2VA keyframe interpolation. Begin exactly from Picture 1 and land "
+                "exactly on Picture 2 at the end while the woman slowly brings both hands from behind her back to rest "
+                "at her sides. Apply only the flat vector treatment and bright palette from Picture 3 throughout, without "
+                "copying its depicted character. Populate all six sections and synchronized fabric sound, no music."
+            ),
+            "mode": "ref2va",
+            "shots": 1,
+            "starts": [0],
+            "reference_tokens": ["<Picture 1>", "<Picture 2>", "<Picture 3>"],
+            "compiled_required_terms": [
+                "The visual treatment throughout the target video follows <Subject 3>.",
+                "<Picture 2>",
+            ],
+            "ordered_sections": [
+                "subject_definitions:", "summary:", "retention_analysis:",
+                "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+            ],
+            "expected_task_types": ["keyframe completion", "reference generation"],
+            "first_frame_lock": True,
+            "observation_terms": [
+                ["woman", "dress", "door"],
+                ["woman", "dress", "door"],
+                ["drawing", "blue", "green", "yellow"],
+            ],
+            "observation_forbidden_terms": [[], [], []],
+        },
     }
 
 
@@ -359,7 +680,11 @@ def validate(name, case, result, preview):
             missing_fields.append("action step")
         if missing_fields:
             errors.append(f"{shot_value.get('id')} has empty fields {missing_fields}")
-        if "sound" in case["prompt"].casefold() and not shot_value.get("sounds"):
+        if (
+            not case.get("complete_silence")
+            and "sound" in case["prompt"].casefold()
+            and not shot_value.get("sounds")
+        ):
             errors.append(f"{shot_value.get('id')} has no synchronized sounds")
     expected_steps = case.get("expected_step_types")
     if expected_steps:
@@ -368,6 +693,13 @@ def validate(name, case, result, preview):
         ]
         if actual_steps != expected_steps:
             errors.append(f"step order {actual_steps} != {expected_steps}")
+    for index, patterns in enumerate(case.get("shot_required_patterns") or []):
+        if index >= len(result_document.get("shots") or []):
+            break
+        shot_text = json.dumps(result_document["shots"][index], ensure_ascii=False)
+        for pattern in patterns:
+            if not re.search(pattern, shot_text, re.IGNORECASE | re.DOTALL):
+                errors.append(f"shot-{index + 1} missed required relation /{pattern}/")
     if case.get("first_frame_lock"):
         first = result_document["shots"][0]
         leaked = [
@@ -376,13 +708,81 @@ def validate(name, case, result, preview):
         ]
         if leaked:
             errors.append(f"first-frame-owned fields changed: {leaked}")
-    if len(compiled.split()) > 650:
+    expected_silence = case.get("complete_silence")
+    if expected_silence is not None and bool(result_document.get("complete_silence")) != expected_silence:
+        errors.append(
+            f"complete_silence {result_document.get('complete_silence')} != {expected_silence}"
+        )
+    if expected_silence and (
+        "overall_soundscape: N/A" not in compiled or "non_diegetic_music: N/A" not in compiled
+    ):
+        errors.append("complete_silence did not suppress compiled soundscape and music")
+    maximum_words = 650 + 50 * max(0, len(result_document.get("references") or []) - 3)
+    if len(compiled.split()) > maximum_words:
         errors.append(f"compiled prompt is unexpectedly verbose: {len(compiled.split())} words")
+    speaker_id_pattern = re.compile(r"(?<![A-Za-z0-9_<])S\d+(?![A-Za-z0-9_>])")
+    prose_fields = (
+        "composition", "subjects", "environment", "lighting", "transition", "notes"
+    )
+    for shot_value in result_document.get("shots") or []:
+        prose_values = [str(shot_value.get(field) or "") for field in prose_fields]
+        prose_values.extend(str(item or "") for item in shot_value.get("sounds") or [])
+        prose_values.extend(str(item or "") for item in shot_value.get("visible_text") or [])
+        prose_values.extend(
+            str(step.get("text") or "")
+            for step in shot_value.get("steps") or []
+            if step.get("type") == "action"
+        )
+        bare_ids = sorted(set(speaker_id_pattern.findall("\n".join(prose_values))))
+        if bare_ids:
+            errors.append(
+                f"{shot_value.get('id')} uses speaker IDs as prose nouns outside dialogue: {bare_ids}"
+            )
     if case.get("prompt_prefix") and not compiled.startswith(case["prompt_prefix"]):
         errors.append(f"compiled prompt does not start with {case['prompt_prefix']!r}")
     forbidden = case.get("forbidden")
     if forbidden and forbidden.casefold() in json.dumps(result_document).casefold():
         errors.append(f"rewritten document still contains {forbidden!r}")
+    expected_task_types = case.get("expected_task_types")
+    if expected_task_types and result_document.get("task_types") != expected_task_types:
+        errors.append(f"task_types {result_document.get('task_types')} != {expected_task_types}")
+    dialogue_texts = [
+        step.get("text")
+        for shot_value in result_document.get("shots") or []
+        for step in shot_value.get("steps") or []
+        if step.get("type") == "dialogue"
+    ]
+    for expected_text in case.get("expected_dialogue_texts") or []:
+        if expected_text not in dialogue_texts:
+            errors.append(f"exact dialogue string missing: {expected_text!r}")
+    for expected in case.get("expected_dialogue_flags") or []:
+        event = next((item for item in (
+            step
+            for shot_value in result_document.get("shots") or []
+            for step in shot_value.get("steps") or []
+            if step.get("type") == "dialogue"
+        ) if item.get("text") == expected["text"]), None)
+        if event is None:
+            continue
+        for flag, value in expected.items():
+            if flag != "text" and bool(event.get(flag)) != value:
+                errors.append(
+                    f"dialogue {expected['text']!r} flag {flag}={event.get(flag)} != {value}"
+                )
+    visible_texts = [
+        value
+        for shot_value in result_document.get("shots") or []
+        for value in shot_value.get("visible_text") or []
+    ]
+    for expected_text in case.get("expected_visible_texts") or []:
+        if expected_text not in visible_texts:
+            errors.append(f"exact visible-text string missing: {expected_text!r}")
+    for term in case.get("compiled_required_terms") or []:
+        if term not in compiled:
+            errors.append(f"compiled prompt missed required term {term!r}")
+    for term in case.get("compiled_forbidden_terms") or []:
+        if term in compiled:
+            errors.append(f"compiled prompt contains forbidden term {term!r}")
     for token in case.get("reference_tokens") or []:
         definitions = " ".join(
             f"<{item.get('label', '').strip('<>')}> {item.get('text', '')}"
@@ -446,6 +846,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", action="append", dest="selected")
     parser.add_argument("--show-prompt", action="store_true")
+    parser.add_argument("--show-document", action="store_true")
+    parser.add_argument(
+        "--optimize-prompt-generation",
+        action="store_true",
+        help="Use compact built-in instructions instead of injecting the relevant guide sections.",
+    )
     args = parser.parse_args()
     matrix = cases()
     selected = args.selected or list(matrix)
@@ -462,6 +868,7 @@ def main():
             data = request(
                 case["document"], case["prompt"], case.get("attachments"),
                 case.get("scope", "project"), case.get("selected_shot_id", ""),
+                args.optimize_prompt_generation,
             )
             result = director_chat(data)
             preview = (
@@ -482,6 +889,9 @@ def main():
             }
             if args.show_prompt:
                 summary["compiled_prompt"] = preview.get("compiled_prompt", "")
+            if args.show_document:
+                summary["document"] = preview.get("document", {})
+                summary["pending_proposal"] = result.get("pending_proposal")
             print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
             if errors:
                 failures += 1

@@ -113,7 +113,10 @@ def _normalize_generation(value, index):
     result["id"] = _identifier(result.get("id"), f"Generation {index + 1}")
     result["prompt_id"] = str(result.get("prompt_id") or "").strip()[:200]
     status = str(result.get("status") or "queued").strip().lower()
-    if status not in {"queued", "generating", "complete", "error", "interrupted"}:
+    if status not in {
+        "validating", "compiling", "queueing", "queued", "generating",
+        "complete", "error", "interrupted", "cancelled",
+    }:
         raise ValueError(f"Generation {index + 1} has invalid status")
     result["status"] = status
     result["created_at"] = _timestamp(result.get("created_at"))

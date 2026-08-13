@@ -62,6 +62,79 @@ class CompilerTests(unittest.TestCase):
         self.assertTrue(prompt.startswith("For the target video, at 0.00 seconds"))
         self.assertIn("<d>[English] Don't rewrite THIS!</d>", prompt)
 
+    def test_ref2va_external_style_overrides_only_first_frame_treatment_layer(self):
+        value = base_document(
+            mode="ref2va",
+            references=[
+                {"kind": "image", "path": "first.png", "roles": ["first_frame"]},
+                {"kind": "image", "path": "last.png", "roles": ["last_frame"]},
+                {"kind": "image", "path": "style.png", "roles": ["style"]},
+            ],
+            task_types=["keyframe completion", "reference generation"],
+            subject_definitions=[
+                {"label": "Picture 1", "text": "is the supplied first frame of [Shot 1]."},
+                {"label": "Picture 2", "text": "is the supplied last frame of [Shot 1]."},
+                {"label": "Subject 3", "text": "is the flat visual style shown in <Picture 3>."},
+            ],
+            summary="The target interpolates <Picture 1> to <Picture 2> using <Subject 3>.",
+            retention_analysis=[
+                {
+                    "label": "<Picture 1>", "where": "[Shot 1]", "relationship": "fully_preserved",
+                    "detail": "The opening composition is retained.",
+                },
+                {
+                    "label": "<Picture 2>", "where": "[Shot 1]", "relationship": "fully_preserved",
+                    "detail": "The ending composition is retained.",
+                },
+                {
+                    "label": "<Subject 3>", "where": "[Shot 1]", "relationship": "attribute_transfer",
+                    "detail": "The visual treatment is transferred.",
+                },
+            ],
+        )
+        value["shots"][0]["steps"] = [{
+            "type": "action", "text": "The motion follows <Subject 3> and lands on <Picture 2>."
+        }]
+        value["shots"][0].pop("dialogue")
+        prompt = compile_prompt(value)
+        self.assertIn(
+            "The subjects, composition, scene, lighting, clothing, colors, key objects, and spatial "
+            "relationships established by <Picture 1> remain fully preserved.",
+            prompt,
+        )
+        self.assertIn("The visual treatment throughout the target video follows <Subject 3>.", prompt)
+        self.assertNotIn("The style, subjects, composition", prompt)
+
+    def test_i2va_generic_onscreen_speaker_is_anchored_to_sole_visible_subject(self):
+        value = base_document(references=[{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+            "subject_candidates": [{"name": "young woman", "location": "center"}],
+        }])
+        value["shots"][0]["dialogue"][0]["speaker"] = "The speaker"
+
+        prompt = compile_prompt(value)
+
+        self.assertIn(
+            "The young woman shown in <Picture 1> (S1) says: "
+            "<d>[English] First batch of the morning.</d>",
+            prompt,
+        )
+        self.assertNotIn("The speaker (S1)", prompt)
+
+    def test_i2va_generic_voiceover_is_not_bound_to_visible_subject(self):
+        value = base_document(references=[{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+            "subject_candidates": [{"name": "young woman", "location": "center"}],
+        }])
+        value["shots"][0]["dialogue"][0].update({
+            "speaker": "The speaker", "voiceover": True,
+        })
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("The speaker (S1) says in an off-screen voiceover", prompt)
+        self.assertNotIn("The young woman shown in <Picture 1>", prompt)
+
     def test_i2va_first_shot_uses_pixels_for_anchored_visual_details(self):
         value = base_document(references=[{
             "kind": "image", "path": "first.png", "roles": ["first_frame"],

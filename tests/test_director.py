@@ -16,11 +16,33 @@ from video.director import (
     document_fingerprint,
     parse_director_response,
     preview_changeset,
+    _prompt_writing_guide,
+    _reference_prompt_writing_guide,
+    _base_prompt_writing_guide_for_mode,
+    _shared_base_prompt_writing_guide,
     _validate_reference_only_preservation,
     _validate_first_frame_proposal_lock,
     _validate_i2va_anchor_preservation,
     _validate_protected_sequence_content,
     _validate_requested_project_result,
+    _validate_speaker_id_prose,
+    _validate_action_sound_separation,
+    _validate_structured_shot_grammar,
+    _validate_requested_reference_coverage,
+    _validate_reference_prompt_length,
+    _validate_sound_entries,
+    _canonicalize_retention_shot_mentions,
+    _canonicalize_reference_definition_grammar,
+    _audible_sound,
+    _validate_requested_dialogue_mechanics,
+    _validate_requested_exact_literals,
+    _validate_complete_project_placeholders,
+    _canonicalize_placeholder_camera_targets,
+    _subject_definitions,
+    _retention_analysis,
+    _complete_grounded_reference_semantics,
+    _validate_subject_only_reference_prose,
+    _validate_requested_step_order,
     _enrich_reference_definition_placeholders,
     _parse_vision_grounding,
     _preserve_reference_only_request,
@@ -103,9 +125,201 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("She smiles throughout the wave", system_message)
             self.assertIn("Do not split concurrent behaviors into adjacent action steps", system_message)
             self.assertIn("Dialogue and singing are timeline events, not pauses in the visuals", system_message)
+            self.assertIn("MiniMax speaker IDs are annotations, never character names", system_message)
+            self.assertIn("a silent character receives no speaker ID", system_message)
+            self.assertIn("Never use bare `S1`", system_message)
             self.assertIn("Every synchronized sounds item must identify its audible source", system_message)
             self.assertIn("Do not rely on the sounds array's position to imply timing", system_message)
             self.assertIn("Use relative synchronization cues rather than per-event timestamps", system_message)
+
+    def test_speaker_ids_are_rejected_outside_dialogue_steps(self):
+        document = director_document()
+        document["shots"][0]["subjects"] = "A silent baker (S1)."
+        document["shots"][0]["steps"][0]["text"] = "S1 opens the shutters."
+        with self.assertRaisesRegex(ValueError, "speaker IDs may appear only"):
+            _validate_speaker_id_prose(document)
+
+        document = director_document()
+        _validate_speaker_id_prose(document)
+
+    def test_action_and_sound_cannot_duplicate_the_same_sentence(self):
+        document = director_document()
+        document["shots"][0]["sounds"] = ["The wooden shutter creaks open."]
+        document["shots"][0]["steps"][0]["text"] = "The wooden shutter creaks open."
+        with self.assertRaisesRegex(ValueError, "duplicates the same event sentence"):
+            _validate_action_sound_separation(document)
+
+        document["shots"][0]["steps"][0]["text"] = "The baker opens the wooden shutter."
+        _validate_action_sound_separation(document)
+
+    def test_structured_shot_fields_reject_compiled_fragments_and_bare_sources(self):
+        document = director_document()
+        document["shots"][0]["steps"][0]["text"] = "[Shot 1] She turns toward <Picture 1>."
+        with self.assertRaisesRegex(ValueError, "embeds compiled prompt grammar"):
+            _validate_structured_shot_grammar(document)
+
+        document["shots"][0]["steps"][0]["text"] = "She lands on Picture 1."
+        with self.assertRaisesRegex(ValueError, "bare source label"):
+            _validate_structured_shot_grammar(document)
+
+        document["shots"][0]["steps"][0]["text"] = "She lands on <Picture 1>."
+        _validate_structured_shot_grammar(document)
+
+    def test_non_audible_states_are_rejected_from_sounds(self):
+        document = director_document()
+        document["shots"][0]["sounds"] = ["The chair creaks, followed by silence."]
+        with self.assertRaisesRegex(ValueError, "only audible events"):
+            _validate_sound_entries(document)
+
+    def test_explicit_all_reference_coverage_requires_every_shot(self):
+        document = normalize_document({
+            **director_document(),
+            "mode": "ref2va",
+            "references": [{
+                "id": "reference-1", "kind": "image", "path": "style.png",
+                "label": "<Picture 1>", "roles": ["style"],
+            }],
+            "subject_definitions": [{
+                "label": "Subject 1", "text": "is the style shown in <Picture 1>."
+            }],
+            "retention_analysis": [{
+                "label": "<Subject 1>", "where": "appears in [Shot 1]",
+                "relationship": "fully_preserved", "detail": "The style is retained.",
+            }],
+        })
+        document["shots"][0]["composition"] += " <Subject 1>."
+        with self.assertRaisesRegex(ValueError, "missing from"):
+            _validate_requested_reference_coverage(document, {
+                "messages": [{"role": "user", "content": "Apply all references throughout all shots."}]
+            })
+
+    def test_reference_prompt_length_allows_concise_full_reference_output(self):
+        document = normalize_document({
+            **director_document(),
+            "mode": "ref2va",
+            "references": [{
+                "id": "reference-1", "kind": "image", "path": "subject.png",
+                "roles": ["subject"],
+            }],
+            "task_types": ["reference generation"],
+            "subject_definitions": [{
+                "label": "Subject 1", "text": "is the person shown in <Picture 1>."
+            }],
+            "summary": "The target video uses <Subject 1> in [Shot 1] and [Shot 2].",
+            "retention_analysis": [{
+                "label": "<Subject 1>", "where": "appears in [Shot 1] and [Shot 2]",
+                "relationship": "fully_preserved", "detail": "The identity is retained.",
+            }],
+        })
+        for shot_value in document["shots"]:
+            shot_value["subjects"] = "<Subject 1> appears in the shot."
+        _validate_reference_prompt_length(document, {
+            "messages": [{"role": "user", "content": "Create the full prompt."}]
+        })
+
+    def test_retention_location_strips_model_supplied_outer_parentheses(self):
+        document = director_document()
+        document["retention_analysis"] = [{
+            "label": "<Subject 1>", "where": "((appears in Shot 1 and Shot 2))",
+            "relationship": "fully_preserved", "detail": "Retained.",
+        }]
+        _canonicalize_retention_shot_mentions(document)
+        self.assertEqual(
+            document["retention_analysis"][0]["where"],
+            "appears in [Shot 1] and [Shot 2]",
+        )
+
+    def test_dialogue_delivery_does_not_duplicate_compiler_speech_verbs(self):
+        document = director_document()
+        document["shots"][0]["steps"][1]["delivery"] = "says in an off-screen voiceover"
+        document["shots"][0]["steps"][1]["voiceover"] = True
+        normalized = normalize_document(document)
+        self.assertEqual(normalized["shots"][0]["steps"][1]["delivery"], "")
+
+    def test_requested_cross_cut_dialogue_requires_structured_flag(self):
+        document = normalize_document(director_document())
+        request = {"messages": [{
+            "role": "user", "content": "Her spoken line continues across the cut."
+        }]}
+        with self.assertRaisesRegex(ValueError, "crosses_cut true"):
+            _validate_requested_dialogue_mechanics(document, request)
+        document["shots"][0]["steps"][1]["crosses_cut"] = True
+        _validate_requested_dialogue_mechanics(document, request)
+
+    def test_requested_dialogue_literal_rejects_markup_or_rewording(self):
+        document = normalize_document(director_document())
+        request = {"messages": [{
+            "role": "user", "content": 'She says exactly "Do not rewrite this."'
+        }]}
+        _validate_requested_exact_literals(document, request)
+        document["shots"][0]["steps"][1]["text"] = "<scenetrans>Do not rewrite this.<scenetrans>"
+        with self.assertRaisesRegex(ValueError, "missing exact text"):
+            _validate_requested_exact_literals(document, request)
+
+    def test_complete_project_rejects_schema_placeholders(self):
+        document = normalize_document(director_document())
+        document["shots"][0]["composition"] = "composition"
+        with self.assertRaisesRegex(ValueError, "placeholder production fields"):
+            _validate_complete_project_placeholders(document, {
+                "messages": [{"role": "user", "content": "Create the complete production."}]
+            })
+
+    def test_placeholder_camera_target_uses_grounded_subject_tokens(self):
+        document = normalize_document(director_document())
+        document["shots"][0]["camera"]["target"] = "the primary subject"
+        proposal = {
+            "scope": {"type": "project"},
+            "summary": "Build the shot.",
+            "operations": [{
+                "op": "update_shot",
+                "shot_id": "shot-1",
+                "fields": {
+                    "subjects": "<Subject 1> waits while <Subject 2> enters.",
+                    "camera": {
+                        "type": "Static Shot", "amplitude": "default",
+                        "speed": "default", "target": "the primary subject",
+                    },
+                },
+            }],
+        }
+        repaired = _canonicalize_placeholder_camera_targets(document, proposal)
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["camera"]["target"],
+            "<Subject 1> and <Subject 2>",
+        )
+        proposal["operations"][0]["fields"].pop("camera")
+        repaired = _canonicalize_placeholder_camera_targets(document, proposal)
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["camera"]["target"],
+            "<Subject 1> and <Subject 2>",
+        )
+
+    def test_reference_collections_accept_json_encoded_mappings(self):
+        self.assertEqual(
+            _subject_definitions('{"Subject 1":"is the pose in <Picture 1>."}'),
+            [{"label": "Subject 1", "text": "is the pose in <Picture 1>."}],
+        )
+        self.assertEqual(
+            _retention_analysis(
+                '{"Subject 1":{"where":"[Shot 1]","relationship":"attribute_transfer",'
+                '"detail":"The pose is transferred."}}'
+            ),
+            [{
+                "label": "<Subject 1>", "where": "[Shot 1]",
+                "relationship": "attribute_transfer", "detail": "The pose is transferred.",
+            }],
+        )
+
+    def test_reference_summary_drops_model_supplied_task_prefix(self):
+        document = director_document()
+        document["task_types"] = ["video editing", "audio reference"]
+        document["summary"] = (
+            "[video editing + audio reference] The target video is an edited version of <Video 1>."
+        )
+        _canonicalize_reference_definition_grammar(document)
+        self.assertEqual(
+            document["summary"], "The target video is an edited version of <Video 1>."
+        )
 
     def test_document_fingerprint_ignores_cached_vision_grounding(self):
         document = normalize_document({
@@ -130,6 +344,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("For scene usage", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("omitting a visible person's identity and wardrobe", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("For style usage", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("For action usage", VISION_GROUNDING_SYSTEM_MESSAGE)
 
     def test_vision_grounding_contract_separates_pixels_from_requested_action(self):
         self.assertIn("report only concrete facts visible in their pixels", VISION_GROUNDING_SYSTEM_MESSAGE)
@@ -152,6 +367,14 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("Platinum-blonde", parsed[0]["observations"])
         self.assertIn("Blue tiled room", parsed[1]["observations"])
         self.assertEqual(parsed[0]["subject_candidates"][0]["name"], "young woman")
+
+    def test_non_identity_grounding_roles_discard_depicted_subject_candidates(self):
+        parsed = _parse_vision_grounding(
+            '{"images":[{"index":1,"observations":"A red chair behind a seated woman.",'
+            '"subjects":[{"name":"young woman"},{"name":"red chair"}]}]}',
+            [{"id": "scene", "name": "Room", "usage": "scene"}],
+        )
+        self.assertEqual(parsed[0]["subject_candidates"], [])
 
     def test_vision_grounding_requires_locations_for_same_type_subjects(self):
         attachments = [{"id": "a", "name": "People.png", "usage": "subject"}]
@@ -424,6 +647,45 @@ class DirectorTests(unittest.TestCase):
         event = parsed["proposal"]["operations"][0]["fields"]["steps"][0]
         self.assertEqual(event["speaker_id"], "S2")
 
+    def test_i2va_director_binds_generic_onscreen_speaker_to_sole_keyframe_subject(self):
+        document = self.i2va_document()
+        document["shots"][0]["steps"] = [
+            step for step in document["shots"][0]["steps"] if step["type"] == "action"
+        ]
+        document["references"][0]["subject_candidates"] = [{
+            "name": "young woman", "location": "center",
+            "visual_selectors": ["woman in white shirt"],
+        }]
+        response = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add synchronized dialogue","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":['
+            '{"type":"dialogue","speaker":"The speaker","speaker_id":"S1",'
+            '"language":"English","text":"I can do this","voiceover":false,"offscreen":false},'
+            '{"type":"action","text":"She raises both hands while speaking."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+
+        with patch("video.director.generate_chat", return_value=response):
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "require_proposal": True,
+                "messages": [{
+                    "role": "user",
+                    "content": 'She says "I can do this" while raising both hands.',
+                }],
+            })
+
+        self.assertEqual(result["status"], "ready", result)
+        preview = preview_changeset(document, result["proposal"])
+        dialogue = dialogue_steps(preview["document"]["shots"][0])[0]
+        self.assertEqual(dialogue["speaker"], "The young woman shown in <Picture 1>")
+        self.assertIn(
+            "The young woman shown in <Picture 1> (S1) says",
+            preview["compiled_prompt"],
+        )
+
     def test_director_rejects_divergent_legacy_field_beside_steps(self):
         document = normalize_document(director_document())
         raw = (
@@ -533,6 +795,123 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(
             restricted["operations"][0]["fields"],
             proposal["operations"][0]["fields"],
+        )
+
+    def test_non_identity_role_definitions_are_rebuilt_from_their_own_images(self):
+        document = normalize_document({
+            **director_document(),
+            "mode": "ref2va",
+            "references": [
+                {
+                    "id": "reference-1", "kind": "image", "path": "action.png",
+                    "roles": ["action"],
+                },
+                {
+                    "id": "reference-2", "kind": "image", "path": "pose.png",
+                    "roles": ["pose"],
+                },
+            ],
+        })
+        proposal = {
+            "operations": [{
+                "op": "update_project",
+                "fields": {
+                    "subject_definitions": [
+                        {"label": "Subject 1", "text": "is the standing pose in <Picture 2>."},
+                        {"label": "Subject 2", "text": "is the seated action in <Picture 1>."},
+                    ],
+                    "summary": "Uses <Subject 1> and <Subject 2>.",
+                    "retention_analysis": [],
+                },
+            }],
+        }
+        completed = _complete_grounded_reference_semantics(document, proposal, {
+            "messages": [{"role": "user", "content": "Use both references."}],
+            "attachments": [
+                {
+                    "id": "attachment-1", "path": "action.png", "usage": "action",
+                    "reference_id": "reference-1",
+                },
+                {
+                    "id": "attachment-2", "path": "pose.png", "usage": "pose",
+                    "reference_id": "reference-2",
+                },
+            ],
+            "_vision_observations": [
+                {
+                    "attachment_id": "attachment-1", "usage": "action",
+                    "observations": "A person lowers into a chair and crosses both legs.",
+                    "subject_candidates": [],
+                },
+                {
+                    "attachment_id": "attachment-2", "usage": "pose",
+                    "observations": "A person stands upright with arms at both sides.",
+                    "subject_candidates": [],
+                },
+            ],
+        })
+        definitions = {
+            item["label"]: item["text"]
+            for item in completed["operations"][0]["fields"]["subject_definitions"]
+        }
+        self.assertIn("<Picture 1>", definitions["Subject 1"])
+        self.assertIn("lowers into a chair", definitions["Subject 1"])
+        self.assertNotIn("<Picture 2>", definitions["Subject 1"])
+        self.assertIn("<Picture 2>", definitions["Subject 2"])
+        self.assertIn("stands upright", definitions["Subject 2"])
+
+    def test_subject_only_reference_rejects_picture_prose_and_invented_appearance(self):
+        document = normalize_document({
+            **director_document(),
+            "mode": "ref2va",
+            "references": [{
+                "id": "reference-1", "kind": "image", "path": "woman.png",
+                "roles": ["subject"],
+            }],
+        })
+        document["shots"][0]["subjects"] = "<Subject 1> stands in the rain."
+        _validate_subject_only_reference_prose(document, {
+            "messages": [{"role": "user", "content": "Make the girl dance in rain."}]
+        })
+        document["shots"][0]["subjects"] = "The dark-haired girl from <Picture 1>."
+        with self.assertRaisesRegex(ValueError, "subject-only reference"):
+            _validate_subject_only_reference_prose(document, {
+                "messages": [{"role": "user", "content": "Make the girl dance in rain."}]
+            })
+
+    def test_explicit_dialogue_then_action_rejects_leading_action(self):
+        document = normalize_document(director_document())
+        request = {"messages": [{
+            "role": "user",
+            "content": 'The girl says "Come here". Then another girl enters.',
+        }]}
+        with self.assertRaisesRegex(ValueError, "dialogue before"):
+            _validate_requested_step_order(document, request)
+        document["shots"][0]["steps"] = [
+            document["shots"][0]["steps"][1], document["shots"][0]["steps"][0]
+        ]
+        _validate_requested_step_order(document, request)
+
+    def test_selected_action_edit_with_preservation_note_is_not_reference_only(self):
+        request = {
+            "attachments": [{"path": "first.png", "usage": "first_frame"}],
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "Rewrite only the selected shot's steps, camera, and sounds. The woman turns toward camera. "
+                    "Do not change pixel-owned setup fields."
+                ),
+            }],
+        }
+        self.assertFalse(_preserve_reference_only_request(request))
+
+    def test_structured_sound_objects_become_natural_sound_sentences(self):
+        self.assertEqual(
+            _audible_sound({
+                "source": "footstep", "timing": "As she moves",
+                "description": "A soft footstep clicks.",
+            }),
+            "As she moves, a soft footstep clicks.",
         )
 
     def test_reference_definition_with_empty_where_is_grounded_into_single_shot(self):
@@ -701,6 +1080,69 @@ class DirectorTests(unittest.TestCase):
         self.assertGreater(usage["omitted_messages"], 0)
         self.assertLessEqual(usage["context_chars"] + usage["history_chars"], 8000)
         self.assertEqual(provider_messages[-1]["role"], "user")
+
+    def test_prompt_generation_optimization_controls_full_guide_context(self):
+        request = {
+            "document": director_document(),
+            "selected_shot_id": "shot-2",
+            "messages": [{"role": "user", "content": "Improve the camera move."}],
+        }
+
+        optimized_messages, optimized_usage = build_provider_messages(request)
+        guide = _base_prompt_writing_guide_for_mode("t2va")
+        self.assertNotIn(guide, optimized_messages[0]["content"])
+        self.assertEqual(optimized_usage["prompt_guide_chars"], 0)
+
+        full_messages, full_usage = build_provider_messages({
+            **request,
+            "optimize_prompt_generation": False,
+        })
+        self.assertIn(guide, full_messages[0]["content"])
+        self.assertIn(
+            "BEGIN AUTHORITATIVE MINIMAX H3 BASE-T2VA VIDEO PROMPT WRITING GUIDE",
+            full_messages[0]["content"],
+        )
+        self.assertEqual(full_usage["prompt_guide_chars"], len(guide))
+        self.assertEqual(full_usage["prompt_guides"], ["base-t2va"])
+        self.assertEqual(provider_context(full_messages)["scope"], "shot")
+
+    def test_base_guide_context_is_task_specific(self):
+        expected_sections = {
+            "t2va": "### Case 1: T2VA",
+            "i2va": "### Case 2: I2VA",
+            "fl2va": "### Case 3: FL2VA",
+            "l2va": "### Case 4: L2VA",
+        }
+        for mode, expected_case in expected_sections.items():
+            guide = _base_prompt_writing_guide_for_mode(mode)
+            self.assertIn(expected_case, guide)
+            for other_case in set(expected_sections.values()) - {expected_case}:
+                self.assertNotIn(other_case, guide)
+            self.assertNotIn("Full-Reference Mode Rewrite Output Format Guide", guide)
+
+    def test_reference_mode_receives_base_and_reference_guides(self):
+        document = director_document()
+        document["references"] = [{
+            "id": "reference-1",
+            "kind": "image",
+            "path": "subject.png",
+            "roles": ["subject"],
+        }]
+        messages, usage = build_provider_messages({
+            "document": document,
+            "scope": "project",
+            "messages": [{"role": "user", "content": "Use the referenced subject."}],
+            "optimize_prompt_generation": False,
+        })
+        base_guide = _shared_base_prompt_writing_guide()
+        reference_guide = _reference_prompt_writing_guide()
+        self.assertIn(base_guide, messages[0]["content"])
+        self.assertIn(reference_guide, messages[0]["content"])
+        self.assertEqual(usage["prompt_guides"], ["reference", "base-shared"])
+        self.assertEqual(usage["prompt_guide_chars"], len(base_guide) + len(reference_guide))
+        self.assertNotIn("### Case 2: I2VA", messages[0]["content"])
+        self.assertNotIn("### Case 3: FL2VA", messages[0]["content"])
+        self.assertNotIn("### Case 4: L2VA", messages[0]["content"])
 
     def test_valid_proposal_updates_only_allowed_fields(self):
         document = normalize_document(director_document())

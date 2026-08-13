@@ -19,6 +19,7 @@ DIRECTOR_IMAGE_USAGES = {
     "subject",
     "scene",
     "style",
+    "action",
     "pose",
     "camera",
     "storyboard",

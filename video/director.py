@@ -7,6 +7,8 @@ import hashlib
 import json
 import math
 import re
+from functools import lru_cache
+from pathlib import Path
 
 from .compiler import compile_prompt
 from .contracts import (
@@ -33,6 +35,10 @@ PROPOSAL_CORRECTION_TEMPERATURE = 0.0
 PROPOSAL_CORRECTION_ATTEMPTS = 3
 VISION_GROUNDING_ATTEMPTS = 2
 VISION_GROUNDING_MAX_CHARS = 1_200
+PROMPT_GUIDE_PATH = Path(__file__).with_name("guides") / "VIDEO_PROMPT_WRITING_GUIDE_base_en.md"
+REFERENCE_PROMPT_GUIDE_PATH = (
+    Path(__file__).with_name("guides") / "VIDEO_PROMPT_WRITING_GUIDE_ref_en.md"
+)
 SHOT_TEXT_FIELDS = {"composition", "subjects", "environment", "lighting", "transition", "notes"}
 SHOT_LIST_FIELDS = {"sounds", "visible_text"}
 SHOT_SEQUENCE_FIELDS = {"steps"}
@@ -74,6 +80,130 @@ DIRECT_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+@lru_cache(maxsize=1)
+def _prompt_writing_guide():
+    try:
+        guide = PROMPT_GUIDE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            "The bundled MiniMax prompting guide could not be loaded"
+        ) from exc
+    if not guide.strip():
+        raise RuntimeError("The bundled MiniMax prompting guide is empty")
+    return guide
+
+
+@lru_cache(maxsize=1)
+def _reference_prompt_writing_guide():
+    try:
+        guide = REFERENCE_PROMPT_GUIDE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            "The bundled MiniMax reference prompting guide could not be loaded"
+        ) from exc
+    if not guide.strip():
+        raise RuntimeError("The bundled MiniMax reference prompting guide is empty")
+    return guide
+
+
+def _guide_slice(guide, start, end=None):
+    start_index = guide.find(start)
+    if start_index < 0:
+        raise RuntimeError(f"The bundled MiniMax guide is missing section {start!r}")
+    end_index = len(guide) if end is None else guide.find(end, start_index + len(start))
+    if end_index < 0:
+        raise RuntimeError(f"The bundled MiniMax guide is missing section {end!r}")
+    return guide[start_index:end_index].strip()
+
+
+@lru_cache(maxsize=4)
+def _base_prompt_writing_guide_for_mode(resolved_mode):
+    guide = _prompt_writing_guide()
+    overview_ends = {
+        "t2va": "\n- **I2VA**:",
+        "i2va": "\n- **FL2VA**:",
+        "fl2va": "\n- **L2VA**:",
+        "l2va": "\n\n## 2.",
+    }
+    overview_starts = {
+        "t2va": "- **T2VA**:",
+        "i2va": "- **I2VA**:",
+        "fl2va": "- **FL2VA**:",
+        "l2va": "- **L2VA**:",
+    }
+    instruction_ends = {
+        "t2va": "\n\n**I2VA** always uses:",
+        "i2va": "\n\n**FL2VA** always uses:",
+        "fl2va": "\n\n**L2VA** always uses:",
+        "l2va": "\n\n### 2.2",
+    }
+    instruction_starts = {
+        "t2va": "**T2VA** has no image-alignment instruction",
+        "i2va": "**I2VA** always uses:",
+        "fl2va": "**FL2VA** always uses:",
+        "l2va": "**L2VA** always uses:",
+    }
+    keyframe_sections = {
+        "i2va": ("### 3.1 I2VA:", "\n\n### 3.2"),
+        "fl2va": ("### 3.2 FL2VA:", "\n\n### 3.3"),
+        "l2va": ("### 3.3 L2VA:", "\n\n## 4."),
+    }
+    case_starts = {
+        "t2va": "### Case 1: T2VA",
+        "i2va": "### Case 2: I2VA",
+        "fl2va": "### Case 3: FL2VA",
+        "l2va": "### Case 4: L2VA",
+    }
+    case_ends = {
+        "t2va": "\n\n### Case 2:",
+        "i2va": "\n\n### Case 3:",
+        "fl2va": "\n\n### Case 4:",
+        "l2va": None,
+    }
+    if resolved_mode not in overview_starts:
+        raise RuntimeError(f"No task-specific MiniMax base guide exists for {resolved_mode}")
+
+    parts = [
+        f"# Task-specific MiniMax base guide: {resolved_mode.upper()}",
+        "## Relevant task overview\n\n" + _guide_slice(
+            guide, overview_starts[resolved_mode], overview_ends[resolved_mode]
+        ),
+        "## Relevant alignment instruction\n\n" + _guide_slice(
+            guide, instruction_starts[resolved_mode], instruction_ends[resolved_mode]
+        ),
+        _guide_slice(guide, "### 2.2 Part Two Contains the Three Core Fields", "\n\n## 3."),
+    ]
+    if resolved_mode in keyframe_sections:
+        start, end = keyframe_sections[resolved_mode]
+        parts.append(_guide_slice(guide, start, end))
+    parts.extend([
+        _guide_slice(guide, "## 4. How to Write the Three Shared Core Sections", "\n\n## 5."),
+        _guide_slice(guide, case_starts[resolved_mode], case_ends[resolved_mode]),
+    ])
+    return "\n\n".join(parts)
+
+
+@lru_cache(maxsize=1)
+def _shared_base_prompt_writing_guide():
+    return _guide_slice(
+        _prompt_writing_guide(),
+        "## 4. How to Write the Three Shared Core Sections",
+        "\n\n## 5.",
+    )
+
+
+def _prompt_writing_guides(resolved_mode):
+    if resolved_mode == "ref2va":
+        # The reference guide delegates its shared shot, camera, dialogue, and
+        # sound rules to base section 4. Base task sections and examples are
+        # intentionally excluded from a full-reference request.
+        return [
+            ("reference", _reference_prompt_writing_guide()),
+            ("base-shared", _shared_base_prompt_writing_guide()),
+        ]
+    return [(f"base-{resolved_mode}", _base_prompt_writing_guide_for_mode(resolved_mode))]
+
 DIRECTOR_SYNCHRONIZATION_POLICY = """TEMPORAL INTENT, CONCURRENCY, AND SYNCHRONIZATION:
 MiniMax H3 tends to render adjacent clauses, sentences, steps, and sound items one after another unless their overlap is explicit. Translate the user's intended screen timing into unambiguous relative timing instead of merely preserving words such as "and." A chronological steps array orders beats, but it does not require every behavior within or across those beats to happen separately.
 
@@ -83,7 +213,19 @@ For concurrent visible behavior, place the relationship inside one action step a
 
 Dialogue and singing are timeline events, not pauses in the visuals. When speech overlaps an expression, gesture, movement, or other action, make the overlap explicit in the surrounding action text and in the dialogue delivery when appropriate, such as "while she continues smiling and waving." Keep the spoken or sung text itself verbatim. State lip synchronization for on-screen speech, and distinguish simultaneous speech, turn-taking, interruption, speech across a cut, and off-screen voiceover rather than leaving their timing implicit.
 
+Dialogue-step text contains only the user's exact spoken or sung words. Never put `<d>`, `<scenetrans>`, `<cutoff>`, language tags, "the audio carries over", or any narration inside text. Express cross-cut continuity only with `crosses_cut: true`, truncation only with `cutoff: true`, and voiceover only with `voiceover: true`; the compiler generates all required markup and continuity phrasing.
+
+MiniMax speaker IDs are annotations, never character names. Assign `(S1)`, `(S2)`, and so on only to a person who actually speaks, sings, or produces an off-screen human voice in the requested video; a silent character receives no speaker ID even if a voice could be imagined. In structured fields, `speaker_id` exists only on dialogue steps. Never use bare `S1`, `S1's`, or another bare speaker ID as a noun in composition, subjects, action, camera target, sounds, or other prose. Refer to the concrete person naturally, and place `(S1)` immediately after that person's identifying phrase when the compiled dialogue first establishes the voice. `<Subject 1>` is a reference label and is not interchangeable with `S1`.
+
 Every synchronized sounds item must identify its audible source and relative relationship to the visible trigger: for example, "Exactly as her heel contacts the floor, one footstep clicks," or "Her bracelet jingles in rhythm with each wave while she keeps smiling." Use during/throughout for sustained sound, begins as for onset, stops when for an ending, and immediately after only for a genuinely subsequent sound. Ambience and non-diegetic music may continue underneath action and dialogue; describe any requested onset, overlap, ducking, swell, interruption, or fade explicitly. Do not rely on the sounds array's position to imply timing.
+
+Keep audiovisual layers complementary rather than duplicative. Every requested visible story beat must be stated explicitly in an action step with its visible subject and change—for example, the baker opens the shutters—rather than being implied only by a synchronized sound. A sounds item states the audible consequence and its timing; it never substitutes for visible action. Never copy or paraphrase the same sentence into both an action step and sounds, and never replace a requested discovery, interaction, expression, or movement with only a creak, rustle, impact, breath, or other noise.
+
+Preserve the user's explicit subject-object and spatial relations exactly. If the user says a person sits on a chair, enters behind another subject, holds an object in the right hand, or stops beside a doorway, realize that same relation in the action step; never weaken or substitute it with sitting on the floor, standing beside the chair, changing hands, or another merely plausible staging choice.
+
+Return structured field values, not fragments of the compiled prompt. Never put `[Shot N]`, cut timestamps, `integrated_multimodal_description:`, `overall_soundscape:`, `non_diegetic_music:`, or any six-section heading inside composition, subjects, environment, lighting, steps, sounds, notes, or camera target; the deterministic compiler supplies that grammar. Whenever prose cites a supplied source, preserve its canonical angle-bracket token exactly—`<Picture 1>`, `<Video 1>`, `<Audio 1>`, or `<Subject 1>`—and never write a bare `Picture 1`, `Video 1`, `Audio 1`, or `Subject 1`.
+
+For a complete/full/entire production, every populated field must contain usable production detail. Never leave schema placeholders such as "subject", "environment", "lighting", "medium-wide composition", "room tone", or "the primary subject"; replace them with the concrete person/object, spatial framing, setting, illumination, audible source, and camera target required by the request and supplied references.
 
 Treat camera movement and continuing background activity as concurrent shot layers when that matches the request. Without duplicating the camera sentence generated from the camera field, action prose may say "Throughout the camera move" or "As the camera moves" to bind performance to it. Use relative synchronization cues rather than per-event timestamps."""
 
@@ -101,7 +243,7 @@ The authoritative video document is edited by deterministic code. Never claim th
 
 Allowed shot fields: composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. steps is the complete chronological sequence: action objects use type and text; dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, and cutoff. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing because each event belongs to its shot. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them. Camera may contain type, amplitude, speed, and target. A selected-shot proposal may also use update_project only for task_types, subject_definitions, summary, and retention_analysis when reference semantics must be created or repaired. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed.
 
-Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context. When a referenced image supplies a person, object, scene, style, action, pose, or camera treatment, define reusable visible content as <Subject N> sourced from its <Picture N>, add it to summary and retention_analysis, and use <Subject N> naturally in every affected shot. One Picture may supply multiple independently selectable Subjects; the user's natural identifiers have already been resolved to canonical tokens from subject_registry. A Picture used only as the source of a Subject does not get a separate Picture definition or retention line. A storyboard or concrete keyframe may be defined directly as <Picture N>. Every source reference must be represented in subject_definitions, and every defined label must have one retention_analysis entry and appear in the summary and applicable shot/audio fields.
+Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context. Never call an on-screen vocalizing person merely "the speaker": on first speaking appearance, bind the speaker to a concrete visible identity and its supplied source, or use its canonical Subject token in REF2VA. In base keyframe modes, identify the sole visible speaker as "the [neutral subject name] shown in <Picture N>"; do not invent a Subject token there. When a REF2VA referenced image supplies a person, object, scene, style, action, pose, or camera treatment, define reusable visible content as <Subject N> sourced from its <Picture N>, add it to summary and retention_analysis, and use <Subject N> naturally in every affected shot. One Picture may supply multiple independently selectable Subjects; the user's natural identifiers have already been resolved to canonical tokens from subject_registry. A Picture used only as the source of a Subject does not get a separate Picture definition or retention line. A storyboard or concrete keyframe may be defined directly as <Picture N>. Every REF2VA source reference must be represented in subject_definitions, and every defined label must have one retention_analysis entry and appear in the summary and applicable shot/audio fields.
 
 When exactly one compatible reference exists, resolve natural phrases such as "the girl from the reference" to that supplied source and still emit its canonical Subject and Picture tokens. When multiple compatible references exist, never guess which one words such as "the girl," "the image," or "the reference" mean; follow the exact <Picture N>, <Video N>, or <Audio N> labels in the request and keep each assignment distinct.
 
@@ -131,9 +273,11 @@ The authoritative video document is edited and compiled by deterministic code. N
 
 Allowed project fields: main_description, style, overall_soundscape, non_diegetic_music, summary, complete_silence, task_types, subject_definitions, and retention_analysis. main_description is the concise planning synopsis shown to the user; it is never compiled and cannot substitute for shot-specific detail. update_shot may target any existing shot and may change start, composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. add_shot uses those same fields plus a new unique id. steps replaces the complete chronological action/dialogue sequence. Action objects use type and text. Dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, and cutoff. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them. remove_shot cannot remove a shot that contains dialogue or visible text. Populate an existing shot with update_shot; never add a replacement for it. Preserve existing shot IDs when they remain useful. Preserve shot count and start times for narrow edits, but for broad production composition choose the shot count implied by the visual story and use add_shot or remove_shot as needed. A shot_id or new shot id is the exact literal id from the context, such as shot-1; it is never a display token such as [Shot 1]. Nest list and sequence fields inside fields for update_shot and inside shot for add_shot. Store camera movement only in camera; do not repeat the camera sentence in an action step because the deterministic compiler adds it. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed. Use N/A for no non-diegetic music. complete_silence suppresses dialogue, synchronized sounds, ambience, and non-diegetic music in the compiled prompt.
 
-Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context and preserve them verbatim. When the project resolves to REF2VA, always populate all six guide sections through the structured document: task_types and summary, subject_definitions, retention_analysis, detailed shot fields, overall_soundscape, and non_diegetic_music. Keep the detailed description chronological and concise. Aim toward the guide's 350–500-word range only when the requested generation genuinely needs that detail; never pad a short clip, repeat subject definitions, restate reference appearance in shot prose, or fill pixel-owned first-frame fields merely to reach a word count.
+Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context and preserve them verbatim. Never call an on-screen vocalizing person merely "the speaker": on first speaking appearance, bind the speaker to a concrete visible identity and its supplied source, or use its canonical Subject token in REF2VA. In base keyframe modes, identify the sole visible speaker as "the [neutral subject name] shown in <Picture N>"; do not invent a Subject token there. When the project resolves to REF2VA, always populate all six guide sections through the structured document: task_types and summary, subject_definitions, retention_analysis, detailed shot fields, overall_soundscape, and non_diegetic_music. Keep the detailed description chronological and concise. Aim toward the guide's 350–500-word range only when the requested generation genuinely needs that detail; never pad a short clip, repeat subject definitions, restate reference appearance in shot prose, or fill pixel-owned first-frame fields merely to reach a word count.
 
-For each image/video visual reference used as a person, object, scene, style, action, pose, or camera treatment, define reusable <Subject N> content and cite its source token in the definition. One Picture may supply multiple independently selectable Subjects; the user's natural identifiers have already been resolved to canonical tokens from subject_registry. A source image used only to define Subjects is cited inside those Subject definitions, not defined separately. Define a <Picture N> directly only for a storyboard or concrete keyframe/composition anchor. Define editing/continuation sources as <Video N> and audio sources as <Audio N>. Every source reference must be represented in subject_definitions; every defined label must appear in summary, have exactly one retention_analysis entry, and be used naturally in every applicable shot or audio section. With multiple references, keep their numbering and meanings distinct. With multiple shots, repeat the same Subject label wherever that subject reappears; do not repeat a catalog of visual traits.
+For each image/video visual reference used as a person, object, scene, style, action, pose, or camera treatment, define reusable <Subject N> content and cite its source token in the definition. One Picture may supply multiple independently selectable Subjects; the user's natural identifiers have already been resolved to canonical tokens from subject_registry. A source image used only to define Subjects is cited inside those Subject definitions, not defined separately. Define a <Picture N> directly only for a storyboard or concrete keyframe/composition anchor. Define editing/continuation sources as <Video N> and audio sources as <Audio N>. Every source reference must be represented in subject_definitions; every defined label must appear in summary, have exactly one retention_analysis entry, and be used naturally in every applicable shot or audio section. With multiple references, keep their numbering and meanings distinct. With multiple shots, repeat the same Subject label wherever that subject reappears; do not repeat a catalog of visual traits. If the user applies every reference throughout the whole video or every shot, place every applicable canonical label directly in every shot and list every shot in each corresponding retention entry; repeating unlabeled traits does not satisfy that coverage.
+
+For a video or audio source that has not been visually or aurally inspected in this turn, treat its supplied reference description as exhaustive. Do not invent wardrobe, identity traits, props, voices, lyrics, camera details, or source events that are absent from that description. A derived subject may be defined minimally as the courier shown in <Video 1>; never embellish it with a dark uniform, satchel, or other unsupported traits.
 
 When exactly one compatible reference exists, resolve natural phrases such as "the girl from the reference" to that supplied source and still emit its canonical Subject and Picture tokens. When multiple compatible references exist, never guess which one words such as "the girl," "the image," or "the reference" mean; follow the exact <Picture N>, <Video N>, or <Audio N> labels in the request and keep each assignment distinct.
 
@@ -141,15 +285,17 @@ Reference project fields use these shapes: task_types is a string array; subject
 
 When images are attached, inspect only visible details and follow each attachment's usage. An image marked describe is visual context only; other usages correspond to project reference roles and include a canonical token when committed. Clearly separate observation from inference.
 
+The six REF2VA sections are compiled output, not writable project fields. Never emit `detailed_description` in update_project. Build it through project style plus structured shot composition, subjects, environment, lighting, camera, steps, visible_text, and sounds; the compiler then emits `detailed_description:` in the final prompt.
+
 If the user's request only assigns or repairs a reference role, preserve the existing main description, shot count, timing, actions, environments, lighting, camera moves, sounds, dialogue, and visible text. Add only the required reference and subject bindings without replacing the established story or action. Existing action, environment, lighting, and composition prose must be retained verbatim unless the user explicitly asks to change it; do not reinterpret the production as a different scene.
 
-Do not change references, existing dialogue, lyrics, existing speaker IDs, or visible text. Preserve every existing dialogue and visible-text string verbatim; new dialogue is allowed only when the user requests it. Never invent a reference token: when the supplied reference and subject token lists are empty, write plain descriptive prose without angle-bracket tokens. Maintain subject identity, screen direction, props, wardrobe, environment, and action state across cuts. When the user asks for an attribute to remain consistent, repeat the same concrete state across the affected shots; never substitute drifting numeric values or ambiguous alternatives. Every sounds item must describe something audible, never a visual state or silence. Dialogue and diegetic music stay within shot action; overall_soundscape summarizes only ambience, action sounds, and non-verbal human sound in one paragraph and must not mention the presence or absence of non-diegetic music; non_diegetic_music describes only audience-heard instrumentation, tempo, rhythm, and dynamics."""
+Do not change references, existing dialogue, lyrics, existing speaker IDs, or visible text. Preserve every existing dialogue and visible-text string verbatim; new dialogue is allowed only when the user requests it. Never invent a reference token: when the supplied reference and subject token lists are empty, write plain descriptive prose without angle-bracket tokens. Maintain subject identity, screen direction, props, wardrobe, environment, and action state across cuts. When the user asks for an attribute to remain consistent, repeat the same concrete state across the affected shots; never substitute drifting numeric values or ambiguous alternatives. Every sounds item must describe something audible, never a visual state or silence. Dialogue and diegetic music stay within shot action; overall_soundscape summarizes only ambience, action sounds, and non-verbal human sound already established in shot sounds or action, never inventing a new door, vehicle, impact, voice, or other event merely to add texture. It must not mention the presence or absence of non-diegetic music; non_diegetic_music describes only audience-heard instrumentation, tempo, rhythm, and dynamics."""
 
 
 VISION_GROUNDING_SYSTEM_MESSAGE = """You are Prompt Studio Video's visual grounding pass.
 Inspect the attached images directly and report only concrete facts visible in their pixels. This is observation, not video directing: do not add the user's requested action, story, weather, setting, mood, or wardrobe unless it is already visible. Do not infer hidden attributes, identity, personality, or intent. If a detail is unclear, omit it or state the uncertainty instead of guessing.
 
-For a person, prioritize visibly supported hair color/style, face and skin appearance, clothing type/color/material, footwear, accessories, pose, framing, and immediate background. For another subject type, provide equivalently concrete colors, shapes, materials, textures, components, layout, and spatial relationships. For style, pose, camera, storyboard, first-frame, or last-frame usages, also describe the visible composition and treatment relevant to that usage.
+For a person, prioritize visibly supported hair color/style, face and skin appearance, clothing type/color/material, footwear, accessories, pose, framing, and immediate background. For another subject type, provide equivalently concrete colors, shapes, materials, textures, components, layout, and spatial relationships. For style, action, pose, camera, storyboard, first-frame, or last-frame usages, also describe the visible composition and treatment relevant to that usage. For action usage, report only the visible body/object state, interaction, direction, and motion cues; do not invent movement before or after the depicted instant.
 
 Follow assigned_usage strictly. For scene usage, report the environment, furnishings, architecture, materials, layout, and lighting while omitting a visible person's identity and wardrobe unless required to explain spatial scale. For style usage, report rendering medium, shapes, linework, texture, palette, and compositional treatment while omitting depicted character identity and wardrobe. For subject, first_frame, and last_frame usage, identify each independently selectable primary subject with a short neutral noun phrase such as "young woman", "dog", or "car". Add a concise location whenever more than one compatible subject is present, such as "left", "center", or "right". Do not put clothing, hair, facial features, pose, mood, background, or prompt-like prose in a subject name. Also return visual_selectors: short natural aliases a user could use to identify that subject from visible hair, clothing, color, accessories, or other distinguishing pixels, for example "person in black", "white shirt", or "woman with blonde hair". Include only grounded distinguishing attributes and useful wording variants. For every subject, also return grounded_attributes as an object containing only visibly supported concise values under hair, face, clothing, footwear, accessories, body, or other. visual_selectors and grounded_attributes are persistent private metadata and must never be treated as requested prompt content.
 
@@ -159,11 +305,11 @@ Return JSON only with one entry per image in the same order: an object containin
 I2VA_DIRECTOR_POLICY = """FIRST-FRAME LOCK (I2VA and mixed full-reference tasks):
 The supplied first-frame image is the sole authority for everything already visible at 0.00 seconds. Do not infer, restate, embellish, or invent its setting, background, lighting, time of day, weather, visual style, subject appearance, wardrobe, props, composition, or color palette. Describing those details in text can contradict the pixels and cause visual drift.
 
-For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields."""
+For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style unless the project contains a separately assigned style reference, in which case that source controls only the rendering treatment while the first frame still controls its anchored visible content and layout. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields."""
 
 
 BASE_KEYFRAME_DIRECTOR_POLICY = """BASE KEYFRAME MODE (I2VA / FL2VA / L2VA):
-This project uses the base keyframe prompt contract, not REF2VA's six-section reference contract. Use the supplied <Picture N> tokens where the keyframe path needs them, but never create or use <Subject N> tokens, subject_definitions, retention_analysis, or REF2VA task_types. Describe people and objects with ordinary nouns. In L2VA, build a plausible preceding state and a concrete motion path that converges on the supplied final-frame <Picture 1> in the final shot."""
+This project uses the base keyframe prompt contract, not REF2VA's six-section reference contract. Use the supplied <Picture N> tokens where the keyframe path needs them, but never create or use <Subject N> tokens, subject_definitions, retention_analysis, or REF2VA task_types. Describe people and objects with ordinary nouns. Treat every visible keyframe observation as a hard endpoint constraint: preserve observed identity, exact clothing type and fit, accessories, key objects, and stable spatial relationships. Never replace a grounded garment, prop, or appearance trait with a merely similar invention such as changing a ruched mini dress into a flowing dress. Describe only the motion or state change needed between endpoints. In L2VA, build a plausible preceding state and a concrete motion path that converges on the supplied final-frame <Picture 1> in the final shot."""
 
 
 def _text(value, maximum=MAX_MESSAGE_CHARS):
@@ -261,6 +407,14 @@ def _has_first_frame_anchor(document):
     return any(
         reference.get("kind") == "image"
         and "first_frame" in set(reference.get("roles") or [])
+        for reference in document.get("references") or []
+    )
+
+
+def _has_external_style_reference(document):
+    return any(
+        "style" in set(reference.get("roles") or [])
+        and "first_frame" not in set(reference.get("roles") or [])
         for reference in document.get("references") or []
     )
 
@@ -719,6 +873,17 @@ def build_provider_messages(data):
         system_message += "\n\n" + BASE_KEYFRAME_DIRECTOR_POLICY
     if _has_first_frame_anchor(document):
         system_message += "\n\n" + I2VA_DIRECTOR_POLICY
+    prompt_guide_chars = 0
+    prompt_guides = []
+    if data.get("optimize_prompt_generation", True) is False:
+        for guide_name, prompt_guide in _prompt_writing_guides(document["resolved_mode"]):
+            prompt_guide_chars += len(prompt_guide)
+            prompt_guides.append(guide_name)
+            system_message += (
+                f"\n\nBEGIN AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE\n\n"
+                + prompt_guide
+                + f"\nEND AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE"
+            )
     messages = [{
         "role": "system",
         "content": system_message + "\n\nCurrent production context (reference data):\n" + context_json,
@@ -728,6 +893,8 @@ def build_provider_messages(data):
         "history_chars": history_chars,
         "history_messages": len(history),
         "omitted_messages": omitted,
+        "prompt_guide_chars": prompt_guide_chars,
+        "prompt_guides": prompt_guides,
     }
 
 
@@ -824,6 +991,11 @@ def _parse_vision_grounding(raw, attachments):
             raise ValueError(
                 f"image observation {index} must give same-type subjects distinct locations"
             )
+        if attachments[index - 1].get("usage") not in {"subject", "first_frame", "last_frame"}:
+            # Scene, style, action, pose, camera, and storyboard ground the
+            # assigned visual role as a whole; their depicted people are not
+            # selectable identity bindings.
+            candidates = []
         by_index[index] = {
             "observations": _role_focused_observations(
                 observations, attachments[index - 1].get("usage")
@@ -846,9 +1018,41 @@ def _parse_vision_grounding(raw, attachments):
 
 
 def _role_focused_observations(value, usage):
-    """Remove clearly role-irrelevant person descriptions from scene grounding."""
+    """Keep only visual facts relevant to the attachment's assigned role."""
     observations = _text(value, VISION_GROUNDING_MAX_CHARS)
-    if _text(usage, 40).casefold() != "scene":
+    role = _text(usage, 40).casefold()
+    if role in {"action", "pose", "camera", "style", "storyboard"}:
+        role_terms = {
+            "action": (
+                r"\b(sits?|stands?|lowers?|raises?|cross(?:ed|es)?|arms?|hands?|legs?|"
+                r"rests?|leans?|steps?|walks?|runs?|turns?|movement|motion|pose|positioned)\b"
+            ),
+            "pose": (
+                r"\b(sits?|stands?|upright|cross(?:ed|es)?|arms?|hands?|legs?|rests?|leans?|"
+                r"pose|posture|positioned|facing)\b"
+            ),
+            "camera": (
+                r"\b(shot|frame|framing|composition|center(?:ed)?|camera|view|angle|"
+                r"foreground|background|door|sunlight|shadow)\b"
+            ),
+            "style": (
+                r"\b(style|aesthetic|illustration|rendering|medium|vector|linework|texture|"
+                r"palette|color|gradient|shading|edges?|shapes?)\b"
+            ),
+            "storyboard": (
+                r"\b(composition|layout|frame|left|right|center(?:ed)?|foreground|background|"
+                r"sky|ground|hill|cloud|subject|figure)\b"
+            ),
+        }[role]
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"(?<=[.!?])\s+|,\s*", observations)
+            if clause.strip()
+        ]
+        focused = [clause for clause in clauses if re.search(role_terms, clause, re.IGNORECASE)]
+        result = ". ".join(clause.rstrip(" .") for clause in focused) or observations
+        return _text(result, 500)
+    if role != "scene":
         return observations
     person_detail = re.compile(
         r"\b(woman|man|person|girl|boy|she|he|her|his|hair|wearing|wears|dressed|"
@@ -1060,7 +1264,20 @@ def _overall_soundscape(value):
 
 
 def _audible_sound(value):
-    sound = _text(value, 2_000)
+    if isinstance(value, dict):
+        sound = next((
+            candidate
+            for name in ("text", "description", "sound", "content", "value")
+            if (candidate := _text(value.get(name), 2_000))
+        ), "")
+        timing = _text(value.get("timing"), 300)
+        source = _text(value.get("source"), 300)
+        if sound and timing and timing.casefold() not in sound.casefold():
+            sound = f"{timing.rstrip(' ,.;')}, {sound[0].lower() + sound[1:]}"
+        elif not sound and source:
+            sound = source
+    else:
+        sound = _text(value, 2_000)
     visual_state = re.compile(
         r"(?:the\s+)?[^.!?]{1,180}\b(?:remains?|stays?)\s+(?:completely\s+)?(?:still|motionless)\.?|"
         r"(?:no\s+sound|complete\s+silence|silence|silent)\.?",
@@ -1100,6 +1317,17 @@ def _task_types(value):
 
 
 def _subject_definitions(value):
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        value = decoded
+    if isinstance(value, dict):
+        value = [
+            {"label": label, "text": text if not isinstance(text, dict) else text.get("text")}
+            for label, text in value.items()
+        ]
     if not isinstance(value, list):
         raise ValueError("subject_definitions must be a list")
     result = []
@@ -1121,6 +1349,17 @@ def _subject_definitions(value):
 
 
 def _retention_analysis(value):
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = value
+        value = decoded
+    if isinstance(value, dict):
+        value = [
+            {"label": label, **(item if isinstance(item, dict) else {"detail": item})}
+            for label, item in value.items()
+        ]
     if not isinstance(value, list):
         raise ValueError("retention_analysis must be a list")
     result = []
@@ -1253,7 +1492,10 @@ def _shot_steps(value):
             # the same harmless key mismatch.
             text = next((
                 candidate
-                for name in ("text", "description", "action")
+                for name in (
+                    "text", "description", "action", "content", "value", "details",
+                    "motion", "movement", "event", "beat", "instruction",
+                )
                 if (candidate := _text(item.get(name), 8_000))
             ), "")
             if not text:
@@ -1627,6 +1869,7 @@ def _sanitize_proposal_tokens(proposal, allowed_tokens, *, allow_reference_seman
             container["camera"]["target"] = _sanitize_model_tokens(
                 container["camera"]["target"], allowed_tokens, inferred_tokens
             )
+        sanitized_steps = []
         for step in container.get("steps") or []:
             if not isinstance(step, dict):
                 continue
@@ -1642,6 +1885,14 @@ def _sanitize_proposal_tokens(proposal, allowed_tokens, *, allow_reference_seman
                 step["speaker"] = _sanitize_model_tokens(
                     step.get("speaker"), allowed_tokens, inferred_tokens
                 )
+            if step.get("type") != "action" or _text(step.get("text"), 8_000):
+                sanitized_steps.append(step)
+        if "steps" in container:
+            if not sanitized_steps:
+                raise ValueError(
+                    "Token sanitization removed every action/dialogue step; rewrite the shot with concrete prose"
+                )
+            container["steps"] = sanitized_steps
     return proposal
 
 
@@ -1995,6 +2246,19 @@ def _reference_role_description(reference):
     return "referenced source"
 
 
+def _anchor_subject_binding_requested(data, source_token):
+    ordinal = re.search(r"(\d+)", _text(source_token, 80))
+    if not ordinal:
+        return False
+    number = ordinal.group(1)
+    content = _latest_user_content(data)
+    subject = r"(?:girl|woman|boy|man|person|character|subject|child|dog|cat|car|object)"
+    picture = rf"<?\s*Picture\s+{number}\s*>?"
+    return bool(
+        re.search(rf"\b{subject}\b\s+(?:shown\s+in|from|in)\s+{picture}", content, re.IGNORECASE)
+    )
+
+
 def _complete_grounded_reference_semantics(document, proposal, data):
     """Complete an otherwise applicable REF2VA proposal from committed, grounded inputs.
 
@@ -2030,10 +2294,44 @@ def _complete_grounded_reference_semantics(document, proposal, data):
         for item in document.get("subject_definitions") or []
     }
     required_tokens = []
+    forbidden_anchor_subject_labels = set()
     for reference in document["references"]:
         source_token = _text(reference.get("label"), 80)
         roles = set(reference.get("roles") or [])
-        if reference.get("kind") == "image" and bindings_by_reference.get(reference["id"]):
+        existing_anchor_subject = any(
+            source_token.casefold() in _text(item.get("text"), 8_000).casefold()
+            and _text(item.get("label"), 80).casefold().startswith("subject")
+            for item in document.get("subject_definitions") or []
+        )
+        anchor_only = bool(roles) and roles <= {"first_frame", "last_frame"}
+        bind_anchor_subject = (
+            not anchor_only
+            or existing_anchor_subject
+            or _anchor_subject_binding_requested(data, source_token)
+        )
+        if anchor_only and not bind_anchor_subject:
+            ordinal = re.search(r"(\d+)", source_token)
+            if ordinal:
+                forbidden_anchor_subject_labels.add(f"subject {int(ordinal.group(1))}")
+            removed_labels = {
+                _text(item.get("label"), 80).strip("<>").casefold()
+                for item in semantic["subject_definitions"]
+                if _text(item.get("label"), 80).casefold().startswith("subject")
+                and source_token.casefold() in _text(item.get("text"), 8_000).casefold()
+            }
+            semantic["subject_definitions"] = [
+                item for item in semantic["subject_definitions"]
+                if _text(item.get("label"), 80).strip("<>").casefold() not in removed_labels
+            ]
+            semantic["retention_analysis"] = [
+                item for item in semantic["retention_analysis"]
+                if _text(item.get("label"), 80).strip("<>").casefold() not in removed_labels
+            ]
+        if (
+            reference.get("kind") == "image"
+            and bindings_by_reference.get(reference["id"])
+            and bind_anchor_subject
+        ):
             reference_bindings = bindings_by_reference[reference["id"]]
             candidate_pool = [binding["candidate"] for binding in reference_bindings]
             matched = _matched_subject_candidates(candidate_pool, data)
@@ -2148,9 +2446,25 @@ def _complete_grounded_reference_semantics(document, proposal, data):
                 semantic["subject_definitions"].append(definition)
             else:
                 definition.update({"label": label, "text": definition_text})
+        elif (
+            reference.get("kind") == "image"
+            and roles & {"scene", "style", "action", "pose", "camera"}
+            and "subject" not in roles
+            and facts
+        ):
+            concise_facts = _text(facts, 500)
+            detail = f": {concise_facts.rstrip(' .')}" if concise_facts else ""
+            definition_text = f"is the {role_description} shown in {source_token}{detail}."
+            if definition is None:
+                definition = {"label": label, "text": definition_text}
+                semantic["subject_definitions"].append(definition)
+            else:
+                definition.update({"label": label, "text": definition_text})
         elif definition is None:
             detail = f": {facts.rstrip(' .')}" if facts else ""
-            definition_text = f"is the {role_description} sourced from {source_token}{detail}."
+            direct_source_label = token.casefold() == source_token.casefold()
+            source_phrase = "" if direct_source_label else f" sourced from {source_token}"
+            definition_text = f"is the {role_description}{source_phrase}{detail}."
             definition = {
                 "label": label,
                 "text": definition_text,
@@ -2195,6 +2509,7 @@ def _complete_grounded_reference_semantics(document, proposal, data):
             semantic["retention_analysis"].append(retention)
         else:
             retention["label"] = token
+            retention["relationship"] = relationship
             if not _text(retention.get("where"), 2_000):
                 retention["where"] = "throughout the video"
             if "subject" in roles and reference.get("kind") == "image":
@@ -2205,6 +2520,16 @@ def _complete_grounded_reference_semantics(document, proposal, data):
                 retention["detail"] = (
                     f"The complete anchored composition and appearance established by {source_token} are preserved."
                 )
+            elif (
+                reference.get("kind") == "image"
+                and roles & {"scene", "style", "action", "pose", "camera"}
+                and "subject" not in roles
+                and facts
+            ):
+                retention["detail"] = (
+                    f"The assigned {role_description} defined for {token} is retained "
+                    "wherever that label appears."
+                )
             elif not _text(retention.get("detail"), 8_000):
                 retention["detail"] = facts or f"The assigned {role_description} remains consistent."
 
@@ -2213,6 +2538,50 @@ def _complete_grounded_reference_semantics(document, proposal, data):
             semantic["task_types"].append(task)
     required_tokens = list(dict.fromkeys(required_tokens))
     required_tokens.sort(key=lambda value: (value.casefold().startswith("<subject"), value.casefold()))
+    obsolete_direct_labels = {
+        _text(reference.get("label"), 80).strip("<>").casefold()
+        for reference in document.get("references") or []
+        if _derived_reference_label(reference).casefold()
+        != _text(reference.get("label"), 80).strip("<>").casefold()
+    } | forbidden_anchor_subject_labels
+    for label in forbidden_anchor_subject_labels:
+        ordinal = re.search(r"(\d+)", label)
+        if not ordinal:
+            continue
+        subject_token = f"<Subject {int(ordinal.group(1))}>"
+        picture_token = f"<Picture {int(ordinal.group(1))}>"
+        semantic["summary"] = re.sub(
+            re.escape(subject_token), picture_token, semantic["summary"], flags=re.IGNORECASE
+        )
+    semantic["subject_definitions"] = [
+        item for item in semantic["subject_definitions"]
+        if _text(item.get("label"), 80).strip("<>").casefold() not in obsolete_direct_labels
+    ]
+    definitions_by_label = {}
+    for item in semantic["subject_definitions"]:
+        definitions_by_label.setdefault(
+            _text(item.get("label"), 80).strip("<>").casefold(), item
+        )
+    semantic["subject_definitions"] = list(definitions_by_label.values())
+    allowed_retention_labels = set(definitions_by_label)
+    retention_by_label = {}
+    for item in semantic["retention_analysis"]:
+        key = _text(item.get("label"), 80).strip("<>").casefold()
+        if key in allowed_retention_labels:
+            retention_by_label.setdefault(key, item)
+    semantic["retention_analysis"] = list(retention_by_label.values())
+    if _requests_all_reference_shots(data):
+        all_shots = "appears in " + " and ".join(
+            f"[Shot {index + 1}]" for index in range(len(document.get("shots") or []))
+        )
+        visual_labels = {
+            _derived_reference_label(reference).strip("<>").casefold()
+            for reference in document.get("references") or []
+            if reference.get("kind") in {"image", "video"}
+        }
+        for item in semantic["retention_analysis"]:
+            if _text(item.get("label"), 80).strip("<>").casefold() in visual_labels:
+                item["where"] = all_shots
     semantic["subject_definitions"].sort(key=lambda item: (
         _text(item.get("label"), 80).casefold().startswith("subject"),
         _text(item.get("label"), 80).casefold(),
@@ -2279,7 +2648,12 @@ def _explicit_subject_attribute_request(data):
         text,
         re.IGNORECASE,
     )
-    return bool(appearance_change or direct_wardrobe_action)
+    requested_sound_only = re.search(
+        r"\b(?:fabric|clothing|dress|wardrobe)\s+(?:rustle|sound|noise)\b",
+        text,
+        re.IGNORECASE,
+    )
+    return bool((appearance_change and not requested_sound_only) or direct_wardrobe_action)
 
 
 def _prompt_semantic_text(document):
@@ -2392,8 +2766,6 @@ def _canonicalize_requested_dialogue_speakers(proposal, document, data):
         for token in requested_speakers
     ]
     requested_speakers = list(dict.fromkeys(requested_speakers))
-    if not requested_speakers:
-        return proposal
     proposal = copy.deepcopy(proposal)
     dialogue_events = []
     for operation in proposal.get("operations") or []:
@@ -2411,7 +2783,38 @@ def _canonicalize_requested_dialogue_speakers(proposal, document, data):
     elif len(requested_speakers) == len(dialogue_events):
         for event, token in zip(dialogue_events, requested_speakers):
             event["speaker"] = token
+    sole_binding = bindings[0] if len(bindings) == 1 else None
+    generic_speaker = re.compile(
+        r"^(?:the\s+)?(?:speaker|subject|character|person|woman|young\s+woman|girl|"
+        r"man|young\s+man|boy|she|he|they)$",
+        re.IGNORECASE,
+    )
     for event in dialogue_events:
+        if (
+            sole_binding
+            and not event.get("voiceover")
+            and not event.get("offscreen")
+            and generic_speaker.fullmatch(_text(event.get("speaker"), 120))
+        ):
+            if document.get("resolved_mode") == "ref2va":
+                event["speaker"] = sole_binding["token"]
+            else:
+                subject_name = _text(
+                    (sole_binding.get("candidate") or {}).get("name"), 120
+                ).rstrip(" .")
+                subject_name = re.sub(
+                    r"^(?:the|a|an)\s+", "", subject_name, flags=re.IGNORECASE
+                )
+                subject_name = subject_name or _candidate_phrase(
+                    sole_binding.get("candidate") or {}
+                )
+                if subject_name and sole_binding.get("source_token"):
+                    event["speaker"] = (
+                        f"The {subject_name} shown in {sole_binding['source_token']}"
+                    )
+            ordinal = re.search(r"(\d+)", sole_binding["label"])
+            if ordinal:
+                event["speaker_id"] = f"S{ordinal.group(1)}"
         match = re.fullmatch(r"<Subject (\d+)>", _text(event.get("speaker"), 80), re.IGNORECASE)
         if match:
             event["speaker_id"] = f"S{int(match.group(1))}"
@@ -2435,7 +2838,10 @@ def _validate_private_subject_selectors(original, result, data, proposal=None):
 
 def _canonicalize_reference_definition_grammar(document):
     """Make compiler-prefixed reference definitions read as grammatical sentences."""
-    leading_verb = re.compile(r"^(?:is|are|represents|depicts|shows|provides|uses)\b", re.IGNORECASE)
+    leading_verb = re.compile(
+        r"^(?:is|are|represents|depicts|shows|provides|uses|serves|defines)\b",
+        re.IGNORECASE,
+    )
     for definition in document.get("subject_definitions") or []:
         label = _text(definition.get("label"), 80).strip("<>")
         token = f"<{label}>"
@@ -2449,7 +2855,28 @@ def _canonicalize_reference_definition_grammar(document):
         )
         if text and not leading_verb.match(text):
             text = "is " + text[0].lower() + text[1:]
+        text = re.sub(
+            r"^is\s+(is|are|represents|depicts|shows|provides|uses|serves|defines)\b",
+            r"\1",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if label.casefold().startswith(("audio ", "video ", "picture ")):
+            text = re.sub(
+                rf"\s*(?:sourced\s+from|source\s+reference:)\s*{re.escape(token)}\s*\.?",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+            text = re.sub(r"\s+([:;,.])", r"\1", text)
         definition["text"] = text
+    task_names = "|".join(re.escape(value) for value in sorted(TASK_TYPES, key=len, reverse=True))
+    document["summary"] = re.sub(
+        rf"^\s*\[(?:{task_names})(?:\s*\+\s*(?:{task_names}))*\]\s*",
+        "",
+        _text(document.get("summary"), 8_000),
+        flags=re.IGNORECASE,
+    )
 
 
 def _canonicalize_subject_token_prose(document):
@@ -2502,20 +2929,25 @@ def _ground_reference_definitions(document):
             if sentence.casefold() not in _text(document.get(field)).casefold():
                 document[field] = " ".join(part for part in (document.get(field), sentence) if _text(part))
             continue
-        if token.casefold().startswith("<subject"):
+        has_first_frame = _has_first_frame_anchor(document)
+        if roles & {"video_edit", "video_continue"}:
+            target_field = "steps"
+        elif "subject" in roles:
             target_field = "subjects"
-        elif roles & {"video_edit", "video_continue"}:
+        elif "scene" in roles:
+            target_field = "environment"
+        elif roles & {"action", "pose"}:
+            target_field = "steps"
+        elif "last_frame" in roles and has_first_frame:
             target_field = "steps"
         else:
             target_field = (
-                "environment" if roles & {"scene"}
-                else "steps" if roles & {"action", "pose"}
-                else "composition" if roles & {"style", "camera", "storyboard", "first_frame", "last_frame"}
+                "composition" if roles & {"style", "camera", "storyboard", "first_frame", "last_frame"}
                 else "subjects"
             )
         if "style" in roles:
             field = "style"
-            sentence = f"{token} {text}".strip()
+            sentence = f"The visual treatment follows {token}."
             if sentence.casefold() not in _text(document.get(field)).casefold():
                 document[field] = " ".join(part for part in (document.get(field), sentence) if _text(part))
         where = _text((retention.get(token.casefold()) or {}).get("where"), 2_000)
@@ -2537,6 +2969,10 @@ def _ground_reference_definitions(document):
             retention_item["where"] = "appears in " + " and ".join(
                 f"[Shot {index + 1}]" for index in sorted(shot_indexes)
             )
+        if "style" in roles and has_first_frame:
+            # The compiler emits an explicit external-treatment scope beside
+            # the first-frame lock; do not mutate pixel-owned shot fields.
+            continue
         for index in sorted(shot_indexes):
             if not 0 <= index < len(document.get("shots") or []):
                 continue
@@ -2547,7 +2983,7 @@ def _ground_reference_definitions(document):
                 # never injected into pixel-owned setup prose merely to satisfy
                 # semantic token coverage.
                 continue
-            if token.casefold().startswith("<subject"):
+            if token.casefold().startswith("<subject") and target_field == "subjects":
                 if token.casefold() in json.dumps(shot, ensure_ascii=False).casefold():
                     continue
                 current_subjects = _text(shot.get("subjects"), 8_000)
@@ -2583,6 +3019,10 @@ def _ground_reference_definitions(document):
                         if "first_frame" in roles
                         else f"The shot lands on {token}, preserving its complete final composition."
                         if "last_frame" in roles
+                        else f"{token} defines the camera height and framing."
+                        if "camera" in roles
+                        else f"{token} defines the storyboard layout and composition."
+                        if "storyboard" in roles
                         else f"{token} defines the visual treatment."
                     )
                 )
@@ -2761,6 +3201,8 @@ def _canonicalize_retention_shot_mentions(document):
             where,
             flags=re.IGNORECASE,
         )
+        while where.startswith("(") and where.endswith(")"):
+            where = where[1:-1].strip()
         combined = f"{where} {_text(item.get('detail'), 8_000)}"
         if not re.search(r"\[\s*Shot\s+\d+\s*\]", where, re.IGNORECASE) and re.search(
             r"\b(all shots|every shot|across all|entire video|throughout (?:the )?(?:video|sequence))\b",
@@ -2981,6 +3423,12 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
         if "invalid speaker ID" in proposal_error
         else ""
     )
+    structured_fields_feedback = (
+        " Do not emit detailed_description as a project field. Express its content through style and structured "
+        "shot fields; the deterministic compiler creates the detailed_description section."
+        if "detailed_description" in proposal_error.casefold()
+        else ""
+    )
     return [
         *messages,
         {
@@ -2992,7 +3440,8 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
             "content": (
                 f"Correct the response now for the {scope_name}. The request explicitly requires document changes."
                 f"{validation_feedback}{timing_feedback}{reference_feedback}{selector_feedback}"
-                f"{relationship_feedback}{i2va_feedback}{steps_feedback}{completeness_feedback}{speaker_feedback} "
+                f"{relationship_feedback}{i2va_feedback}{steps_feedback}{completeness_feedback}{speaker_feedback}"
+                f"{structured_fields_feedback} "
                 f"Return a brief answer followed by exactly one valid JSON change set between {CHANGESET_BEGIN} "
                 f"and {CHANGESET_END}. Return a replacement for the invalid proposal and follow the allowed "
                 "operation and protected-field contract from the system message."
@@ -3064,8 +3513,15 @@ def _validate_first_frame_proposal_lock(document, proposal):
     for operation in proposal.get("operations") or []:
         operation_type = operation.get("op")
         fields = operation.get("fields") or {}
-        if operation_type == "update_project" and "style" in fields:
-            if _text(fields.get("style")) != _text(document.get("style")):
+        if (
+            operation_type == "update_project"
+            and "style" in fields
+            and not _has_external_style_reference(document)
+        ):
+            if (
+                not _has_external_style_reference(document)
+                and _text(fields.get("style")) != _text(document.get("style"))
+            ):
                 raise ValueError("First-frame lock forbids Director changes to project style")
         if operation_type != "update_shot" or operation.get("shot_id") != first_shot["id"]:
             continue
@@ -3094,7 +3550,10 @@ def _restrict_first_frame_proposal(document, proposal):
         operation = copy.deepcopy(operation)
         if operation.get("op") == "update_project":
             fields = operation.get("fields") or {}
-            if _text(fields.get("style")) != _text(document.get("style")):
+            if (
+                not _has_external_style_reference(document)
+                and _text(fields.get("style")) != _text(document.get("style"))
+            ):
                 fields.pop("style", None)
             operation["fields"] = fields
         elif operation.get("op") == "update_shot" and operation.get("shot_id") == first_shot["id"]:
@@ -3116,7 +3575,10 @@ def _validate_i2va_anchor_preservation(original_document, result_document, data)
     """Prevent Director prose from competing with the authoritative first frame."""
     if not _has_first_frame_anchor(original_document):
         return
-    if _text(result_document.get("style")) != _text(original_document.get("style")):
+    if (
+        not _has_external_style_reference(original_document)
+        and _text(result_document.get("style")) != _text(original_document.get("style"))
+    ):
         raise ValueError("I2VA first-frame lock forbids Director changes to project style")
 
     original_by_id = {shot["id"]: shot for shot in original_document["shots"]}
@@ -3165,6 +3627,17 @@ def _preserve_reference_only_request(data):
         )
     )
     if broad_rewrite:
+        return False
+    content_change = (
+        re.search(
+            r"\b(?:rewrite|replace|change|refine|add|remove)\b.{0,100}"
+            r"\b(?:steps?|camera|sounds?|action|shot|dialogue|visible text)\b",
+            content,
+            re.IGNORECASE,
+        )
+        or DIRECT_ACTION_RE.search(content)
+    )
+    if content_change:
         return False
     explicit_preservation = re.search(r"\b(preserve|keep|retain|do not change|don't change)\b", content, re.IGNORECASE)
     simple_assignment = (
@@ -3378,6 +3851,424 @@ def _validate_requested_project_result(result_document, data):
         raise ValueError(f"The complete project proposal omitted explicitly requested cut time(s): {formatted}")
 
 
+def _validate_speaker_id_prose(result_document):
+    speaker_id = re.compile(r"(?<![A-Za-z0-9_<])S\d+(?![A-Za-z0-9_>])", re.IGNORECASE)
+    project_values = [
+        result_document.get("main_description"),
+        result_document.get("style"),
+        result_document.get("overall_soundscape"),
+        result_document.get("non_diegetic_music"),
+        result_document.get("summary"),
+    ]
+    offenders = []
+    if speaker_id.search("\n".join(_text(value) for value in project_values)):
+        offenders.append("project prose")
+    for shot in result_document.get("shots") or []:
+        prose = [
+            shot.get("composition"), shot.get("subjects"), shot.get("environment"),
+            shot.get("lighting"), shot.get("transition"), shot.get("notes"),
+            (shot.get("camera") or {}).get("target"),
+            *(shot.get("sounds") or []),
+            *(
+                step.get("text")
+                for step in shot.get("steps") or []
+                if isinstance(step, dict) and step.get("type") == "action"
+            ),
+        ]
+        if speaker_id.search("\n".join(_text(value) for value in prose)):
+            offenders.append(shot.get("id") or "unnamed shot")
+    if offenders:
+        raise ValueError(
+            "MiniMax speaker IDs may appear only as speaker_id on dialogue steps, not as prose nouns or "
+            "silent-character labels. Replace every bare or parenthesized S-number in: "
+            + ", ".join(offenders)
+        )
+
+
+def _validate_action_sound_separation(result_document):
+    for shot in result_document.get("shots") or []:
+        actions = [
+            _text(step.get("text"), 8_000)
+            for step in shot.get("steps") or []
+            if isinstance(step, dict) and step.get("type") == "action"
+        ]
+        sounds = [_text(value, 8_000) for value in shot.get("sounds") or []]
+        normalized_actions = {re.sub(r"\W+", " ", value).strip().casefold() for value in actions}
+        normalized_sounds = {re.sub(r"\W+", " ", value).strip().casefold() for value in sounds}
+        duplicates = sorted((normalized_actions & normalized_sounds) - {""})
+        if duplicates:
+            raise ValueError(
+                f"{shot.get('id') or 'A shot'} duplicates the same event sentence in both an action "
+                "step and sounds. Keep the visible action in steps and only its audible consequence in sounds"
+            )
+
+
+def _validate_structured_shot_grammar(result_document):
+    compiled_fragment = re.compile(
+        r"\[\s*Shot\s+\d+\s*\]|(?:integrated_multimodal_description|overall_soundscape|"
+        r"non_diegetic_music|subject_definitions|retention_analysis|detailed_description)\s*:",
+        re.IGNORECASE,
+    )
+    bare_source = re.compile(
+        r"(?<!<)\b(?:Picture|Video|Audio|Subject)\s+\d+\b(?!>)",
+        re.IGNORECASE,
+    )
+    absolute_event_time = re.compile(r"\bAt\s+\d{2}:\d{2}(?::\d{2})?", re.IGNORECASE)
+    for shot in result_document.get("shots") or []:
+        values = [
+            shot.get("composition"), shot.get("subjects"), shot.get("environment"),
+            shot.get("lighting"), shot.get("notes"), (shot.get("camera") or {}).get("target"),
+            *(shot.get("sounds") or []),
+            *(
+                step.get("text")
+                for step in shot.get("steps") or []
+                if isinstance(step, dict) and step.get("type") == "action"
+            ),
+        ]
+        prose = "\n".join(_text(value) for value in values)
+        if compiled_fragment.search(prose):
+            raise ValueError(
+                f"{shot.get('id') or 'A shot'} embeds compiled prompt grammar inside a structured field; "
+                "remove shot tags and section headings because the compiler supplies them"
+            )
+        bare_match = bare_source.search(prose)
+        if bare_match:
+            raise ValueError(
+                f"{shot.get('id') or 'A shot'} uses bare source label {bare_match.group(0)!r}; "
+                "preserve the supplied canonical angle-bracket token exactly"
+            )
+        if absolute_event_time.search(prose):
+            raise ValueError(
+                f"{shot.get('id') or 'A shot'} embeds an absolute timestamp inside a shot field; "
+                "event order belongs in steps and cut time belongs on the shot start"
+            )
+
+
+def _requests_all_reference_shots(data):
+    content = _latest_user_content(data)
+    return bool(
+        re.search(
+            r"\b(?:all|every|each)\b.{0,30}\breferences?\b.{0,80}"
+            r"\b(?:all|every|each|throughout)\b.{0,30}\bshots?\b|"
+            r"\breferences?\b.{0,40}\bthroughout\b.{0,30}\b(?:video|shots?)\b",
+            content,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _validate_requested_reference_coverage(result_document, data):
+    if not _requests_all_reference_shots(data):
+        return
+    visual_sources = {
+        _text(reference.get("label"), 80).casefold()
+        for reference in result_document.get("references") or []
+        if reference.get("kind") in {"image", "video"}
+    }
+    retention = {
+        _text(item.get("label"), 80).strip("<>").casefold(): item
+        for item in result_document.get("retention_analysis") or []
+    }
+    shot_tags = [f"[Shot {index + 1}]" for index in range(len(result_document.get("shots") or []))]
+    for definition in result_document.get("subject_definitions") or []:
+        definition_text = _text(definition.get("text"), 8_000).casefold()
+        label = _text(definition.get("label"), 80).strip("<>")
+        token = f"<{label}>"
+        if not label or not any(source in definition_text for source in visual_sources if source):
+            continue
+        missing = [
+            shot["id"]
+            for shot in result_document.get("shots") or []
+            if token.casefold() not in json.dumps(shot, ensure_ascii=False).casefold()
+        ]
+        if missing:
+            raise ValueError(
+                f"The request applies every visual reference throughout all shots, but {token} is missing "
+                "from: " + ", ".join(missing)
+            )
+        where = _text((retention.get(label.casefold()) or {}).get("where"), 2_000)
+        missing_tags = [tag for tag in shot_tags if tag.casefold() not in where.casefold()]
+        if missing_tags:
+            raise ValueError(
+                f"The retention entry for {token} must list every affected shot: "
+                + ", ".join(missing_tags)
+            )
+
+
+def _validate_reference_prompt_length(result_document, data):
+    if result_document.get("resolved_mode") != "ref2va":
+        return
+    if not re.search(r"\b(?:complete|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
+        return
+    word_count = len(compile_prompt(result_document).split())
+    reference_count = len(result_document.get("references") or [])
+    maximum_words = 650 + 50 * max(0, reference_count - 3)
+    if word_count > maximum_words:
+        raise ValueError(
+            f"The full-reference prompt is {word_count} words; condense it below {maximum_words} words, "
+            "staying near MiniMax's normal 350-500-word range by defining reference traits once and "
+            "reusing canonical labels"
+        )
+
+
+def _validate_sound_entries(result_document):
+    for shot in result_document.get("shots") or []:
+        for sound in shot.get("sounds") or []:
+            if re.search(r"\b(?:silence|silent|inaudible)\b", _text(sound), re.IGNORECASE):
+                raise ValueError(
+                    f"{shot.get('id') or 'A shot'} contains a non-audible state in sounds; "
+                    "sounds entries must describe only audible events and their synchronization"
+                )
+
+
+def _validate_requested_dialogue_mechanics(result_document, data):
+    content = _latest_user_content(data)
+    dialogue = [
+        step
+        for shot in result_document.get("shots") or []
+        for step in shot.get("steps") or []
+        if isinstance(step, dict) and step.get("type") == "dialogue"
+    ]
+    if re.search(r"\b(?:continues?|carries)\b.{0,40}\bacross\s+(?:the\s+)?cut\b", content, re.IGNORECASE):
+        if not any(step.get("crosses_cut") for step in dialogue):
+            raise ValueError(
+                "The request says spoken audio continues across the cut, but no dialogue step sets crosses_cut true"
+            )
+    if re.search(r"\boff[- ]screen\s+voiceover\b", content, re.IGNORECASE):
+        if not any(step.get("voiceover") for step in dialogue):
+            raise ValueError(
+                "The request requires an off-screen voiceover, but no dialogue step sets voiceover true"
+            )
+    if re.search(r"\bcut\s+off\b.{0,50}\b(?:end|ending)\b|\bcutoff\b", content, re.IGNORECASE):
+        if not any(step.get("cutoff") for step in dialogue):
+            raise ValueError(
+                "The request requires speech truncated by the video ending, but no dialogue step sets cutoff true"
+            )
+
+
+def _validate_requested_exact_literals(result_document, data):
+    content = _latest_user_content(data)
+    requested_dialogue = re.findall(
+        r"\b(?:says?|saying)\s+(?:exactly\s+)?[\"“](.*?)[\"”]",
+        content,
+        re.IGNORECASE,
+    )
+    dialogue = [
+        str(step.get("text") or "")
+        for shot in result_document.get("shots") or []
+        for step in shot.get("steps") or []
+        if isinstance(step, dict) and step.get("type") == "dialogue"
+    ]
+    missing = [value for value in requested_dialogue if value not in dialogue]
+    if missing:
+        raise ValueError(
+            "Preserve each requested spoken string verbatim in dialogue-step text; missing exact text: "
+            + ", ".join(repr(value) for value in missing)
+        )
+    for value in dialogue:
+        if re.search(r"</?d>|<scenetrans>|<cutoff>|\[[A-Za-z][^\]]*\]", value, re.IGNORECASE):
+            raise ValueError(
+                "Dialogue-step text must contain only spoken words; remove language tags and MiniMax markup "
+                "and use crosses_cut/cutoff/voiceover flags instead"
+            )
+
+
+def _validate_complete_project_placeholders(result_document, data):
+    if not re.search(r"\b(?:complete|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
+        return
+    generic = {
+        "composition": re.compile(r"^(?:the\s+)?composition\.?$", re.IGNORECASE),
+        "subjects": re.compile(r"^(?:the\s+)?(?:primary\s+)?subject\.?$", re.IGNORECASE),
+        "environment": re.compile(r"^(?:the\s+)?environment\.?$", re.IGNORECASE),
+        "lighting": re.compile(r"^(?:the\s+)?lighting\.?$", re.IGNORECASE),
+    }
+    failures = []
+    first_frame_lock = _has_first_frame_anchor(result_document)
+    for shot_index, shot in enumerate(result_document.get("shots") or []):
+        for field, pattern in generic.items():
+            if first_frame_lock and shot_index == 0 and field in {
+                "composition", "subjects", "environment", "lighting"
+            }:
+                continue
+            value = _text(shot.get(field), 8_000)
+            if pattern.fullmatch(value) or (
+                field == "subjects"
+                and re.search(r"(?:^|[.!?]\s+)(?:the\s+)?subject\.?$", value, re.IGNORECASE)
+            ):
+                failures.append(f"{shot.get('id')} {field}")
+        if re.fullmatch(
+            r"(?:the\s+)?(?:primary\s+)?subject\.?",
+            _text((shot.get("camera") or {}).get("target"), 8_000),
+            re.IGNORECASE,
+        ):
+            failures.append(f"{shot.get('id')} camera target")
+    if failures:
+        raise ValueError(
+            "The complete project still contains placeholder production fields: " + ", ".join(failures)
+        )
+
+
+def _canonicalize_placeholder_camera_targets(document, proposal):
+    """Replace a schema-example camera target with grounded shot terminology.
+
+    Models sometimes copy ``the primary subject`` from the output-schema example
+    even though the rest of the shot already uses concrete canonical labels.  The
+    target is not creative content in that situation, so derive it losslessly from
+    the shot instead of spending another correction turn on the placeholder.
+    """
+    proposal = copy.deepcopy(proposal)
+    placeholder = re.compile(r"(?:the\s+)?(?:primary\s+)?subject\.?", re.IGNORECASE)
+    shots_by_id = {shot["id"]: shot for shot in document.get("shots") or []}
+    first_frame = next((
+        reference for reference in document.get("references") or []
+        if reference.get("kind") == "image"
+        and "first_frame" in set(reference.get("roles") or [])
+    ), None)
+    def replacement_for(merged, *, is_first_shot=False):
+        grounded_text = json.dumps(
+            {name: value for name, value in merged.items() if name != "camera"},
+            ensure_ascii=False,
+        )
+        subject_tokens = list(dict.fromkeys(
+            re.findall(r"<Subject\s+\d+>", grounded_text, re.IGNORECASE)
+        ))
+        if subject_tokens:
+            return " and ".join(subject_tokens)
+        subjects = _text(merged.get("subjects"), 8_000).strip().rstrip(".")
+        if subjects and not placeholder.fullmatch(subjects):
+            return subjects
+        if first_frame and is_first_shot:
+            return f"the visible subject established by {first_frame['label']}"
+        return ""
+
+    operations = proposal.get("operations") or []
+    for operation in operations:
+        operation_type = operation.get("op")
+        if operation_type == "update_shot":
+            container = operation.get("fields")
+            original = shots_by_id.get(operation.get("shot_id")) or {}
+        elif operation_type == "add_shot":
+            container = operation.get("shot")
+            original = {}
+        else:
+            continue
+        if not isinstance(container, dict) or not isinstance(container.get("camera"), dict):
+            continue
+        target = _text(container["camera"].get("target"), 8_000)
+        if not placeholder.fullmatch(target):
+            continue
+        merged = {**original, **container}
+        replacement = replacement_for(
+            merged,
+            is_first_shot=(
+                operation_type == "update_shot"
+                and operation.get("shot_id") == (document.get("shots") or [{}])[0].get("id")
+            ),
+        )
+        if not replacement:
+            continue
+        container["camera"]["target"] = replacement
+
+    # A complete proposal often populates the blank shot's production fields but
+    # leaves its preexisting example camera object untouched. Repair that inherited
+    # placeholder as part of the nearest update operation.
+    for shot_index, original in enumerate(document.get("shots") or []):
+        original_camera = original.get("camera") or {}
+        if not placeholder.fullmatch(_text(original_camera.get("target"), 8_000)):
+            continue
+        updates = [
+            operation for operation in operations
+            if operation.get("op") == "update_shot" and operation.get("shot_id") == original["id"]
+        ]
+        if not updates:
+            continue
+        merged = copy.deepcopy(original)
+        for operation in updates:
+            merged.update(operation.get("fields") or {})
+        effective_target = _text((merged.get("camera") or {}).get("target"), 8_000)
+        if not placeholder.fullmatch(effective_target):
+            continue
+        replacement = replacement_for(merged, is_first_shot=shot_index == 0)
+        if not replacement:
+            continue
+        fields = updates[-1].setdefault("fields", {})
+        fields["camera"] = {**original_camera, **(fields.get("camera") or {}), "target": replacement}
+    return proposal
+
+
+def _validate_selected_shot_quality(result_document, data):
+    if _director_scope(data) != "shot":
+        return
+    selected_id = _text(data.get("selected_shot_id"), 80)
+    shot = next(
+        (item for item in result_document.get("shots") or [] if item.get("id") == selected_id),
+        None,
+    )
+    if shot is None:
+        return
+    target = _text((shot.get("camera") or {}).get("target"), 8_000)
+    if re.fullmatch(r"(?:the\s+)?(?:primary\s+)?subject\.?", target, re.IGNORECASE):
+        raise ValueError(
+            "The selected shot camera target is still a schema placeholder; name the concrete person or object"
+        )
+
+
+def _validate_subject_only_reference_prose(result_document, data):
+    if _explicit_subject_attribute_request(data):
+        return
+    subject_only = [
+        reference for reference in result_document.get("references") or []
+        if reference.get("kind") == "image"
+        and set(reference.get("roles") or []) == {"subject"}
+    ]
+    if not subject_only or len(result_document.get("references") or []) != 1:
+        return
+    source_tokens = {_text(item.get("label"), 80).casefold() for item in subject_only}
+    appearance = re.compile(
+        r"\b(?:hair|haired|blonde|brunette|cardigan|shirt|blouse|jacket|coat|dress|skirt|"
+        r"trousers|pants|shorts|boots?|shoes?|necklace|earrings?|outfit|wardrobe|wearing)\b",
+        re.IGNORECASE,
+    )
+    offenders = []
+    for shot in result_document.get("shots") or []:
+        values = [
+            shot.get("composition"), shot.get("subjects"), shot.get("environment"),
+            shot.get("lighting"), shot.get("notes"), (shot.get("camera") or {}).get("target"),
+            *(
+                step.get("text")
+                for step in shot.get("steps") or []
+                if isinstance(step, dict) and step.get("type") == "action"
+            ),
+        ]
+        prose = "\n".join(_text(value) for value in values)
+        if any(token and token in prose.casefold() for token in source_tokens) or appearance.search(prose):
+            offenders.append(shot.get("id") or "unnamed shot")
+    if offenders:
+        raise ValueError(
+            "A subject-only reference must use its canonical <Subject N> label as the noun without "
+            "repeating <Picture N> or inventing/unrequested appearance traits in: "
+            + ", ".join(offenders)
+        )
+
+
+def _validate_requested_step_order(result_document, data):
+    content = _latest_user_content(data)
+    says_then_action = re.search(
+        r"\b(?:says?|speaks?|asks?|whispers?|shouts?)\b.{0,240}\bthen\b.{0,160}"
+        r"\b(?:enters?|walks?|runs?|turns?|moves?|smiles?)\b",
+        content,
+        re.IGNORECASE,
+    )
+    if not says_then_action:
+        return
+    steps = (result_document.get("shots") or [{}])[0].get("steps") or []
+    if not steps or steps[0].get("type") != "dialogue":
+        raise ValueError(
+            "The request explicitly orders dialogue before the following action; the first affected step "
+            "must be that dialogue, with no invented action before it"
+        )
+
+
 def _protected_content_change_requested(data, kind):
     content = _latest_user_content(data)
     if kind == "dialogue":
@@ -3458,6 +4349,9 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             parsed["proposal"] = _canonicalize_requested_dialogue_speakers(
                 parsed["proposal"], document, request_data
             )
+            parsed["proposal"] = _canonicalize_placeholder_camera_targets(
+                document, parsed["proposal"]
+            )
             _validate_private_subject_selectors(
                 document, None, request_data, proposal=parsed["proposal"]
             )
@@ -3469,6 +4363,18 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             _validate_protected_sequence_content(document, preview["document"], request_data)
             _validate_reference_only_preservation(document, preview["document"], request_data)
             _validate_i2va_anchor_preservation(document, preview["document"], request_data)
+            _validate_speaker_id_prose(preview["document"])
+            _validate_action_sound_separation(preview["document"])
+            _validate_structured_shot_grammar(preview["document"])
+            _validate_requested_reference_coverage(preview["document"], request_data)
+            _validate_reference_prompt_length(preview["document"], request_data)
+            _validate_sound_entries(preview["document"])
+            _validate_requested_dialogue_mechanics(preview["document"], request_data)
+            _validate_requested_exact_literals(preview["document"], request_data)
+            _validate_complete_project_placeholders(preview["document"], request_data)
+            _validate_selected_shot_quality(preview["document"], request_data)
+            _validate_subject_only_reference_prose(preview["document"], request_data)
+            _validate_requested_step_order(preview["document"], request_data)
         if request_data and parsed["proposal"]["scope"]["type"] == "project":
             _validate_requested_project_result(preview["document"], request_data)
         parsed["proposal"] = preview["proposal"]

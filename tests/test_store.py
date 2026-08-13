@@ -154,6 +154,34 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["workflow_snapshot"], generation["workflow_snapshot"])
             self.assertEqual(restored["outputs"][0]["filename"], "video.mp4")
 
+    def test_in_message_operation_statuses_survive_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "projects.json")
+            document = default_document()
+            generations = [
+                {
+                    "id": f"generation-{status}", "prompt_id": "", "status": status,
+                    "document": document, "created_at": index, "updated_at": index,
+                }
+                for index, status in enumerate(
+                    ("validating", "compiling", "queueing", "cancelled"), 1
+                )
+            ]
+            update_project_store(path, {
+                "version": 2, "revision": 0, "active_project_id": "project-1",
+                "projects": [{
+                    "id": "project-1", "name": "Operations", "brief": "",
+                    "document": document, "workflow_id": "", "generations": generations,
+                    "created_at": 1, "updated_at": 4,
+                }],
+            })
+
+            restored = read_project_store(path)["projects"][0]["generations"]
+            self.assertEqual(
+                {generation["status"] for generation in restored},
+                {"validating", "compiling", "queueing", "cancelled"},
+            )
+
     def test_generation_continuation_lineage_is_normalized(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "projects.json")
