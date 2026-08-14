@@ -55,6 +55,38 @@ class UnifiedStudioContractTests(unittest.TestCase):
             handler = events[handler_start:handler_start + 500]
             self.assertIn("markGenerationExecuting(id)", handler)
 
+    def test_live_progress_is_restored_after_returning_to_video_project(self):
+        events_start = self.source.index("function setupProgressEvents")
+        events_end = self.source.index("function setStandaloneVisibility", events_start)
+        events = self.source[events_start:events_end]
+
+        self.assertIn('node?.state === "running"', events)
+        self.assertIn("Number(running.value)", events)
+        self.assertIn("Number(running.max)", events)
+
+        executing_start = events.index('api.addEventListener("executing"')
+        executing_handler = events[executing_start:executing_start + 350]
+        self.assertIn('state.generationProgress.set(id, { phase: "generating" })', executing_handler)
+
+        state_start = events.index('api.addEventListener("progress_state"')
+        state_handler = events[state_start:state_start + 450]
+        self.assertIn("const progress = runningProgress(event)", state_handler)
+        self.assertIn("...(progress || {})", state_handler)
+        self.assertIn("renderGenerations()", state_handler)
+
+    def test_turbo_profile_is_visible_and_follows_backend_routing_order(self):
+        helper_start = self.source.index("function resolvedTurboProfile")
+        helper_end = self.source.index("function renderTurboProfileIndicator", helper_start)
+        helper = self.source[helper_start:helper_end]
+        self.assertIn('mode === "ref2va"', helper)
+        self.assertIn("width === 1344 && height === 768", helper)
+        self.assertIn('preset === "fast_4step"', helper)
+        self.assertLess(helper.index('mode === "ref2va"'), helper.index("width === 1344 && height === 768"))
+        self.assertLess(helper.index("width === 1344 && height === 768"), helper.index('preset === "fast_4step"'))
+        self.assertIn("renderTurboProfileIndicator(project, true)", self.source)
+        self.assertIn("container.append(row, turboIndicator)", self.source)
+        self.assertIn(".psvstudio-turbo-profile {", self.styles)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -128,6 +128,7 @@ def _studio_instances():
                 "openedAt": presence["opened_at"],
                 "activeProjectId": presence["active_project_id"],
                 "projectName": presence["project_name"],
+                "projectEmpty": presence.get("project_empty", False),
             }
             for instance_id, presence in STUDIO_PRESENCES.items()
         ]
@@ -162,6 +163,7 @@ async def promptstudio_video_presence(request):
                     "opened_at": float(data.get("openedAt") or 0),
                     "active_project_id": _bridge_text(data.get("activeProjectId"), "activeProjectId", 128),
                     "project_name": _bridge_text(data.get("projectName"), "projectName", 256),
+                    "project_empty": data.get("projectEmpty") is True,
                 }
                 for request_id, handoff in STUDIO_HANDOFFS.items():
                     if handoff["target_instance_id"] != instance_id or handoff["status"] != "pending":

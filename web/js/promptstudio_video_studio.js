@@ -4,6 +4,7 @@ import { api } from "/scripts/api.js";
 const EXTENSION_NAME = "PromptStudio.Video.Standalone";
 const CHANNEL_NAME = "promptstudio.video.standalone.v1";
 const DIRECTOR_TYPE = "PSV_MiniMaxH3Director";
+const TURBO_PROFILE_TYPE = "PSV_MiniMaxH3TurboProfile";
 const WORKFLOW_PREFIX = "[PSV]";
 const PROJECTS_ENDPOINT = "/promptstudio-video/projects";
 const WORKFLOWS_ENDPOINT = "/promptstudio-video/workflows";
@@ -76,6 +77,7 @@ const state = {
   serverPresenceRequest: null,
   serverPresenceQueued: false,
   latestServerPresence: null,
+  lastPresenceSignature: "",
   relayedHandoffs: new Set(),
   studioOpenedAt: 0,
   standaloneAttached: false,
@@ -1954,6 +1956,38 @@ async function addMediaFiles(fileList) {
   setStatus(errors.length ? `${summary} ${errors.join(" ")}` : summary, errors.length ? "warning" : "ready");
 }
 
+function projectDocumentMatchesDefault(project) {
+  if (!project?.document || !state.config?.default_document) return false;
+  const comparable = value => {
+    const document = clone(value);
+    for (const shot of document.shots || []) shot.id = "";
+    return JSON.stringify(document);
+  };
+  return comparable(project.document) === comparable(state.config.default_document);
+}
+
+function directorProjectSessionHasContent(projectId) {
+  return [projectId, `${projectId}:project`].some(sessionId => {
+    const session = directorSessions()[sessionId];
+    return Boolean(
+      session?.messages?.length
+      || session?.draft_attachments?.length
+      || session?.pending_plan
+      || session?.pending_job
+    );
+  });
+}
+
+function projectIsEmpty(project) {
+  if (!project) return true;
+  return (project.name || "Untitled video") === "Untitled video"
+    && !String(project.brief || "").trim()
+    && !(project.generations || []).length
+    && (project.workflow_id || "") === (state.workflows[0]?.id || "")
+    && !directorProjectSessionHasContent(project.id)
+    && projectDocumentMatchesDefault(project);
+}
+
 function videoStudioStatus() {
   const project = activeProject();
   const open = Boolean(state.ready && state.panel && state.standaloneAttached);
@@ -1963,6 +1997,7 @@ function videoStudioStatus() {
     openedAt: state.studioOpenedAt,
     activeProjectId: open ? project?.id || "" : "",
     projectName: open && project ? project.name || "Untitled video" : "",
+    projectEmpty: open && project ? projectIsEmpty(project) : true,
   };
 }
 
@@ -2015,6 +2050,11 @@ function flushServerPresence() {
 
 function postVideoStudioPresence() {
   const presence = videoStudioStatus();
+  state.lastPresenceSignature = JSON.stringify([
+    presence.open,
+    presence.activeProjectId,
+    presence.projectEmpty,
+  ]);
   state.bridgeChannel?.postMessage({ type: "studio-presence", ...presence });
   state.latestServerPresence = presence;
   flushServerPresence();
@@ -2028,14 +2068,15 @@ function safeHandoffFilename(value, mimeType) {
 
 async function handoffPromptStudioImage(value) {
   const status = videoStudioStatus();
-  const project = activeProject();
-  if (!status.open || !project) throw new Error("Video Studio no longer has an open project.");
-  if (value?.targetProjectId && value.targetProjectId !== project.id) {
+  const originalProject = activeProject();
+  if (!status.open || !originalProject) throw new Error("Video Studio no longer has an open project.");
+  if (value?.targetProjectId && value.targetProjectId !== originalProject.id) {
     throw new Error("The open Video Studio project changed before the image handoff started.");
   }
+  const createNewProject = value?.targetMode === "new";
   const sourceUrl = new URL(String(value?.url || ""), window.location.href);
   if (sourceUrl.origin !== window.location.origin) throw new Error("Video Studio only accepts same-origin Prompt Studio images.");
-  const limitError = mediaLimit(project, "image");
+  const limitError = createNewProject ? "" : mediaLimit(originalProject, "image");
   if (limitError) throw new Error(limitError);
 
   setStatus(`Importing ${value?.filename || "Prompt Studio image"}…`, "working");
@@ -2050,9 +2091,10 @@ async function handoffPromptStudioImage(value) {
     ? { width: suppliedWidth, height: suppliedHeight }
     : await fileMediaDimensions(file, "image");
   const path = await uploadMediaFile(file);
-  if (activeProject()?.id !== project.id) {
+  if (activeProject()?.id !== originalProject.id) {
     throw new Error("The open Video Studio project changed during the image handoff. Try again in the intended project.");
   }
+  const project = createNewProject ? createProjectRecord() : originalProject;
   project.document.references ||= [];
   const reference = {
     id: makeId("reference"), kind: "image", path, name: file.name,
@@ -2172,6 +2214,121 @@ function localResolvedMode(document) {
   return "t2va";
 }
 
+function selectedWorkflow(project) {
+  return state.workflows.find(workflow => workflow.id === project?.workflow_id) || null;
+}
+
+function workflowTurboNode(workflow) {
+  return Object.values(workflow?.snapshot?.output || {})
+    .find(node => node?.class_type === TURBO_PROFILE_TYPE) || null;
+}
+
+function resolvedTurboProfile(project) {
+  const workflow = selectedWorkflow(project);
+  if (!workflow) {
+    return {
+      kind: "missing",
+      badge: "NO WORKFLOW",
+      heading: "No generation workflow selected",
+      detail: "Choose a workflow to see its sampling profile.",
+      loraName: "",
+    };
+  }
+
+  const turboNode = workflowTurboNode(workflow);
+  if (!turboNode) {
+    return {
+      kind: "standard",
+      badge: "STANDARD 20-STEP",
+      heading: "Standard MiniMax H3 profile",
+      detail: "20 steps | shifts V11 / A4 | no Turbo LoRA",
+      loraName: "",
+    };
+  }
+
+  const inputs = turboNode.inputs || {};
+  if (inputs.enabled === false || inputs.enabled === "false") {
+    return {
+      kind: "standard",
+      badge: "TURBO DISABLED",
+      heading: "Turbo profile disabled",
+      detail: "20 steps | shifts V11 / A4 | no Turbo LoRA",
+      loraName: "",
+    };
+  }
+
+  const mode = localResolvedMode(project.document);
+  const width = Number(project.document.width);
+  const height = Number(project.document.height);
+  const preset = String(inputs.preset || "auto_quality");
+  let profile;
+  if (mode === "ref2va") {
+    profile = {
+      label: "REF2V v0.1",
+      input: "ref2va_4step_lora",
+      steps: 4,
+      shiftVideo: 12,
+      shiftAudio: 3,
+    };
+  } else if (width === 1344 && height === 768) {
+    profile = {
+      label: "FL2V 768p v1.0",
+      input: "fl2va_768p_4step_lora",
+      steps: 4,
+      shiftVideo: 6,
+      shiftAudio: 3,
+    };
+  } else if (preset === "fast_4step") {
+    profile = {
+      label: "FL2V mixed v0.1",
+      input: "fl2va_mixed_4step_lora",
+      steps: 4,
+      shiftVideo: 12,
+      shiftAudio: 3,
+    };
+  } else {
+    profile = {
+      label: "FL2V mixed v1.0",
+      input: "fl2va_mixed_8step_lora",
+      steps: 8,
+      shiftVideo: 12,
+      shiftAudio: 3,
+    };
+  }
+
+  const loraPath = String(inputs[profile.input] || "");
+  return {
+    kind: "turbo",
+    badge: `${profile.steps}-STEP TURBO`,
+    heading: `${profile.label} - ${profile.steps} steps`,
+    detail: `${mode.toUpperCase()} | ${width}x${height} | shifts V${profile.shiftVideo} / A${profile.shiftAudio} | ${preset}`,
+    loraName: loraPath.replaceAll("\\", "/").split("/").pop() || "Configured Turbo LoRA",
+  };
+}
+
+function renderTurboProfileIndicator(project, compact = false) {
+  const profile = resolvedTurboProfile(project);
+  if (compact) {
+    const badge = el("span", `psvstudio-turbo-badge is-${profile.kind}`, profile.badge);
+    badge.title = `${profile.heading}. ${profile.detail}${profile.loraName ? `. ${profile.loraName}` : ""}`;
+    return badge;
+  }
+
+  const indicator = el("div", `psvstudio-turbo-profile is-${profile.kind}`);
+  const copy = el("div", "psvstudio-turbo-profile-copy");
+  copy.append(
+    el("strong", "", profile.heading),
+    el("span", "", profile.detail),
+  );
+  indicator.append(copy);
+  if (profile.loraName) {
+    const filename = el("small", "", profile.loraName);
+    filename.title = profile.loraName;
+    indicator.append(filename);
+  }
+  return indicator;
+}
+
 function setStatus(message, kind = "") {
   const status = state.panel?.querySelector("#psvstudio-status");
   if (!status) return;
@@ -2187,6 +2344,13 @@ function setSaveState(message) {
 function markProjectChanged({ render = false, project = activeProject() } = {}) {
   if (project) project.updated_at = Date.now();
   state.projectMutation += 1;
+  const presence = videoStudioStatus();
+  const presenceSignature = JSON.stringify([
+    presence.open,
+    presence.activeProjectId,
+    presence.projectEmpty,
+  ]);
+  if (presenceSignature !== state.lastPresenceSignature) postVideoStudioPresence();
   setSaveState("Saving…");
   if (state.projectSaveTimer) clearTimeout(state.projectSaveTimer);
   state.projectSaveTimer = setTimeout(() => persistProjects(), 450);
@@ -2244,7 +2408,7 @@ async function loadProjects() {
   state.projectMutation = state.projectSavedMutation = 0;
 }
 
-function newProject() {
+function createProjectRecord() {
   closeShotEditor({ force: true });
   const now = Date.now();
   const document = clone(state.config.default_document);
@@ -2262,9 +2426,14 @@ function newProject() {
   state.projects.unshift(project);
   state.activeProjectId = project.id;
   state.selectedShotId = project.document.shots[0].id;
+  return project;
+}
+
+function newProject() {
+  const project = createProjectRecord();
   markProjectChanged({ render: true });
-  postVideoStudioPresence();
   setStatus("New video project created.", "ready");
+  return project;
 }
 
 function selectProject(projectId) {
@@ -3413,7 +3582,10 @@ function renderPreview() {
     preview.append(empty);
     return;
   }
-  preview.append(el("span", "psvstudio-mode-badge", localResolvedMode(project.document).toUpperCase()));
+  preview.append(
+    el("span", "psvstudio-mode-badge", localResolvedMode(project.document).toUpperCase()),
+    renderTurboProfileIndicator(project, true),
+  );
   preview.append(button("Global settings", () => showGlobalSettings(project), "psvstudio-button psvstudio-global-settings-button"));
   const output = latestOutput(project);
   if (output) {
@@ -3599,6 +3771,15 @@ function renderReferenceSemantics(project, refresh) {
 }
 
 function appendGlobalSettings(container, project, refresh) {
+  let turboIndicator = null;
+  const refreshTurboIndicator = () => {
+    if (turboIndicator?.isConnected) {
+      const replacement = renderTurboProfileIndicator(project);
+      turboIndicator.replaceWith(replacement);
+      turboIndicator = replacement;
+    }
+    renderPreview();
+  };
   const sizeValue = `${project.document.width}x${project.document.height}`;
   const aspectOptions = state.config.aspect_presets.map(item => ({ value: `size:${item.width}x${item.height}`, label: item.label }));
   for (const reference of project.document.references || []) {
@@ -3636,6 +3817,7 @@ function appendGlobalSettings(container, project, refresh) {
       project.document.canvas_reference_id = "";
     }
     markProjectChanged();
+    refreshTurboIndicator();
   });
   const canvasRules = state.config.canvas || {};
   const targetMegapixelValue = Number(
@@ -3664,6 +3846,7 @@ function appendGlobalSettings(container, project, refresh) {
         }
       }
       markProjectChanged();
+      refreshTurboIndicator();
     },
     "number",
   );
@@ -3687,7 +3870,8 @@ function appendGlobalSettings(container, project, refresh) {
     field("Target MP", targetMegapixels, "For imported media ratios."),
     durationField,
   );
-  container.append(row);
+  turboIndicator = renderTurboProfileIndicator(project);
+  container.append(row, turboIndicator);
 
   const production = inspectorDetails("Production settings");
   production.body.append(
@@ -3698,6 +3882,7 @@ function appendGlobalSettings(container, project, refresh) {
     field("Mode override", selectInput(state.config.modes.map(value => ({ value, label: value === "auto" ? "Automatic (recommended)" : value.toUpperCase() })), project.document.mode, value => {
       project.document.mode = value;
       markProjectChanged({ render: true });
+      refreshTurboIndicator();
     }), "Automatic selects the correct MiniMax route from your media roles."),
   );
   container.append(production.details, renderReferenceSemantics(project, refresh));
@@ -5138,7 +5323,7 @@ function buildPanel() {
     <aside class="psvstudio-inspector">
       <div class="psvstudio-brand psvstudio-inspector-brand">
         <img class="psvstudio-brand-mark" src="${VIDEO_ICON_URL}" alt="" aria-hidden="true">
-        <div><strong>Prompt Studio Video</strong><small>MiniMax H3 Director</small></div>
+        <div><strong>Prompt Studio Video</strong><small>by tiko13</small></div>
         <div class="psvstudio-studio-switch" role="group" aria-label="Studio mode">
           <button type="button" data-promptstudio-studio-mode="image" aria-pressed="false">Image</button>
           <button type="button" data-promptstudio-studio-mode="video" data-available="true" aria-pressed="true">Video</button>
@@ -5203,6 +5388,7 @@ function buildPanel() {
     if (!project) return;
     project.workflow_id = event.target.value;
     markProjectChanged();
+    renderPreview();
   });
   panel.querySelector("#psvstudio-project-title").addEventListener("input", event => {
     const project = activeProject();
@@ -5246,6 +5432,15 @@ function buildPanel() {
 
 function setupProgressEvents() {
   const promptId = event => String(event?.detail?.prompt_id || event?.detail?.promptId || "");
+  const runningProgress = event => {
+    const nodes = event?.detail?.nodes;
+    if (!nodes || typeof nodes !== "object") return null;
+    const running = Object.values(nodes).find(node => node?.state === "running");
+    if (!running) return null;
+    const value = Number(running.value);
+    const max = Number(running.max);
+    return Number.isFinite(value) && Number.isFinite(max) && max > 0 ? { value, max } : null;
+  };
   api.addEventListener("execution_start", event => {
     const id = promptId(event);
     if (!markGenerationExecuting(id)) return;
@@ -5269,11 +5464,16 @@ function setupProgressEvents() {
   }
   api.addEventListener("executing", event => {
     const id = promptId(event);
-    markGenerationExecuting(id);
+    if (!markGenerationExecuting(id)) return;
+    state.generationProgress.set(id, { phase: "generating" });
+    renderGenerations();
   });
   api.addEventListener("progress_state", event => {
     const id = promptId(event);
-    markGenerationExecuting(id);
+    if (!markGenerationExecuting(id)) return;
+    const progress = runningProgress(event);
+    state.generationProgress.set(id, { phase: "generating", ...(progress || {}) });
+    renderGenerations();
   });
   api.addEventListener("reconnecting", () => setApiConnected(false));
   api.addEventListener("reconnected", () => setApiConnected(true));

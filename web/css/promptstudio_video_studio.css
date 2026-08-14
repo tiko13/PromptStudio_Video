@@ -215,6 +215,16 @@ button { color: inherit; }
 .psvstudio-preview-empty { max-width: 390px; display: grid; justify-items: center; gap: 8px; padding: 30px; color: var(--psv-muted); text-align: center; }
 .psvstudio-preview-empty strong { color: var(--psv-text); font-size: 18px; }
 .psvstudio-mode-badge { position: absolute; z-index: 2; top: 12px; left: 12px; padding: 4px 9px; color: #e4dcff; background: rgba(67, 49, 133, .82); border: 1px solid rgba(174, 153, 255, .45); border-radius: 999px; font-size: 10px; font-weight: 800; }
+.psvstudio-turbo-badge { position: absolute; z-index: 2; top: 42px; left: 12px; padding: 4px 9px; color: #ffe7bd; background: rgba(116, 72, 20, .86); border: 1px solid rgba(244, 177, 78, .5); border-radius: 999px; font-size: 10px; font-weight: 800; }
+.psvstudio-turbo-badge.is-standard { color: #cdd2df; background: rgba(54, 60, 74, .86); border-color: rgba(173, 183, 204, .3); }
+.psvstudio-turbo-badge.is-missing { color: #f0c9c9; background: rgba(103, 45, 51, .86); border-color: rgba(255, 133, 142, .38); }
+.psvstudio-turbo-profile { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 12px; color: #ffe7bd; background: linear-gradient(145deg, rgba(137, 85, 24, .22), rgba(77, 52, 22, .14)); border: 1px solid rgba(244, 177, 78, .35); border-radius: 10px; }
+.psvstudio-turbo-profile.is-standard { color: #d6d9e2; background: rgba(255, 255, 255, .025); border-color: var(--psv-border); }
+.psvstudio-turbo-profile.is-missing { color: #f1ced1; background: rgba(135, 58, 67, .1); border-color: rgba(255, 133, 142, .28); }
+.psvstudio-turbo-profile-copy { min-width: 0; display: grid; gap: 2px; }
+.psvstudio-turbo-profile-copy strong { font-size: 11px; }
+.psvstudio-turbo-profile-copy span, .psvstudio-turbo-profile > small { overflow: hidden; color: var(--psv-muted); font-size: 9px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.psvstudio-turbo-profile > small { max-width: 45%; }
 .psvstudio-global-settings-button { min-height: 30px; padding: 0 10px; color: #ddd6ff; border-color: rgba(151, 126, 255, .34); font-size: 10px; }
 .psvstudio-preview > .psvstudio-global-settings-button { position: absolute; z-index: 3; top: 12px; right: 12px; background: rgba(16, 18, 26, .86); backdrop-filter: blur(10px); }
 .psvstudio-director-launch { display: grid; gap: 8px; margin: 3px 0 5px; padding: 11px; background: linear-gradient(145deg, rgba(111, 79, 221, .2), rgba(52, 42, 91, .12)); border: 1px solid rgba(174, 153, 255, .42); border-radius: 12px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035), 0 10px 28px rgba(37, 24, 83, .18); }

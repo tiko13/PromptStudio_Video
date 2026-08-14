@@ -262,6 +262,34 @@ The compiler follows MiniMax's official guides:
 The Director requests only the active diffusion-model input through ComfyUI's
 lazy-input mechanism.
 
+## Separate MiniMax H3 Turbo workflow
+
+Keep the normal full-step workflow unchanged and save Turbo wiring as a second
+`[PSV]` workflow. Connect the Director's selected `model`, `mode`, `width`, and
+`height` outputs to `Prompt Studio MiniMax H3 Turbo Profile`. Connect the
+profile's outputs as follows:
+
+- `model` to any ordinary content `LoraLoaderModelOnly` chain, then through
+  model patches and `MiniMaxH3SigmaShift`; connect that shifted model to both
+  the guider and `BasicScheduler`;
+- `steps` to `BasicScheduler.steps`;
+- `shift_video` and `shift_audio` to `MiniMaxH3SigmaShift`.
+
+The `auto_quality` preset selects the FL2VA 768p four-step profile only for its
+exact 1344x768 training canvas, the mixed-resolution FL2VA eight-step profile
+for other base-mode canvases, and the task-specific REF2VA four-step profile
+for reference generation. `fast_4step` selects the mixed-resolution FL2VA
+four-step profile away from 1344x768. T2VA, I2VA, FL2VA, L2VA, and continuation
+all use the FL2VA family; REF2VA uses its own LoRA.
+
+Install the Kijai rank-reduced Turbo files under `ComfyUI/models/loras` before
+queueing. The node accepts an exact relative path and can also resolve a moved
+file by basename when there is only one match. Its default strength is 0.75.
+Do not enable `EasyCache` or `SpectrumApplyMiniMaxH3` in the initial Turbo
+workflow; their behavior on a four- or eight-step distilled schedule has not
+been validated. Add content LoRAs after the Turbo Profile so they remain
+independent of inference-mode routing and sampling policy.
+
 ## Capability endpoint
 
 Prompt Studio can detect the companion at:

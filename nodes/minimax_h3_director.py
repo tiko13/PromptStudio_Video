@@ -36,7 +36,9 @@ class PromptStudioMiniMaxH3Director:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "INT", "FLOAT", "STRING", "STRING")
+    RETURN_TYPES = (
+        "MODEL", "CONDITIONING", "LATENT", "INT", "FLOAT", "STRING", "STRING", "INT", "INT",
+    )
     RETURN_NAMES = (
         "model",
         "positive",
@@ -45,6 +47,8 @@ class PromptStudioMiniMaxH3Director:
         "effective_duration",
         "compiled_prompt",
         "mode",
+        "width",
+        "height",
     )
     FUNCTION = "build"
     CATEGORY = "Prompt Studio/Video"
@@ -126,4 +130,6 @@ class PromptStudioMiniMaxH3Director:
             effective_duration(document),
             prompt,
             mode,
+            width,
+            height,
         )

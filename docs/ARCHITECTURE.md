@@ -151,7 +151,15 @@ resolved mode:
 - full reference: `MiniMaxH3ReferenceToVideo`.
 
 The node returns the selected lazy model alongside native conditioning and
-latent outputs, keeping the rest of the workflow conventional and editable.
+latent outputs, plus the resolved canvas dimensions, keeping the rest of the
+workflow conventional and editable.
+
+An optional `PSV_MiniMaxH3TurboProfile` consumes that selected model, resolved
+mode, and canvas. It applies exactly one pinned inference LoRA and returns the
+model together with the coupled step count and video/audio shifts. Acceleration
+LoRAs therefore own inference policy, while ordinary content LoRAs remain a
+separate downstream stack. The normal full-step workflow does not require this
+node and remains an independent fallback.
 
 ## Standalone workflow dispatch
 
