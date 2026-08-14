@@ -11,8 +11,9 @@ const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
 const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
 const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
-const KOBOLD_STATUS_ENDPOINT = "/promptstudio-video/kobold/status";
+const LLM_STATUS_ENDPOINT = "/promptstudio-video/llm/status";
 const KOBOLD_ABORT_ENDPOINT = "/promptstudio-video/kobold/abort";
+const COMFY_RESTART_ENDPOINT = "/manager/reboot";
 const DIRECTOR_JOB_POLL_MS = 1000;
 const DIRECTOR_STATUS_RETRY_LIMIT = 3;
 const KOBOLD_STATUS_POLL_MS = 3000;
@@ -124,6 +125,9 @@ const state = {
   optimizePromptGeneration: true,
   koboldStatusRequest: null,
   koboldStatusTimer: null,
+  llmStatusSnapshot: null,
+  comfyQueueRemaining: 0,
+  comfyRestartBusy: false,
   koboldAbortBusy: false,
   ready: false,
 };
@@ -301,30 +305,88 @@ function saveDirectorSettings(dialog = state.directorDialog) {
   return settings;
 }
 
+function comfyUiIsProcessing() {
+  return state.comfyQueueRemaining > 0 || activeGenerationPromptIds().length > 0;
+}
+
+function renderSystemStatusSummary() {
+  const control = state.panel?.querySelector("#psvstudio-kobold-control");
+  const label = control?.querySelector("#psvstudio-kobold-status-label");
+  const comfyDetail = control?.querySelector("#psvstudio-comfy-status-detail");
+  const restart = control?.querySelector("#psvstudio-comfy-restart");
+  if (!control || !label || !comfyDetail || !restart) return;
+
+  const llm = state.llmStatusSnapshot;
+  const provider = llm?.provider === "ollama" ? "ollama" : directorSettings().llm_provider;
+  const llmUnhealthy = llm?.reachable === false
+    || (provider === "ollama" && llm?.reachable === true && (!llm.model || llm.model_installed === false));
+  const checking = !llm || llm.checking === true;
+  const comfyProcessing = comfyUiIsProcessing();
+  const processing = checking
+    || llm?.busy === true
+    || comfyProcessing
+    || state.directorBusy
+    || state.directorJobs.size > 0
+    || state.comfyRestartBusy;
+  const unhealthy = !state.apiConnected || llmUnhealthy;
+  const stateName = unhealthy ? "offline" : (processing ? "busy" : "idle");
+  control.dataset.state = stateName;
+  control.querySelector("summary").title = stateName === "offline"
+    ? "System status: attention needed"
+    : (stateName === "busy" ? "System status: processing" : "System status: ready");
+  label.textContent = stateName === "offline"
+    ? "Status: attention needed"
+    : (stateName === "busy" ? "Status: processing" : "Status: ready");
+
+  if (!state.apiConnected) {
+    comfyDetail.textContent = "Not responding";
+    comfyDetail.dataset.state = "offline";
+  } else if (state.comfyRestartBusy) {
+    comfyDetail.textContent = "Restart requested";
+    comfyDetail.dataset.state = "busy";
+  } else if (comfyProcessing) {
+    const queued = Math.max(0, Number(state.comfyQueueRemaining) || 0);
+    comfyDetail.textContent = queued ? `Processing · ${queued} queued` : "Processing";
+    comfyDetail.dataset.state = "busy";
+  } else {
+    comfyDetail.textContent = "Connected and ready";
+    comfyDetail.dataset.state = "idle";
+  }
+  restart.disabled = state.comfyRestartBusy || !state.apiConnected;
+  restart.textContent = state.comfyRestartBusy ? "Restarting…" : "Restart ComfyUI";
+}
+
 function renderKoboldStatus(status = {}) {
   const control = state.panel?.querySelector("#psvstudio-kobold-control");
   const label = control?.querySelector("#psvstudio-kobold-status-label");
   const detail = control?.querySelector("#psvstudio-kobold-status-detail");
   const model = control?.querySelector("#psvstudio-kobold-model");
   const vision = control?.querySelector("#psvstudio-kobold-vision");
+  const heading = control?.querySelector("#psvstudio-llm-status-heading");
   const stop = control?.querySelector("#psvstudio-kobold-stop");
-  if (!control || !label || !detail || !model || !vision || !stop) return;
+  const stopHelp = control?.querySelector("#psvstudio-kobold-stop-help");
+  if (!control || !label || !detail || !model || !vision || !heading || !stop || !stopHelp) return;
+  const provider = status.provider === "ollama" ? "ollama" : directorSettings().llm_provider;
+  const isOllama = provider === "ollama";
+  const providerName = isOllama ? "Ollama" : "KoboldCpp";
   const reachable = status.reachable === true;
-  const busy = reachable && status.busy === true;
-  const stateName = busy ? "busy" : (reachable ? "idle" : (status.checking ? "checking" : "offline"));
-  control.dataset.state = stateName;
-  label.textContent = busy ? "Kobold busy" : (reachable ? "Kobold idle" : (status.checking ? "Kobold…" : "Kobold offline"));
+  const busy = !isOllama && reachable && status.busy === true;
+  state.llmStatusSnapshot = { ...status, provider };
+  heading.textContent = providerName;
   const characters = Number(status.generated_characters);
   detail.textContent = status.message || (busy
     ? `Generation active${Number.isFinite(characters) && characters > 0 ? ` · ${characters.toLocaleString()} characters` : ""}`
-    : (reachable ? "Ready for local requests." : "KoboldCpp could not be reached."));
+    : (reachable ? "Ready for local requests." : `${providerName} could not be reached.`));
   const modelName = typeof status.model === "string" ? status.model.trim() : "";
   model.textContent = modelName || (reachable ? "Unavailable" : "—");
   model.title = modelName;
   vision.textContent = status.vision === true ? "Yes" : (status.vision === false ? "No" : (reachable ? "Unknown" : "—"));
   vision.dataset.state = status.vision === true ? "available" : (status.vision === false ? "unavailable" : "unknown");
+  stop.hidden = isOllama;
+  stopHelp.hidden = isOllama;
   stop.disabled = !busy || state.koboldAbortBusy;
   stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Stop generation";
+  renderSystemStatusSummary();
 }
 
 async function refreshKoboldStatus() {
@@ -334,13 +396,13 @@ async function refreshKoboldStatus() {
   if (!control || control.dataset.state === "checking") renderKoboldStatus({ checking: true });
   state.koboldStatusRequest = (async () => {
     try {
-      const response = await api.fetchApi(KOBOLD_STATUS_ENDPOINT, {
+      const response = await api.fetchApi(LLM_STATUS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kobold_url: settings.kobold_url }),
+        body: JSON.stringify(settings),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `KoboldCpp status failed (${response.status}).`);
+      if (!response.ok) throw new Error(data.error || `${settings.llm_provider === "ollama" ? "Ollama" : "KoboldCpp"} status failed (${response.status}).`);
       renderKoboldStatus(data);
       return data;
     } catch (error) {
@@ -375,6 +437,28 @@ async function stopKoboldGeneration() {
   } finally {
     state.koboldAbortBusy = false;
     window.setTimeout(refreshKoboldStatus, 500);
+  }
+}
+
+async function restartComfyUIFromStatus() {
+  if (state.comfyRestartBusy || !state.apiConnected) return;
+  const ownerWindow = state.panel?.ownerDocument?.defaultView || window;
+  if (!ownerWindow.confirm("Restart ComfyUI now? Running generations and connected clients will be interrupted.")) return;
+  state.comfyRestartBusy = true;
+  renderSystemStatusSummary();
+  try {
+    const response = await api.fetchApi(COMFY_RESTART_ENDPOINT, { method: "POST" });
+    if (!response.ok) throw new Error(`ComfyUI Manager could not restart the server (${response.status}).`);
+    const detail = state.panel?.querySelector("#psvstudio-comfy-status-detail");
+    if (detail) detail.textContent = "Restarting; waiting to reconnect…";
+  } catch (error) {
+    state.comfyRestartBusy = false;
+    renderSystemStatusSummary();
+    const detail = state.panel?.querySelector("#psvstudio-comfy-status-detail");
+    if (detail) {
+      detail.textContent = `${error.message || error} Restart ComfyUI manually if Manager is unavailable.`;
+      detail.dataset.state = "offline";
+    }
   }
 }
 
@@ -2776,7 +2860,11 @@ function activeGenerationPromptIds() {
 }
 
 function setApiConnected(connected) {
-  state.apiConnected = Boolean(connected);
+  connected = Boolean(connected);
+  const reconnectedAfterRestart = connected && !state.apiConnected && state.comfyRestartBusy;
+  state.apiConnected = connected;
+  if (reconnectedAfterRestart) state.comfyRestartBusy = false;
+  renderSystemStatusSummary();
   if (state.apiConnected) {
     if (state.disconnectedGenerationTimer) clearTimeout(state.disconnectedGenerationTimer);
     state.disconnectedGenerationTimer = null;
@@ -4980,16 +5068,24 @@ function buildPanel() {
         <button id="psvstudio-refresh-workflows" class="psvstudio-button psvstudio-icon-button" type="button" title="Refresh [PSV] workflows" aria-label="Refresh [PSV] workflows">↻</button>
         <button id="psvstudio-toggle-studio-settings" class="psvstudio-button psvstudio-icon-button" type="button" title="Video Studio settings" aria-label="Video Studio settings" aria-expanded="false">&#9881;</button>
         <details id="psvstudio-kobold-control" class="psvstudio-kobold-control" data-state="checking">
-          <summary title="KoboldCpp status and emergency stop"><span class="psvstudio-kobold-dot" aria-hidden="true"></span><span id="psvstudio-kobold-status-label">Kobold…</span></summary>
+          <summary title="System status"><span class="psvstudio-kobold-dot" aria-hidden="true"></span><span id="psvstudio-kobold-status-label">Status: checking</span></summary>
           <div class="psvstudio-kobold-popover">
-            <strong>KoboldCpp</strong>
-            <span id="psvstudio-kobold-status-detail" role="status" aria-live="polite">Checking local status…</span>
-            <dl class="psvstudio-kobold-metadata">
-              <div><dt>Model</dt><dd id="psvstudio-kobold-model">Checking…</dd></div>
-              <div><dt>Vision</dt><dd id="psvstudio-kobold-vision" data-state="unknown">Checking…</dd></div>
-            </dl>
-            <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Stop generation</button>
-            <small>Stops text generation only. KoboldCpp stays loaded.</small>
+            <strong class="psvstudio-system-status-heading">System status</strong>
+            <section class="psvstudio-system-status-section">
+              <strong id="psvstudio-llm-status-heading">KoboldCpp</strong>
+              <span id="psvstudio-kobold-status-detail" role="status" aria-live="polite">Checking local status…</span>
+              <dl class="psvstudio-kobold-metadata">
+                <div><dt>Model</dt><dd id="psvstudio-kobold-model">Checking…</dd></div>
+                <div><dt>Vision</dt><dd id="psvstudio-kobold-vision" data-state="unknown">Checking…</dd></div>
+              </dl>
+              <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Stop generation</button>
+              <small id="psvstudio-kobold-stop-help">Stops text generation only. KoboldCpp stays loaded.</small>
+            </section>
+            <section class="psvstudio-system-status-section">
+              <div class="psvstudio-system-status-row"><strong>ComfyUI</strong><span id="psvstudio-comfy-status-detail" data-state="busy" role="status" aria-live="polite">Checking…</span></div>
+              <button id="psvstudio-comfy-restart" class="psvstudio-button" type="button">Restart ComfyUI</button>
+              <small>Requires ComfyUI Manager. Running work will be interrupted.</small>
+            </section>
           </div>
         </details>
         <label class="psvstudio-inline psvstudio-help"><input id="psvstudio-new-seed" type="checkbox" checked /> New seed</label>
@@ -5101,6 +5197,7 @@ function buildPanel() {
     saveVideoStudioSettings(event.target.checked);
   });
   panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopKoboldGeneration);
+  panel.querySelector("#psvstudio-comfy-restart").addEventListener("click", restartComfyUIFromStatus);
   panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
     const project = activeProject();
     if (!project) return;
@@ -5180,7 +5277,11 @@ function setupProgressEvents() {
   });
   api.addEventListener("reconnecting", () => setApiConnected(false));
   api.addEventListener("reconnected", () => setApiConnected(true));
-  api.addEventListener("status", event => setApiConnected(event.detail !== null));
+  api.addEventListener("status", event => {
+    const queueRemaining = Number(event.detail?.exec_info?.queue_remaining);
+    if (Number.isFinite(queueRemaining)) state.comfyQueueRemaining = Math.max(0, queueRemaining);
+    setApiConnected(event.detail !== null);
+  });
   setApiConnected(api.socket ? api.socket.readyState === WebSocket.OPEN : true);
 }
 

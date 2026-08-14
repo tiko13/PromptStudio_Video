@@ -618,6 +618,16 @@ async def promptstudio_video_kobold_status(request):
         return web.json_response({"error": str(exc)}, status=502)
 
 
+async def promptstudio_video_llm_status(request):
+    try:
+        data = await _director_body(request)
+        return web.json_response(await asyncio.to_thread(generation_status, data))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
 async def promptstudio_video_kobold_abort(request):
     try:
         data = await _director_body(request)
@@ -654,6 +664,7 @@ def register_routes():
     routes.get("/promptstudio-video/director/chat/{job_id}")(promptstudio_video_director_status)
     routes.post("/promptstudio-video/director/chat/{job_id}/cancel")(promptstudio_video_director_cancel)
     routes.post("/promptstudio-video/director/preview")(promptstudio_video_director_preview)
+    routes.post("/promptstudio-video/llm/status")(promptstudio_video_llm_status)
     routes.post("/promptstudio-video/kobold/status")(promptstudio_video_kobold_status)
     routes.post("/promptstudio-video/kobold/abort")(promptstudio_video_kobold_abort)
     return True

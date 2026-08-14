@@ -76,6 +76,21 @@ class LlmProviderTests(unittest.TestCase):
         self.assertEqual(status["model"], "koboldcpp/Qwen2.5-VL-7B-Q4_K_M")
         self.assertIs(status["vision"], True)
 
+    def test_ollama_generation_status_uses_selected_model(self):
+        with patch("video.llm_provider._get_json", return_value={
+            "models": [{"name": "gemma3:4b"}, {"model": "qwen3:8b"}],
+        }):
+            status = generation_status({
+                "llm_provider": "ollama",
+                "ollama_url": "http://localhost:11434",
+                "ollama_model": "gemma3:4b",
+            })
+
+        self.assertEqual(status["provider"], "ollama")
+        self.assertIs(status["reachable"], True)
+        self.assertEqual(status["model"], "gemma3:4b")
+        self.assertIs(status["model_installed"], True)
+
     def test_kobold_auto_response_budget_uses_remaining_context(self):
         posted = []
 

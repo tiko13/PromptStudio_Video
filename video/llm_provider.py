@@ -107,8 +107,40 @@ def _get_json(url, timeout):
 def generation_status(data):
     """Return a small, non-sensitive progress snapshot for a running local generation."""
     provider = str(data.get("llm_provider") or "koboldcpp").strip().casefold()
+    if provider == "ollama":
+        try:
+            base_url = clean_service_url(
+                data.get("ollama_url"),
+                DEFAULT_OLLAMA_URL,
+                "Ollama",
+                "PROMPT_STUDIO_VIDEO_OLLAMA_ALLOWED_HOSTS",
+            )
+            result = _get_json(_ollama_url(base_url, "tags"), 3)
+            if not isinstance(result, dict) or not isinstance(result.get("models"), list):
+                return {"provider": provider, "reachable": False, "busy": None}
+            models = {
+                str(item.get("name") or item.get("model") or "").strip()
+                for item in result["models"]
+                if isinstance(item, dict)
+            }
+            selected_model = str(data.get("ollama_model") or "").strip()
+            status = {
+                "provider": provider,
+                "reachable": True,
+                "busy": None,
+                "model": selected_model or None,
+                "model_installed": selected_model in models if selected_model else None,
+                "vision": None,
+            }
+            if not selected_model:
+                status["message"] = "Ollama is online. Select a model to use it."
+            elif selected_model not in models:
+                status["message"] = f"Ollama is online, but '{selected_model}' is not installed."
+            return status
+        except (OverflowError, TypeError, ValueError):
+            return {"provider": provider, "reachable": False, "busy": None}
     if provider != "koboldcpp":
-        return {"provider": provider, "reachable": None, "busy": None}
+        raise ValueError("llm_provider must be koboldcpp or ollama")
     try:
         base_url = clean_service_url(
             data.get("kobold_url"),

@@ -197,10 +197,11 @@ processing the prompt or how many response characters are available. The
 request timeout defaults to 600 seconds and can be adjusted in Director
 settings.
 
-The compact Kobold status control in the Video Studio toolbar remains available
-outside Director dialogs. It reports idle, busy, or unreachable state and can
-send KoboldCpp's supported abort signal to stop a runaway text generation
-without unloading the model or restarting KoboldCpp.
+The compact toolbar status icon covers the selected local LLM (KoboldCpp or
+Ollama) and ComfyUI. Green means all services are ready, orange means work is
+being processed, and red means a service needs attention. Its panel retains
+KoboldCpp's supported abort action when KoboldCpp is selected and includes a
+ComfyUI restart action when ComfyUI Manager is available.
 
 Existing dialogue, visible text, and references remain protected in both
 scopes. The Director may append newly requested dialogue but cannot rewrite or
