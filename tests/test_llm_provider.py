@@ -102,6 +102,32 @@ class LlmProviderTests(unittest.TestCase):
         self.assertEqual(result, "Complete response")
         self.assertEqual(posted[-1]["max_tokens"], 8_192 - 2_000 - 32)
 
+    def test_kobold_auto_response_budget_caps_runaway_generation(self):
+        posted = []
+
+        def post_json(_url, payload, _timeout, _service_name):
+            posted.append(payload)
+            if "special" in payload:
+                return {"value": 1_000}
+            return {
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "Compact response"},
+                }],
+            }
+
+        with (
+            patch("video.llm_provider._get_json", side_effect=[{"jinja": True}, {"value": 32_768}]),
+            patch("video.llm_provider._post_json", side_effect=post_json),
+        ):
+            result = generate_chat(
+                {"llm_provider": "koboldcpp", "max_response_tokens": 0},
+                [{"role": "user", "content": "Compose the full prompt."}],
+            )
+
+        self.assertEqual(result, "Compact response")
+        self.assertEqual(posted[-1]["max_tokens"], 12_288)
+
     def test_ollama_auto_response_budget_fills_context(self):
         with patch("video.llm_provider._post_json") as post:
             post.return_value = {

@@ -35,6 +35,7 @@ from video.director import (
     _canonicalize_reference_definition_grammar,
     _audible_sound,
     _validate_requested_dialogue_mechanics,
+    _validate_requested_camera_mechanics,
     _validate_requested_exact_literals,
     _validate_complete_project_placeholders,
     _canonicalize_placeholder_camera_targets,
@@ -50,6 +51,10 @@ from video.director import (
     _proposal_requested,
     _restrict_first_frame_proposal,
     _restrict_reference_only_proposal,
+    _restrict_ungrounded_audio_proposal,
+    _generate_with_context_fallback,
+    _canonicalize_requested_dialogue_literals,
+    _enforce_requested_reference_coverage,
 )
 
 
@@ -119,6 +124,32 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("steps array is its only writable performance sequence", system_message)
             self.assertIn("Never emit the legacy action or dialogue mirror fields", system_message)
 
+    def test_context_exhaustion_retries_once_with_low_thinking(self):
+        with patch(
+            "video.director.generate_chat",
+            side_effect=[
+                RuntimeError("KoboldCpp exhausted the available-context Director response budget."),
+                "valid response",
+            ],
+        ) as generate:
+            result = _generate_with_context_fallback(
+                {"thinking_mode": "High"}, [{"role": "user", "content": "Build it."}], []
+            )
+        self.assertEqual(result, "valid response")
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args_list[0].args[0]["thinking_mode"], "High")
+        self.assertEqual(generate.call_args_list[1].args[0]["thinking_mode"], "Low")
+
+    def test_non_context_provider_errors_do_not_retry(self):
+        with patch(
+            "video.director.generate_chat", side_effect=RuntimeError("KoboldCpp is unreachable")
+        ) as generate:
+            with self.assertRaisesRegex(RuntimeError, "unreachable"):
+                _generate_with_context_fallback(
+                    {"thinking_mode": "High"}, [{"role": "user", "content": "Build it."}], []
+                )
+        self.assertEqual(generate.call_count, 1)
+
     def test_both_directors_make_concurrency_and_sync_explicit(self):
         for system_message in (SHOT_SYSTEM_MESSAGE, PROJECT_SYSTEM_MESSAGE):
             self.assertIn("TEMPORAL INTENT, CONCURRENCY, AND SYNCHRONIZATION", system_message)
@@ -169,7 +200,125 @@ class DirectorTests(unittest.TestCase):
         document = director_document()
         document["shots"][0]["sounds"] = ["The chair creaks, followed by silence."]
         with self.assertRaisesRegex(ValueError, "only audible events"):
-            _validate_sound_entries(document)
+            _validate_sound_entries(document, {})
+
+        self.assertEqual(
+            _audible_sound("Footsteps continue while the umbrella remains closed and silent."),
+            "Footsteps continue",
+        )
+        self.assertEqual(_audible_sound("Exactly as her weight shifts to standing."), "")
+
+    def test_sound_validation_rejects_ungrounded_stock_foley_and_ambience(self):
+        document = normalize_document(director_document())
+        document["shots"][0]["sounds"] = ["Her silver bracelet jingles as she waves."]
+        with self.assertRaisesRegex(ValueError, "ungrounded.*jewelry"):
+            _validate_sound_entries(document, {
+                "messages": [{"role": "user", "content": "Have the baker wave."}],
+            })
+
+        document = normalize_document(director_document())
+        document["overall_soundscape"] = "A breeze rustles unseen curtains."
+        with self.assertRaisesRegex(ValueError, "overall_soundscape.*curtains|overall_soundscape.*wind"):
+            _validate_sound_entries(document, {
+                "messages": [{"role": "user", "content": "Keep the existing bakery sounds."}],
+            })
+
+    def test_sound_validation_accepts_sources_grounded_in_request_and_shots(self):
+        document = normalize_document(director_document())
+        document["shots"][0]["environment"] = "Rain falls outside the bakery window."
+        document["shots"][0]["sounds"] = [
+            "Rain taps against the window throughout her movement."
+        ]
+        document["overall_soundscape"] = "Rain and the window tapping continue under the action."
+        _validate_sound_entries(document, {
+            "messages": [{"role": "user", "content": "Add rain at the bakery window."}],
+        })
+
+    def test_ungrounded_audio_sanitizer_drops_stock_foley_and_soundscape_clauses(self):
+        document = normalize_document(director_document())
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"}, "summary": "Clean the audio",
+            "operations": [{
+                "op": "update_project", "fields": {
+                    "overall_soundscape": (
+                        "Paper rustles as she opens the letter. A breeze rustles unseen curtains."
+                    ),
+                },
+            }, {
+                "op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "sounds": [
+                        "Paper rustles as she opens the letter.",
+                        "Her silver bracelet jingles.",
+                    ],
+                },
+            }],
+        }
+        cleaned = _restrict_ungrounded_audio_proposal(document, proposal, {
+            "messages": [{"role": "user", "content": "Keep the letter's paper rustle."}],
+        })
+        self.assertEqual(
+            cleaned["operations"][1]["fields"]["sounds"],
+            ["Paper rustles as she opens the letter."],
+        )
+        self.assertEqual(
+            cleaned["operations"][0]["fields"]["overall_soundscape"],
+            "Paper rustles as she opens the letter.",
+        )
+
+        shutter_document = normalize_document(director_document())
+        shutter_document["shots"][0]["steps"][0]["text"] = "The baker opens the shutters."
+        shutter_proposal = {
+            "base_document_hash": document_fingerprint(shutter_document),
+            "scope": {"type": "project"}, "summary": "Sound the shutters",
+            "operations": [{
+                "op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "sounds": ["The wooden doors scrape and creak as they open."],
+                },
+            }],
+        }
+        repaired = _restrict_ungrounded_audio_proposal(
+            shutter_document, shutter_proposal,
+            {"messages": [{"role": "user", "content": "The baker opens the shutters."}]},
+        )
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["sounds"],
+            ["The wooden shutters scrape and creak as they open."],
+        )
+
+        latch_document = normalize_document(director_document())
+        latch_document["shots"][0]["steps"][0]["text"] = (
+            "The baker unlatches the shutters and pushes them open."
+        )
+        latch_proposal = {
+            "base_document_hash": document_fingerprint(latch_document),
+            "scope": {"type": "project"}, "summary": "Sound the latch",
+            "operations": [{
+                "op": "update_shot", "shot_id": "shot-1", "fields": {
+                    "sounds": ["As the latches release, two metal clicks ring out."],
+                },
+            }],
+        }
+        repaired = _restrict_ungrounded_audio_proposal(
+            latch_document, latch_proposal,
+            {"messages": [{"role": "user", "content": "The baker opens the shutters."}]},
+        )
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["sounds"],
+            ["As the latches release, two metal clicks ring out."],
+        )
+
+    def test_pan_around_subject_requires_arc_shot(self):
+        document = normalize_document(director_document())
+        document["shots"][1]["camera"]["type"] = "Pan Right"
+        data = {"messages": [{
+            "role": "user", "content": "After the cut, the camera will pan around her."
+        }]}
+        with self.assertRaisesRegex(ValueError, "use Arc Shot"):
+            _validate_requested_camera_mechanics(document, data)
+
+        document["shots"][1]["camera"]["type"] = "Arc Shot"
+        _validate_requested_camera_mechanics(document, data)
 
     def test_explicit_all_reference_coverage_requires_every_shot(self):
         document = normalize_document({
@@ -192,6 +341,26 @@ class DirectorTests(unittest.TestCase):
             _validate_requested_reference_coverage(document, {
                 "messages": [{"role": "user", "content": "Apply all references throughout all shots."}]
             })
+
+        for shot_value in document["shots"]:
+            shot_value["composition"] += " <Subject 1>."
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"}, "summary": "Apply throughout",
+            "operations": [{"op": "update_project", "fields": {
+                "retention_analysis": [{
+                    "label": "<Subject 1>", "where": "appears in [Shot 1]",
+                    "relationship": "fully_preserved", "detail": "The style is retained.",
+                }],
+            }}],
+        }
+        repaired = _enforce_requested_reference_coverage(document, proposal, {
+            "messages": [{"role": "user", "content": "Apply all references throughout all shots."}]
+        })
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["retention_analysis"][0]["where"],
+            "appears in [Shot 1], [Shot 2]",
+        )
 
     def test_reference_prompt_length_allows_concise_full_reference_output(self):
         document = normalize_document({
@@ -256,6 +425,62 @@ class DirectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing exact text"):
             _validate_requested_exact_literals(document, request)
 
+    def test_requested_dialogue_literal_repairs_punctuation_only_drift(self):
+        proposal = {
+            "scope": {"type": "project"}, "summary": "Keep the line",
+            "operations": [{
+                "op": "update_shot", "shot_id": "shot-1", "fields": {"steps": [{
+                    "type": "dialogue", "speaker": "The woman", "speaker_id": "S1",
+                    "language": "English", "text": "Come here, dear.",
+                }]},
+            }],
+        }
+        repaired = _canonicalize_requested_dialogue_literals(proposal, {
+            "messages": [{"role": "user", "content": 'The woman says "Come here dear".'}],
+        })
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["steps"][0]["text"],
+            "Come here dear",
+        )
+        rewritten = copy.deepcopy(proposal)
+        rewritten["operations"][0]["fields"]["steps"][0]["text"] = "Please come here."
+        unchanged = _canonicalize_requested_dialogue_literals(rewritten, {
+            "messages": [{"role": "user", "content": 'The woman says "Come here dear".'}],
+        })
+        self.assertEqual(
+            unchanged["operations"][0]["fields"]["steps"][0]["text"],
+            "Please come here.",
+        )
+
+    def test_requested_visible_text_literal_is_exact(self):
+        document = normalize_document(director_document())
+        document["shots"][0]["visible_text"] = ["EXIT 7"]
+        request = {"messages": [{
+            "role": "user", "content": 'The neon sign visibly reads "EXIT 7".'
+        }]}
+        _validate_requested_exact_literals(document, request)
+        document["shots"][0]["visible_text"] = ["Exit 7."]
+        with self.assertRaisesRegex(ValueError, "missing exact visible text"):
+            _validate_requested_exact_literals(document, request)
+
+    def test_requested_visible_text_repairs_punctuation_only_drift(self):
+        proposal = {
+            "scope": {"type": "project"}, "summary": "Keep the sign",
+            "operations": [{
+                "op": "update_shot", "shot_id": "shot-1",
+                "fields": {"visible_text": ["EXIT 7."]},
+            }],
+        }
+        repaired = _canonicalize_requested_dialogue_literals(proposal, {
+            "messages": [{
+                "role": "user", "content": 'The neon sign visibly reads "EXIT 7".'
+            }],
+        })
+        self.assertEqual(
+            repaired["operations"][0]["fields"]["visible_text"],
+            ["EXIT 7"],
+        )
+
     def test_complete_project_rejects_schema_placeholders(self):
         document = normalize_document(director_document())
         document["shots"][0]["composition"] = "composition"
@@ -263,6 +488,39 @@ class DirectorTests(unittest.TestCase):
             _validate_complete_project_placeholders(document, {
                 "messages": [{"role": "user", "content": "Create the complete production."}]
             })
+
+        document = normalize_document(director_document())
+        document["shots"][0]["composition"] = "medium-wide composition"
+        document["shots"][0]["steps"][0]["text"] = "action"
+        with self.assertRaisesRegex(ValueError, "composition|action step"):
+            _validate_complete_project_placeholders(document, {
+                "messages": [{"role": "user", "content": "Completely rewrite the production."}]
+            })
+        retry = _proposal_retry_messages(
+            [{"role": "user", "content": "Completely rewrite the production."}],
+            "project",
+            proposal_error=(
+                "The complete project still contains placeholder production fields: "
+                "shot-1 composition, shot-1 action step 1"
+            ),
+        )
+        self.assertIn("not merely 'medium-wide composition'", retry[-1]["content"])
+        self.assertIn("not 'action'", retry[-1]["content"])
+        retry_with_draft = _proposal_retry_messages(
+            [{"role": "user", "content": "Completely rewrite the production."}],
+            "project",
+            proposal_error="placeholder production fields",
+            draft_proposal={"scope": {"type": "project"}, "operations": []},
+        )
+        self.assertIn("Invalid structured draft to repair", retry_with_draft[-2]["content"])
+        self.assertIn('"operations":[]', retry_with_draft[-2]["content"])
+        sound_retry = _proposal_retry_messages(
+            [{"role": "user", "content": "Add synchronized sounds."}],
+            "project",
+            proposal_error="The complete project proposal omitted requested synchronized sounds for: shot-1",
+        )
+        self.assertIn("shutters scrape", sound_retry[-1]["content"])
+        self.assertIn("keep the same source noun", sound_retry[-1]["content"])
 
     def test_placeholder_camera_target_uses_grounded_subject_tokens(self):
         document = normalize_document(director_document())
@@ -1438,6 +1696,21 @@ class DirectorTests(unittest.TestCase):
         preview = preview_changeset(document, parsed["proposal"])
         self.assertIn("A soft footstep lands on the carriage floor.", preview["compiled_prompt"])
 
+    def test_audible_only_action_step_is_lifted_without_losing_visible_action(self):
+        document = normalize_document(director_document())
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Separate action and sound","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She stops beneath the clock."},'
+            '{"type":"action","text":"Footsteps echo and then stop abruptly."}]}}]}'
+            f"\n{CHANGESET_END}"
+        )
+        parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
+        fields = parsed["proposal"]["operations"][0]["fields"]
+        self.assertEqual(fields["steps"], [{"type": "action", "text": "She stops beneath the clock."}])
+        self.assertEqual(fields["sounds"], ["Footsteps echo and then stop abruptly."])
+
     def test_project_proposal_can_update_planning_synopsis_without_compiling_it(self):
         document = normalize_document(director_document())
         fingerprint = document_fingerprint(document)
@@ -1472,6 +1745,43 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(action_text(result["document"]["shots"][1]), "She opens the letter.")
         self.assertEqual(result["document"]["shots"][1]["camera"]["target"], "the text")
         self.assertEqual(result["compiled_prompt"].count("camera pushes in"), 1)
+
+    def test_camera_only_step_deduplication_keeps_valid_camera_proposal(self):
+        document = normalize_document(director_document())
+        fingerprint = document_fingerprint(document)
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Hold the first-frame composition","operations":['
+            '{"op":"update_shot","shot_id":"shot-1","fields":{'
+            '"steps":[{"type":"action","text":"The camera holds a static shot."}],'
+            '"camera":{"type":"Static Shot","amplitude":"default","speed":"default",'
+            '"target":"the woman"}}}]}\n'
+            f"{CHANGESET_END}"
+        )
+        parsed = parse_director_response(raw, "shot-1", fingerprint)
+        result = preview_changeset(document, parsed["proposal"])
+        fields = result["proposal"]["operations"][0]["fields"]
+        self.assertNotIn("steps", fields)
+        self.assertEqual(fields["camera"]["type"], "Static Shot")
+        self.assertEqual(
+            result["document"]["shots"][0]["steps"], document["shots"][0]["steps"]
+        )
+
+    def test_camera_deduplication_preserves_action_in_mixed_sentence(self):
+        document = normalize_document(director_document())
+        fingerprint = document_fingerprint(document)
+        raw = (
+            f"{CHANGESET_BEGIN}\n"
+            '{"summary":"Add a wave","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-1","fields":{"steps":[{"type":"action",'
+            '"text":"The woman waves while the camera holds a static shot."}],'
+            '"camera":{"type":"Static Shot","amplitude":"default","speed":"default",'
+            '"target":"the woman"}}}]}\n'
+            f"{CHANGESET_END}"
+        )
+        parsed = parse_director_response(raw, "shot-1", fingerprint)
+        result = preview_changeset(document, parsed["proposal"])
+        self.assertEqual(action_text(result["document"]["shots"][0]), "The woman waves")
 
     def test_add_operations_for_display_ids_update_existing_shots(self):
         document = normalize_document(director_document())
@@ -2273,6 +2583,42 @@ class DirectorTests(unittest.TestCase):
             },
         )
 
+    def test_i2va_allows_concrete_requested_bedroom_shot(self):
+        original = self.i2va_document()
+        result = copy.deepcopy(original)
+        result["shots"][1]["id"] = "shot-new-bedroom"
+        result["shots"][1]["environment"] = "Her bedroom with a bed and nightstand."
+        result["shots"][1]["lighting"] = "Warm bedside-lamp light."
+
+        for instruction in (
+            "Add a second shot in her bedroom, where she sits on the bed.",
+            "Next shot: she is in the bedroom and walks toward the nightstand.",
+            "The girl in picture 1 will smile and start walking towards the camera. "
+            "When she reaches the camera, the shot will cut to a new shot - the girl "
+            "will be standing in a luxury bedroom, and the camera will pan around her.",
+            "Keep the same woman but change only her wardrobe to a black tuxedo. "
+            "After the cut she adjusts one cuff in a luxury hotel lobby.",
+            "She walks into an abandoned industrial warehouse in the final shot.",
+        ):
+            _validate_i2va_anchor_preservation(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": instruction}]},
+            )
+
+    def test_i2va_concrete_place_detection_does_not_allow_unrequested_room(self):
+        original = self.i2va_document()
+        result = copy.deepcopy(original)
+        result["shots"][1]["environment"] = "An ornate marble ballroom."
+        result["shots"][1]["lighting"] = "Crystal chandeliers cast warm light."
+
+        with self.assertRaisesRegex(ValueError, "later shots to inherit"):
+            _validate_i2va_anchor_preservation(
+                original,
+                result,
+                {"messages": [{"role": "user", "content": "Add another shot where she waves."}]},
+            )
+
     def test_complete_i2va_requires_action_but_not_fabricated_visual_fields(self):
         document = self.i2va_document()
         for shot in document["shots"]:
@@ -2336,9 +2682,8 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_args_list[0].args[0]["temperature"], 0.2)
         self.assertEqual(generate.call_args_list[1].args[0]["max_response_tokens"], 0)
         self.assertEqual(generate.call_args_list[1].args[0]["temperature"], 0.0)
-        self.assertTrue(all(
-            call.args[0]["thinking_mode"] == "High" for call in generate.call_args_list
-        ))
+        self.assertEqual(generate.call_args_list[0].args[0]["thinking_mode"], "High")
+        self.assertEqual(generate.call_args_list[1].args[0]["thinking_mode"], "Low")
         retry_messages = generate.call_args.args[1]
         self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
         self.assertIn(CHANGESET_BEGIN, retry_messages[-1]["content"])
@@ -2849,6 +3194,53 @@ class DirectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fill level|right-hand"):
             _validate_requested_project_result(document, data)
 
+    def test_complete_project_requires_requested_screen_direction_across_cuts(self):
+        document = normalize_document(director_document())
+        for index, shot in enumerate(document["shots"], 1):
+            shot.update({
+                "composition": f"Medium shot {index}", "subjects": "The same woman",
+                "environment": "Train carriage", "lighting": "Cool window light",
+            })
+        document["shots"][0]["steps"][0]["text"] = (
+            "She walks screen-left to screen-right through the carriage."
+        )
+        document["shots"][1]["steps"][0]["text"] = "She continues walking toward the door."
+        data = {"messages": [{"role": "user", "content": (
+            "Completely refine both shots. She moves screen-left to screen-right; preserve screen "
+            "direction throughout and do not reverse it across the cut."
+        )}]}
+        with self.assertRaisesRegex(ValueError, "screen-left to screen-right"):
+            _validate_requested_project_result(document, data)
+        document["shots"][1]["steps"][0]["text"] = (
+            "She continues screen-left to screen-right toward the door."
+        )
+        _validate_requested_project_result(document, data)
+
+    def test_complete_project_requires_explicit_shot_start_list(self):
+        document = normalize_document({
+            "version": 1,
+            "duration_seconds": 9,
+            "shots": [
+                {"id": "shot-1", "start": 0, "composition": "Wide shot", "subjects": "A baker",
+                 "environment": "Bakery", "lighting": "Night light",
+                 "steps": [{"type": "action", "text": "She opens the shutters."}]},
+                {"id": "shot-2", "start": 4, "composition": "Medium shot", "subjects": "The baker",
+                 "environment": "Bakery", "lighting": "Night light",
+                 "steps": [{"type": "action", "text": "She finds a parcel."}]},
+                {"id": "shot-3", "start": 6, "composition": "Close-up", "subjects": "The baker",
+                 "environment": "Bakery", "lighting": "Night light",
+                 "steps": [{"type": "action", "text": "She reads its note."}]},
+            ],
+        })
+        request = {"messages": [{
+            "role": "user",
+            "content": "Completely rewrite this as exactly three resulting shots at 0, 3, and 6 seconds.",
+        }]}
+        with self.assertRaisesRegex(ValueError, "requested shot start times"):
+            _validate_requested_project_result(document, request)
+        document["shots"][1]["start"] = 3
+        _validate_requested_project_result(document, request)
+
     def test_invalid_project_timeline_is_corrected_once(self):
         invalid_response = (
             "Here is the complete structured video document populated for MiniMax H3.\n"
@@ -2882,7 +3274,7 @@ class DirectorTests(unittest.TestCase):
         retry_messages = generate.call_args.args[1]
         self.assertIn("strictly increasing", retry_messages[-1]["content"])
         self.assertNotIn(invalid_response, retry_messages[-2]["content"])
-        self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
+        self.assertIn("Invalid structured draft to repair", retry_messages[-2]["content"])
 
     def test_malformed_json_retry_accepts_vague_camera_qualifiers(self):
         malformed_response = (

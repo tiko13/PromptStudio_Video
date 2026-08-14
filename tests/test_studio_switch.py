@@ -40,6 +40,21 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("promptstudio_video_redirect.js", self.page)
         self.assertIn('pathname.endsWith("/prompt_studio_video.html")', self.redirect)
 
+    def test_live_execution_activity_promotes_queued_generations(self):
+        helper_start = self.source.index("function markGenerationExecuting")
+        helper_end = self.source.index("function failGeneration", helper_start)
+        helper = self.source[helper_start:helper_end]
+        self.assertIn('record.generation.status === "queued"', helper)
+        self.assertIn('updateGeneration(id, { status: "generating" })', helper)
+
+        events_start = self.source.index("function setupProgressEvents")
+        events_end = self.source.index("function setStandaloneVisibility", events_start)
+        events = self.source[events_start:events_end]
+        for event_name in ("execution_start", "progress", "executing", "progress_state"):
+            handler_start = events.index(f'api.addEventListener("{event_name}"')
+            handler = events[handler_start:handler_start + 500]
+            self.assertIn("markGenerationExecuting(id)", handler)
+
 
 if __name__ == "__main__":
     unittest.main()

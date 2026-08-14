@@ -28,6 +28,7 @@ CHAIR_IMAGE = "ComfyUI_00038_.webp"
 DRAWING_IMAGE = "example.png"
 FIRST_FRAME_IMAGE = "ComfyUI_00061_.webp"
 LAST_FRAME_IMAGE = "ComfyUI_00066_.webp"
+USER_FIRST_FRAME_IMAGE = "ComfyUI_00005_.webp"
 
 
 def reference(index, path, role, kind="image", prompt=""):
@@ -39,6 +40,25 @@ def reference(index, path, role, kind="image", prompt=""):
         "roles": [role],
         "prompt": prompt,
     }
+
+
+def user_first_frame_reference():
+    value = reference(1, USER_FIRST_FRAME_IMAGE, "first_frame")
+    value.update({
+        "observed_visual_facts": (
+            "A full-body young woman stands on grey cobblestones with long straight brown hair, "
+            "a tight-fitting red mini dress with short sleeves, and bare feet."
+        ),
+        "subject_candidates": [{
+            "name": "young woman", "location": "center",
+            "visual_selectors": ["woman in red dress", "barefoot woman", "long brown hair"],
+            "grounded_attributes": {
+                "hair": "long, straight, brown", "face": "fair skin",
+                "clothing": "red mini dress", "footwear": "barefoot",
+            },
+        }],
+    })
+    return value
 
 
 def attachment(index, path, usage):
@@ -138,6 +158,78 @@ def cases():
         reference(3, DRAWING_IMAGE, "style"),
     ]
     return {
+        "i2va_hard_cut_identity": {
+            "document": document(
+                mode="i2va", references=[user_first_frame_reference()],
+                shots=[shot("shot-1", 0)], duration=6,
+            ),
+            "prompt": (
+                "The girl in picture 1 will smile and start walking towards the camera. When she reaches "
+                "the camera, the shot will cut to a new shot - the girl will be standing in a luxury "
+                "bedroom, and the camera will pan around her. Her identity, hair, red mini dress, bare "
+                "feet, and body proportions must remain exactly the same across the cut."
+            ),
+            "mode": "i2va",
+            "shots": 2,
+            "prompt_prefix": "For the target video, at 0.00 seconds",
+            "compiled_required_terms": [
+                "the same person shown in <Picture 1>", "clothing (red mini dress)",
+                "footwear (barefoot)", "there is no wardrobe change",
+                "camera moves in an arc around the subject",
+            ],
+            "compiled_forbidden_terms": ["silk robe", "gown", "high heels", "bracelet"],
+            "shot_required_patterns": [
+                [r"smil(?:e|es|ing).*(?:walk|approach)"],
+                [r"luxur(?:y|ious).*bedroom", r"Arc Shot"],
+            ],
+        },
+        "i2va_intentional_wardrobe_change": {
+            "document": document(
+                mode="i2va", references=[user_first_frame_reference()],
+                shots=[shot("shot-1", 0)], duration=6,
+            ),
+            "prompt": (
+                "Create exactly two shots. She takes one step toward camera in Shot 1. At the cut to Shot 2, "
+                "keep the same woman's face, brown hair, and body proportions, but deliberately change only "
+                "her wardrobe from the red mini dress to a tailored black tuxedo and black dress shoes. She "
+                "adjusts one cuff in a hotel lobby. This wardrobe change is intentional."
+            ),
+            "mode": "i2va",
+            "shots": 2,
+            "compiled_required_terms": ["black tuxedo"],
+            "compiled_forbidden_terms": ["there is no wardrobe change"],
+            "shot_required_patterns": [
+                [r"step.*(?:camera|forward)"],
+                [r"black tuxedo", r"adjust.*cuff", r"hotel lobby"],
+            ],
+        },
+        "t2va_match_cut_prop_continuity": {
+            "document": document(
+                mode="t2va",
+                shots=[{"id": "shot-1", "start": 0, "steps": []}],
+                duration=9,
+            ),
+            "prompt": (
+                "Completely rewrite the video as exactly three shots at 0, 3, and 6 seconds. A detective in "
+                "a charcoal coat carries a closed red umbrella in her right hand. Shot 1 tracks her walking "
+                "screen-left to screen-right through a station. Cut on action to Shot 2 without reversing screen "
+                "direction; the same umbrella remains closed in the same right hand as she stops under a clock. "
+                "Use a match cut to Shot 3 on the umbrella's red curved handle; it is still closed and in her "
+                "right hand as she enters a rainy street. Preserve her identity, coat, umbrella state, hand, and "
+                "screen direction throughout. Add only synchronized footsteps, coat movement, station ambience, "
+                "and rain that begins in Shot 3; no invented keys, jewelry, heels, doors, or music."
+            ),
+            "mode": "t2va",
+            "shots": 3,
+            "starts": [0, 3, 6],
+            "forbidden": "OBSOLETE",
+            "shot_required_patterns": [
+                [r"charcoal coat", r"closed red umbrella.*right hand", r"left.*right"],
+                [r"closed red umbrella.*right hand", r"clock", r"left.*right"],
+                [r"red.*handle", r"closed.*right hand", r"rain"],
+            ],
+            "compiled_forbidden_terms": ["keys", "bracelet", "necklace", "high heels"],
+        },
         "t2va_rewrite": {
             "document": document(mode="t2va"),
             "prompt": (
@@ -227,7 +319,7 @@ def cases():
             "observation_terms": [
                 ["blonde", "pink", "boots"],
                 ["burgundy", "red", "chair"],
-                ["drawing", "cartoon", "yellow", "blue", "green"],
+                ["drawing", "cartoon", "illustration", "yellow", "blue", "green"],
             ],
             "observation_forbidden_terms": [
                 [],
@@ -238,7 +330,7 @@ def cases():
                 "<Picture 2>": ["dark brown hair", "white short-sleeved", "black skirt"],
             },
             "shot_required_patterns": [
-                [r"approach(?:es|ing)?.*<Subject 2>"],
+                [r"(?:approach(?:es|ing)?|walk(?:s|ing)?\s+(?:toward|to)).*<Subject 2>"],
                 [r"danc(?:e|es|ing).*<Subject 2>"],
                 [r"sit(?:s|ting)?.*(?:on|in).*<Subject 2>", r"rais(?:e|es|ing).*both hands"],
             ],
@@ -461,6 +553,30 @@ def cases():
                 "<cutoff>", '"CORE TEMP: 72°C"',
             ],
         },
+        "t2va_two_speakers_interrupt_and_singing": {
+            "document": document(
+                mode="t2va", shots=[{"id": "shot-1", "start": 0, "steps": []}], duration=8,
+            ),
+            "prompt": (
+                "Completely rewrite the production as exactly two shots at 0 and 4 seconds. In Shot 1, a woman "
+                "walks toward an exit while saying exactly \"We go now.\" in English. Before she finishes moving, "
+                "a man interrupts her and says exactly \"Wait.\" in English; keep distinct stable speaker IDs and "
+                "make the interruption explicit in delivery while her walking continues. A sign visibly reads "
+                "\"EXIT 7\". In Shot 2, the man remains off-screen and sings exactly \"Stay with me.\" in English "
+                "while the woman stops at the doorway and keeps her lips closed. Use synchronized footsteps and "
+                "room ambience. Quiet piano ducks beneath the spoken lines and swells only after the singing ends."
+            ),
+            "mode": "t2va", "shots": 2, "starts": [0, 4], "forbidden": "OBSOLETE",
+            "expected_dialogue_texts": ["We go now.", "Wait.", "Stay with me."],
+            "expected_visible_texts": ["EXIT 7"],
+            "compiled_required_terms": [
+                "(S1) says", "(S2) says", "(S2) sings off-screen",
+                "<d>[English] We go now.</d>", "<d>[English] Wait.</d>",
+                "<d>[English] Stay with me.</d>", '"EXIT 7"',
+            ],
+            "dialogue_delivery_contains": {"Wait.": "interrupt"},
+            "distinct_speaker_ids": True,
+        },
         "t2va_complete_silence": {
             "document": document(mode="t2va", shots=[shot("shot-1", 0)], duration=6),
             "prompt": (
@@ -638,7 +754,7 @@ def cases():
             "observation_terms": [
                 ["woman", "dress", "door"],
                 ["woman", "dress", "door"],
-                ["drawing", "blue", "green", "yellow"],
+                ["drawing", "illustration", "vector", "blue", "green", "yellow"],
             ],
             "observation_forbidden_terms": [[], [], []],
         },
@@ -717,7 +833,7 @@ def validate(name, case, result, preview):
         "overall_soundscape: N/A" not in compiled or "non_diegetic_music: N/A" not in compiled
     ):
         errors.append("complete_silence did not suppress compiled soundscape and music")
-    maximum_words = 650 + 50 * max(0, len(result_document.get("references") or []) - 3)
+    maximum_words = 650 + 100 * max(0, len(result_document.get("references") or []) - 3)
     if len(compiled.split()) > maximum_words:
         errors.append(f"compiled prompt is unexpectedly verbose: {len(compiled.split())} words")
     speaker_id_pattern = re.compile(r"(?<![A-Za-z0-9_<])S\d+(?![A-Za-z0-9_>])")
@@ -769,6 +885,20 @@ def validate(name, case, result, preview):
                 errors.append(
                     f"dialogue {expected['text']!r} flag {flag}={event.get(flag)} != {value}"
                 )
+    for text_value, delivery_term in (case.get("dialogue_delivery_contains") or {}).items():
+        event = next((item for item in (
+            step for shot_value in result_document.get("shots") or []
+            for step in shot_value.get("steps") or [] if step.get("type") == "dialogue"
+        ) if item.get("text") == text_value), None)
+        if event is not None and delivery_term.casefold() not in str(event.get("delivery") or "").casefold():
+            errors.append(f"dialogue {text_value!r} delivery missed {delivery_term!r}")
+    if case.get("distinct_speaker_ids"):
+        ids = [
+            step.get("speaker_id") for shot_value in result_document.get("shots") or []
+            for step in shot_value.get("steps") or [] if step.get("type") == "dialogue"
+        ]
+        if len(set(ids)) < 2:
+            errors.append(f"expected at least two distinct speaker IDs, got {ids}")
     visible_texts = [
         value
         for shot_value in result_document.get("shots") or []

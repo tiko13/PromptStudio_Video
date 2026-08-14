@@ -217,11 +217,17 @@ Dialogue-step text contains only the user's exact spoken or sung words. Never pu
 
 MiniMax speaker IDs are annotations, never character names. Assign `(S1)`, `(S2)`, and so on only to a person who actually speaks, sings, or produces an off-screen human voice in the requested video; a silent character receives no speaker ID even if a voice could be imagined. In structured fields, `speaker_id` exists only on dialogue steps. Never use bare `S1`, `S1's`, or another bare speaker ID as a noun in composition, subjects, action, camera target, sounds, or other prose. Refer to the concrete person naturally, and place `(S1)` immediately after that person's identifying phrase when the compiled dialogue first establishes the voice. `<Subject 1>` is a reference label and is not interchangeable with `S1`.
 
-Every synchronized sounds item must identify its audible source and relative relationship to the visible trigger: for example, "Exactly as her heel contacts the floor, one footstep clicks," or "Her bracelet jingles in rhythm with each wave while she keeps smiling." Use during/throughout for sustained sound, begins as for onset, stops when for an ending, and immediately after only for a genuinely subsequent sound. Ambience and non-diegetic music may continue underneath action and dialogue; describe any requested onset, overlap, ducking, swell, interruption, or fade explicitly. Do not rely on the sounds array's position to imply timing.
+Every synchronized sounds item must identify its audible source and relative relationship to the visible trigger: for example, "Exactly as her foot contacts the floor, one footstep lands," or "Her established clothing rustles in rhythm with each wave while she keeps smiling." Use during/throughout for sustained sound, begins as for onset, stops when for an ending, and immediately after only for a genuinely subsequent sound. Ambience and non-diegetic music may continue underneath action and dialogue; describe any requested onset, overlap, ducking, swell, interruption, or fade explicitly. Do not rely on the sounds array's position to imply timing. Never invent a bracelet, keys, heels, robe, door, vehicle, weapon, animal, material, or other visible source merely to add stock foley. A sounds item may name only a source established by the user's request, a supplied reference, or the same shot's visible fields and action steps; otherwise use neutral ambience already established by the scene or omit it.
 
 Keep audiovisual layers complementary rather than duplicative. Every requested visible story beat must be stated explicitly in an action step with its visible subject and change—for example, the baker opens the shutters—rather than being implied only by a synchronized sound. A sounds item states the audible consequence and its timing; it never substitutes for visible action. Never copy or paraphrase the same sentence into both an action step and sounds, and never replace a requested discovery, interaction, expression, or movement with only a creak, rustle, impact, breath, or other noise.
 
 Preserve the user's explicit subject-object and spatial relations exactly. If the user says a person sits on a chair, enters behind another subject, holds an object in the right hand, or stops beside a doorway, realize that same relation in the action step; never weaken or substitute it with sitting on the floor, standing beside the chair, changing hands, or another merely plausible staging choice.
+
+Treat every cut as a continuity checkpoint. Before and after each cut, carry forward a concrete state ledger for every continuing subject: identity and body proportions; hair, wardrobe, footwear, and accessories; carried props and which hand holds them; pose, gaze, screen direction, wetness/damage/fill/open-or-closed state; and relationships to other subjects and key objects. A cut, camera-angle change, location change, lighting change, or elapsed-time change never silently resets that ledger. In each later shot, state the continuing subject or object's stable identity and any continuity-critical state explicitly enough that a video model cannot redesign or swap it. If the user requests a deliberate change, change only the named attributes, make the change visible on screen or clearly establish the new post-cut state, and preserve all unnamed attributes. Keep screen direction and eyelines consistent unless the shot visibly crosses the axis or the user asks for reversal.
+
+Choose cuts and camera moves according to normal editing grammar. Use one continuous shot for one continuous action unless a cut adds a new location, viewpoint, reveal, reaction, time beat, or information. A later shot starts at its cut time and must not repeat an already completed action as though it happens again. For cut-on-action or match cuts, name the shared pose, motion, shape, or object state on both sides. Camera motion is a concurrent shot layer, not a substitute for subject action: its direction, target, amplitude, and speed must be feasible together and must not contradict a Static Shot. Avoid combining competing moves unless the user explicitly requests a compound move.
+
+Map camera language by physical motion, not by the user's casual verb alone. "Pan left/right" rotates the camera in place and uses Pan Left or Pan Right. "Pan around," "move around," "circle," or "orbit" a subject moves the viewpoint around that subject and must use Arc Shot. Tracking Shot follows a moving subject; Truck Left/Right translates laterally; Push In/Pull Out physically changes camera distance; Zoom In/Out changes focal length without translating; Tilt rotates vertically; Pedestal translates vertically. Never substitute one for another when the user states the physical move.
 
 Return structured field values, not fragments of the compiled prompt. Never put `[Shot N]`, cut timestamps, `integrated_multimodal_description:`, `overall_soundscape:`, `non_diegetic_music:`, or any six-section heading inside composition, subjects, environment, lighting, steps, sounds, notes, or camera target; the deterministic compiler supplies that grammar. Whenever prose cites a supplied source, preserve its canonical angle-bracket token exactly—`<Picture 1>`, `<Video 1>`, `<Audio 1>`, or `<Subject 1>`—and never write a bare `Picture 1`, `Video 1`, `Audio 1`, or `Subject 1`.
 
@@ -305,7 +311,9 @@ Return JSON only with one entry per image in the same order: an object containin
 I2VA_DIRECTOR_POLICY = """FIRST-FRAME LOCK (I2VA and mixed full-reference tasks):
 The supplied first-frame image is the sole authority for everything already visible at 0.00 seconds. Do not infer, restate, embellish, or invent its setting, background, lighting, time of day, weather, visual style, subject appearance, wardrobe, props, composition, or color palette. Describing those details in text can contradict the pixels and cause visual drift.
 
-For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style unless the project contains a separately assigned style reference, in which case that source controls only the rendering treatment while the first frame still controls its anchored visible content and layout. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields."""
+For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style unless the project contains a separately assigned style reference, in which case that source controls only the rendering treatment while the first frame still controls its anchored visible content and layout. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields.
+
+After a cut, if a person from the first frame reappears, "the same girl/person" alone is not an adequate continuity instruction. Bind that person explicitly to <Picture 1> and state that facial identity, body proportions, hair, exact wardrobe design and fit, accessories, and footwear remain unchanged unless the user explicitly requested an appearance or wardrobe change. A location or lighting change never implies a character redesign. Sound descriptions must not invent a garment, footwear, accessory, or material: write a neutral clothing/fabric sound or use only the grounded first-frame item. For example, never turn an anchored dress into a "silk robe" merely to describe rustling."""
 
 
 BASE_KEYFRAME_DIRECTOR_POLICY = """BASE KEYFRAME MODE (I2VA / FL2VA / L2VA):
@@ -486,11 +494,27 @@ def _remove_compiled_camera_prose(value, camera_type=""):
         "Tracking Shot": r"\btracking shot\b",
     }.get(camera_type)
     duplicate = re.compile(phrase, re.IGNORECASE) if phrase else None
-    return " ".join(
-        sentence
-        for sentence in sentences
-        if not motion.search(sentence) and not (duplicate and duplicate.search(sentence))
-    ).strip()
+    retained = []
+    for sentence in sentences:
+        if not motion.search(sentence) and not (duplicate and duplicate.search(sentence)):
+            retained.append(sentence)
+            continue
+        # Preserve a concrete subject action when the model combines it with a
+        # redundant camera clause in one sentence: "She waves while the camera
+        # holds steady." Only the camera clause belongs to the camera field.
+        clauses = re.split(
+            r"\s+(?:while|as|and(?:\s+then)?)\s+|(?<=[,;])\s+",
+            sentence,
+            flags=re.IGNORECASE,
+        )
+        retained.extend(
+            clause.strip().rstrip(" ,;")
+            for clause in clauses
+            if clause.strip()
+            and not motion.search(clause)
+            and not (duplicate and duplicate.search(clause))
+        )
+    return " ".join(retained).strip()
 
 
 def document_fingerprint(value):
@@ -1280,10 +1304,53 @@ def _audible_sound(value):
         sound = _text(value, 2_000)
     visual_state = re.compile(
         r"(?:the\s+)?[^.!?]{1,180}\b(?:remains?|stays?)\s+(?:completely\s+)?(?:still|motionless)\.?|"
-        r"(?:no\s+sound|complete\s+silence|silence|silent)\.?",
+        r"(?:the\s+)?[^.!?]{1,180}\b(?:remains?|stays?)\s+(?:closed|open|unchanged|in\s+the\s+same\s+hand)\.?|"
+        r"(?:no\s+sound|complete\s+silence|silence|silent|inaudible)\.?",
         re.IGNORECASE,
     )
-    return "" if visual_state.fullmatch(sound) else sound
+    if visual_state.fullmatch(sound):
+        return ""
+    clauses = re.split(
+        r"(?<=[.!?])\s+|\s+(?:while|and(?:\s+then)?)\s+|(?<=[,;])\s+",
+        sound,
+        flags=re.IGNORECASE,
+    )
+    nonempty = [clause for clause in clauses if clause.strip()]
+    retained = [
+        clause.strip().rstrip(" ,;.")
+        for clause in nonempty
+        if not re.search(r"\b(?:silence|silent|inaudible|no\s+sound)\b", clause, re.IGNORECASE)
+        and not visual_state.fullmatch(clause.strip())
+    ]
+    # Preserve authored punctuation exactly when no invalid clause was removed.
+    result = sound if len(retained) == len(nonempty) else ". ".join(retained)
+    audible_signal = re.compile(
+        r"\b(?:sound|noise|tone|ambience|room\s+tone|footsteps?|rustl(?:e|es|ing)|creak(?:s|ing)?|"
+        r"click(?:s|ing)?|clack(?:s|ing)?|tap(?:s|ping)?|knock(?:s|ing)?|thud(?:s|ding)?|"
+        r"slam(?:s|ming)?|bang(?:s|ing)?|ring(?:s|ing)?|chime(?:s|ing)?|jingle(?:s|ing)?|"
+        r"clink(?:s|ing)?|scrape(?:s|ing)?|squeak(?:s|ing)?|echo(?:es|ing)?|hum(?:s|ming)?|"
+        r"buzz(?:es|ing)?|hiss(?:es|ing)?|roar(?:s|ing)?|rumbl(?:e|es|ing)|whoosh(?:es|ing)?|"
+        r"splash(?:es|ing)?|patter(?:s|ing)?|crackl(?:e|es|ing)|rattle(?:s|ing)?|"
+        r"breath(?:s|ing)?|inhale(?:s|d|ing)?|exhale(?:s|d|ing)?|gasp(?:s|ing)?|"
+        r"laugh(?:s|ing)?|sob(?:s|bing)?|applause|chatter|music|melody|rhythm)\b",
+        re.IGNORECASE,
+    )
+    return result if audible_signal.search(result) else ""
+
+
+def _audible_only_action(value):
+    text = _text(value, 8_000)
+    if not _audible_sound(text):
+        return False
+    visible_subject_action = re.search(
+        r"\b(?:she|he|they|woman|girl|man|boy|person|character|subject|dog|cat|animal|"
+        r"camera)\b.{0,80}\b(?:walk|run|move|turn|look|smile|wave|reach|open|close|hold|"
+        r"lift|lower|sit|stand|stop|enter|exit|adjust|touch|pick|place|drop|throw|catch|"
+        r"dance|jump|fall|rise|lean|nod|shake|gesture)(?:s|ed|ing)?\b",
+        text,
+        re.IGNORECASE,
+    )
+    return not visible_subject_action
 
 
 def _guide_reference_label(value, *, allow_subject=True):
@@ -1588,6 +1655,18 @@ def _shot_fields(value, allow_start=False):
         lifted_sounds = []
         for index, item in enumerate(value["steps"]):
             step_type = _text(item.get("type"), 40).casefold() if isinstance(item, dict) else ""
+            if step_type == "action":
+                action_text = next((
+                    candidate
+                    for name in (
+                        "text", "description", "action", "content", "value", "details",
+                        "motion", "movement", "event", "beat", "instruction",
+                    )
+                    if (candidate := _text(item.get(name), 8_000))
+                ), "")
+                if action_text and _audible_only_action(action_text):
+                    lifted_sounds.append(_audible_sound(action_text))
+                    continue
             if step_type != "sound":
                 chronological_steps.append(item)
                 continue
@@ -1889,10 +1968,17 @@ def _sanitize_proposal_tokens(proposal, allowed_tokens, *, allow_reference_seman
                 sanitized_steps.append(step)
         if "steps" in container:
             if not sanitized_steps:
-                raise ValueError(
-                    "Token sanitization removed every action/dialogue step; rewrite the shot with concrete prose"
-                )
-            container["steps"] = sanitized_steps
+                if isinstance(container.get("camera"), dict) and container["camera"].get("type"):
+                    # Every proposed step merely duplicated the structured camera
+                    # field. Omitting the sequence update preserves existing steps
+                    # and still applies the valid camera change.
+                    container.pop("steps", None)
+                else:
+                    raise ValueError(
+                        "Token sanitization removed every action/dialogue step; rewrite the shot with concrete prose"
+                    )
+            else:
+                container["steps"] = sanitized_steps
     return proposal
 
 
@@ -3358,9 +3444,17 @@ def _proposal_temperature(value):
     return max(0.0, min(PROPOSAL_TEMPERATURE_CAP, configured))
 
 
-def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
+def _proposal_retry_messages(messages, scope, raw="", proposal_error="", draft_proposal=None):
     scope_name = "project" if scope == "project" else "selected shot"
-    assistant_content = _text(raw) or "I answered without a machine-applicable structured proposal."
+    if isinstance(draft_proposal, dict):
+        serialized_draft = json.dumps(draft_proposal, ensure_ascii=False, separators=(",", ":"))
+        assistant_content = _text(
+            "Invalid structured draft to repair and replace (do not merely explain it): "
+            + serialized_draft,
+            16_000,
+        )
+    else:
+        assistant_content = _text(raw) or "I answered without a machine-applicable structured proposal."
     validation_feedback = (
         f" The previous proposal failed deterministic validation: {_text(proposal_error, 1_000)}."
         if proposal_error
@@ -3429,6 +3523,53 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
         if "detailed_description" in proposal_error.casefold()
         else ""
     )
+    sound_feedback = (
+        " Every sounds item must contain only an audible event from a source already established by the request, "
+        "reference, or visible shot. Remove silence, visual-state continuity, and invented stock foley from sounds; "
+        "keep closed/open, hand, wardrobe, pose, and other visible states in subjects or action steps. "
+        "overall_soundscape may summarize only the corrected shot sounds and established ambience."
+        if any(term in proposal_error.casefold() for term in (
+            "non-audible state", "ungrounded audible", "overall_soundscape invents",
+        ))
+        else (
+            " Add at least one genuinely audible, synchronized consequence to every shot named by the error. "
+            "Derive it from that shot's established visible action or environment and keep the same source noun: "
+            "shutters scrape, paper rustles, footsteps land, fabric moves, or rain taps only when that exact source "
+            "already exists. Do not add a new prop merely to make sound."
+            if "omitted requested synchronized sounds" in proposal_error.casefold()
+            else ""
+        )
+    )
+    placeholder_feedback = (
+        " Replace every named placeholder with concrete production prose. A composition must state framing plus "
+        "the visible subject's placement or visual purpose (not merely 'medium-wide composition'); an action step "
+        "must state who visibly does what (not 'action'); environment, lighting, and camera target must name their "
+        "actual scene elements and subject."
+        if "placeholder production fields" in proposal_error.casefold()
+        else ""
+    )
+    continuity_feedback = (
+        " Repeat the exact requested screen direction in the concrete subjects or action step of every affected "
+        "shot named by the error, including the motion leading into a stop and the motion after a cut. Do not leave "
+        "direction only in the summary."
+        if "screen-left to screen-right continuity" in proposal_error.casefold()
+        else (
+            " Repeat the requested hand, prop, or object-state continuity explicitly in every affected shot named "
+            "by the error; do not rely on 'same' or a project summary."
+            if any(term in proposal_error.casefold() for term in (
+                "right-hand continuity", "consistent fill level", "object-state continuity",
+            ))
+            else ""
+        )
+    )
+    literal_feedback = (
+        " Copy every missing quoted spoken string byte-for-byte into a dialogue step's text, and every missing "
+        "quoted sign/caption/on-screen string byte-for-byte into the affected shot's visible_text array. Do not "
+        "add punctuation, translation, markup, or paraphrasing."
+        if "missing exact text" in proposal_error.casefold()
+        or "missing exact visible text" in proposal_error.casefold()
+        else ""
+    )
     return [
         *messages,
         {
@@ -3441,7 +3582,8 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error=""):
                 f"Correct the response now for the {scope_name}. The request explicitly requires document changes."
                 f"{validation_feedback}{timing_feedback}{reference_feedback}{selector_feedback}"
                 f"{relationship_feedback}{i2va_feedback}{steps_feedback}{completeness_feedback}{speaker_feedback}"
-                f"{structured_fields_feedback} "
+                f"{structured_fields_feedback}{sound_feedback}{placeholder_feedback}{continuity_feedback}"
+                f"{literal_feedback} "
                 f"Return a brief answer followed by exactly one valid JSON change set between {CHANGESET_BEGIN} "
                 f"and {CHANGESET_END}. Return a replacement for the invalid proposal and follow the allowed "
                 "operation and protected-field contract from the system message."
@@ -3489,6 +3631,22 @@ def _i2va_scene_change_requested(data):
         r"(?:setting|environment|location|scene|background|lighting|illumination|"
         r"time\s+of\s+day|weather|interior|exterior|indoors|outdoors)"
     )
+    # Users normally name the actual destination instead of saying "change the
+    # environment". Treat an explicitly requested concrete place as scene intent;
+    # otherwise a valid instruction such as "the next shot is in her bedroom"
+    # is falsely rejected as first-frame drift.
+    concrete_place = (
+        r"(?:bedroom|bathroom|kitchen|living\s+room|dining\s+room|hotel\s+room|locker\s+room|"
+        r"room|apartment|house|home|mansion|hotel|office|classroom|school|university|"
+        r"hallway|corridor|stairwell|lobby|ballroom|studio|stage|theater|cinema|auditorium|"
+        r"arena|stadium|gym|warehouse|workshop|factory|laboratory|lab|library|museum|gallery|"
+        r"hospital|courtroom|church|temple|prison|jail|cell|restaurant|caf[eé]|bar|club|"
+        r"store|shop|supermarket|mall|market|bank|salon|elevator|garage|parking\s+lot|"
+        r"street|road|alley|sidewalk|intersection|square|plaza|park|garden|forest|woods|"
+        r"field|meadow|farm|barn|desert|mountain|cave|tunnel|bridge|beach|shore|rooftop|"
+        r"balcony|terrace|pool|dock|harbor|cabin|cottage|airport|station|platform|subway|"
+        r"train|bus|car|vehicle|boat|ship)"
+    )
     change = (
         r"(?:change|replace|alter|switch|transition|transform|shift|move|relocate|make|set|"
         r"walk|run|step|go|travel|enter|leave|exit|arrive)"
@@ -3498,6 +3656,19 @@ def _i2va_scene_change_requested(data):
         or re.search(rf"\b{visual_target}\b.{{0,100}}\b{change}\b", content, re.IGNORECASE)
         or re.search(
             rf"\b(?:new|different|another)\s+{visual_target}\b",
+            content,
+            re.IGNORECASE,
+        )
+        or re.search(
+            rf"\b(?:in|inside|into|at|to|within)\s+(?:a|an|the|her|his|their|our|my)?\s*"
+            rf"(?:[a-z][\w'-]*\s+){{0,4}}"
+            rf"{concrete_place}\b",
+            content,
+            re.IGNORECASE,
+        )
+        or re.search(
+            rf"\b(?:next|later|second|third|final|last|another|new|shot\s+\d+)\b"
+            rf".{{0,100}}\b{concrete_place}\b",
             content,
             re.IGNORECASE,
         )
@@ -3780,7 +3951,7 @@ def _validate_requested_project_result(result_document, data):
             raise ValueError(
                 f"The user requested {requested_count} resulting shots, but the proposal produced {actual_count}"
             )
-    if not re.search(r"\b(complete|entire|full)\b", content, re.IGNORECASE):
+    if not re.search(r"\b(?:complete(?:ly)?|entire|full)\b", content, re.IGNORECASE):
         return
     required_fields = () if _has_first_frame_anchor(result_document) else (
         "composition", "subjects", "environment", "lighting"
@@ -3836,6 +4007,32 @@ def _validate_requested_project_result(result_document, data):
                 "The complete project proposal omitted requested right-hand continuity for: "
                 + ", ".join(missing_hand)
             )
+    requested_screen_direction = re.search(
+        r"\bscreen[- ](left|right)\s+to\s+screen[- ](left|right)\b",
+        content,
+        re.IGNORECASE,
+    )
+    preserve_direction = re.search(
+        r"\b(?:preserve|keep|maintain|without\s+reversing)\b.{0,100}\b(?:screen\s+)?direction\b|"
+        r"\bscreen\s+direction\b.{0,100}\b(?:throughout|across|consistent|same)\b",
+        content,
+        re.IGNORECASE,
+    )
+    if requested_screen_direction and preserve_direction:
+        expected = (
+            f"screen-{requested_screen_direction.group(1).casefold()} to "
+            f"screen-{requested_screen_direction.group(2).casefold()}"
+        )
+        missing_direction = [
+            result_document["shots"][index]["id"]
+            for index, shot_text in enumerate(continuity_text)
+            if expected not in re.sub(r"\s+", " ", shot_text.casefold())
+        ]
+        if missing_direction:
+            raise ValueError(
+                f"The proposal omitted requested {expected} continuity from: "
+                + ", ".join(missing_direction)
+            )
     requested_cuts = [
         float(value)
         for value in re.findall(
@@ -3849,6 +4046,26 @@ def _validate_requested_project_result(result_document, data):
     if missing_cuts:
         formatted = ", ".join(f"{value:g}s" for value in missing_cuts)
         raise ValueError(f"The complete project proposal omitted explicitly requested cut time(s): {formatted}")
+    requested_start_lists = re.findall(
+        r"\bshots?\s+(?:starting\s+)?at\s+"
+        r"((?:\d+(?:\.\d+)?\s*(?:,\s*(?:and\s+)?|\band\s+|&\s*))+\d+(?:\.\d+)?)\s*seconds?\b",
+        content,
+        re.IGNORECASE,
+    )
+    if requested_start_lists:
+        requested_starts = [
+            float(value)
+            for value in re.findall(r"\d+(?:\.\d+)?", requested_start_lists[-1])
+        ]
+        actual_starts = [float(shot["start"]) for shot in result_document["shots"]]
+        if len(requested_starts) == len(actual_starts) and any(
+            abs(expected - actual) >= 0.0005
+            for expected, actual in zip(requested_starts, actual_starts)
+        ):
+            formatted = ", ".join(f"{value:g}s" for value in requested_starts)
+            raise ValueError(
+                "The proposal did not preserve the explicitly requested shot start times: " + formatted
+            )
 
 
 def _validate_speaker_id_prose(result_document):
@@ -3995,14 +4212,48 @@ def _validate_requested_reference_coverage(result_document, data):
             )
 
 
+def _enforce_requested_reference_coverage(document, proposal, data):
+    if not _requests_all_reference_shots(data):
+        return proposal
+    proposal = copy.deepcopy(proposal)
+    result_document = preview_changeset(document, proposal)["document"]
+    shot_tags = [f"[Shot {index + 1}]" for index in range(len(result_document.get("shots") or []))]
+    all_shots = "appears in " + ", ".join(shot_tags)
+    visual_sources = {
+        _text(reference.get("label"), 80).casefold()
+        for reference in result_document.get("references") or []
+        if reference.get("kind") in {"image", "video"}
+    }
+    definitions = {
+        _text(item.get("label"), 80).strip("<>").casefold(): _text(item.get("text"), 8_000).casefold()
+        for item in result_document.get("subject_definitions") or []
+    }
+    retention = copy.deepcopy(result_document.get("retention_analysis") or [])
+    for item in retention:
+        definition = definitions.get(_text(item.get("label"), 80).strip("<>").casefold(), "")
+        if any(source and source in definition for source in visual_sources):
+            item["where"] = all_shots
+    update = next((
+        operation for operation in reversed(proposal.get("operations") or [])
+        if operation.get("op") == "update_project"
+    ), None)
+    if update is None:
+        proposal.setdefault("operations", []).append({
+            "op": "update_project", "fields": {"retention_analysis": retention},
+        })
+    else:
+        update.setdefault("fields", {})["retention_analysis"] = retention
+    return proposal
+
+
 def _validate_reference_prompt_length(result_document, data):
     if result_document.get("resolved_mode") != "ref2va":
         return
-    if not re.search(r"\b(?:complete|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
+    if not re.search(r"\b(?:complete(?:ly)?|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
         return
     word_count = len(compile_prompt(result_document).split())
     reference_count = len(result_document.get("references") or [])
-    maximum_words = 650 + 50 * max(0, reference_count - 3)
+    maximum_words = 650 + 100 * max(0, reference_count - 3)
     if word_count > maximum_words:
         raise ValueError(
             f"The full-reference prompt is {word_count} words; condense it below {maximum_words} words, "
@@ -4011,7 +4262,126 @@ def _validate_reference_prompt_length(result_document, data):
         )
 
 
-def _validate_sound_entries(result_document):
+SOUND_SOURCE_GROUPS = {
+    "curtains": r"\b(?:curtains?|drapes?)\b",
+    "wind": r"\b(?:wind|breeze|gusts?)\b",
+    "doors": r"\b(?:doors?|doorways?|(?:un)?latch(?:es|ed|ing)?|hinges?|(?:un)?locks?)\b",
+    "keys": r"\b(?:keys?|keyrings?)\b",
+    "jewelry": r"\b(?:bracelets?|bangles?|necklaces?|earrings?|watches?|chains?|pendants?|cufflinks?|jewelry)\b",
+    "footwear": r"\b(?:heels?|shoes?|boots?|sandals?|sneakers?)\b",
+    "vehicles": r"\b(?:cars?|vehicles?|trains?|buses?|trucks?|motorcycles?|engines?|horns?)\b",
+    "machinery": r"\b(?:machines?|machinery|motors?|fans?|generators?|conveyors?|gears?)\b",
+    "clocks": r"\b(?:clocks?|watches?|alarms?|ticks?|ticking)\b",
+    "weather": r"\b(?:rain|rainfall|raindrops?|thunder|lightning|snow|hail)\b",
+    "animals": r"\b(?:dogs?|cats?|birds?|insects?|crickets?|animals?|barks?|chirps?|tweets?)\b",
+    "crowds": r"\b(?:crowds?|traffic|pedestrians?|bystanders?|chatter|applause)\b",
+    "phones": r"\b(?:phones?|telephones?|ringtones?|notifications?)\b",
+    "glass": r"\b(?:glass|glasses|windows?|bottles?|goblets?)\b",
+    "paper": r"\b(?:paper|pages?|letters?|envelopes?|newspapers?|notes?|messages?|handwriting)\b",
+    "water": r"\b(?:water|waves?|ocean|sea|river|stream|faucets?|showers?)\b",
+    "fire": r"\b(?:fire|flames?|fireplace|embers?|woodstove|crackles?|crackling)\b",
+    "weapons": r"\b(?:guns?|pistols?|rifles?|weapons?|swords?|knives?|blades?)\b",
+}
+
+
+def _sound_grounding_text(result_document, data, *, include_sounds):
+    values = [_latest_user_content(data), _text(data.get("brief"), 4_000)]
+    for reference in result_document.get("references") or []:
+        values.append(_text(reference.get("observed_visual_facts"), VISION_GROUNDING_MAX_CHARS))
+        values.append(_text(reference.get("prompt"), 2_000))
+        for candidate in reference.get("subject_candidates") or []:
+            values.extend((candidate.get("grounded_attributes") or {}).values())
+    for shot in result_document.get("shots") or []:
+        values.extend(
+            shot.get(name) for name in ("composition", "subjects", "environment", "lighting", "notes")
+        )
+        values.append((shot.get("camera") or {}).get("target"))
+        values.extend(
+            step.get("text") for step in shot.get("steps") or [] if isinstance(step, dict)
+        )
+        if include_sounds:
+            values.extend(shot.get("sounds") or [])
+    return "\n".join(_text(value, 8_000) for value in values if _text(value, 8_000))
+
+
+def _novel_sound_sources(value, grounded_text):
+    return [
+        name for name, pattern in SOUND_SOURCE_GROUPS.items()
+        if re.search(pattern, _text(value), re.IGNORECASE)
+        and not re.search(pattern, grounded_text, re.IGNORECASE)
+    ]
+
+
+def _canonicalize_sound_source_aliases(value, grounded_text):
+    sound = _text(value, 8_000)
+    has_shutters = re.search(r"\bshutters?\b", grounded_text, re.IGNORECASE)
+    has_door = re.search(SOUND_SOURCE_GROUPS["doors"], grounded_text, re.IGNORECASE)
+    door_foley = re.search(
+        r"\b(?:doors?|doorways?|latches?|hinges?)\b.{0,60}"
+        r"\b(?:creak(?:s|ing)?|scrape(?:s|ing)?|rattle(?:s|ing)?)\b|"
+        r"\b(?:creak(?:s|ing)?|scrape(?:s|ing)?|rattle(?:s|ing)?)\b.{0,60}"
+        r"\b(?:doors?|doorways?|latches?|hinges?)\b",
+        sound,
+        re.IGNORECASE,
+    )
+    if has_shutters and not has_door and door_foley:
+        sound = re.sub(
+            r"\b(?:doors?|doorways?|latches?|hinges?)\b",
+            "shutters",
+            sound,
+            flags=re.IGNORECASE,
+        )
+    return sound
+
+
+def _restrict_ungrounded_audio_proposal(document, proposal, data):
+    """Drop stock foley/ambience that is unsupported by the proposed visuals."""
+    proposal = copy.deepcopy(proposal)
+    preview = preview_changeset(document, proposal)
+    result_document = preview["document"]
+    grounded_without_sounds = _sound_grounding_text(
+        result_document, data, include_sounds=False
+    )
+    for operation in proposal.get("operations") or []:
+        operation_type = operation.get("op")
+        container = operation.get("fields") if operation_type in {"update_project", "update_shot"} else operation.get("shot")
+        if not isinstance(container, dict):
+            continue
+        if operation_type in {"update_shot", "add_shot"} and "sounds" in container:
+            repaired_sounds = [
+                _canonicalize_sound_source_aliases(sound, grounded_without_sounds)
+                for sound in container.get("sounds") or []
+            ]
+            container["sounds"] = [
+                sound for sound in repaired_sounds
+                if sound and not _novel_sound_sources(sound, grounded_without_sounds)
+            ]
+    cleaned_document = preview_changeset(document, proposal)["document"]
+    grounded_with_kept_sounds = _sound_grounding_text(
+        cleaned_document, data, include_sounds=True
+    )
+    for operation in proposal.get("operations") or []:
+        operation_type = operation.get("op")
+        container = operation.get("fields") if operation_type == "update_project" else None
+        if not isinstance(container, dict):
+            continue
+        if operation_type == "update_project" and "overall_soundscape" in container:
+            sentences = re.split(
+                r"(?<=[.!?])\s+",
+                _text(container.get("overall_soundscape"), 8_000),
+            )
+            container["overall_soundscape"] = " ".join(
+                repaired for sentence in sentences
+                if (repaired := _canonicalize_sound_source_aliases(
+                    sentence, grounded_with_kept_sounds
+                ))
+                and not _novel_sound_sources(repaired, grounded_with_kept_sounds)
+            ).strip()
+    return proposal
+
+
+def _validate_sound_entries(result_document, data):
+    grounded_without_sounds = _sound_grounding_text(result_document, data, include_sounds=False)
     for shot in result_document.get("shots") or []:
         for sound in shot.get("sounds") or []:
             if re.search(r"\b(?:silence|silent|inaudible)\b", _text(sound), re.IGNORECASE):
@@ -4019,6 +4389,22 @@ def _validate_sound_entries(result_document):
                     f"{shot.get('id') or 'A shot'} contains a non-audible state in sounds; "
                     "sounds entries must describe only audible events and their synchronization"
                 )
+            novel = _novel_sound_sources(sound, grounded_without_sounds)
+            if novel:
+                raise ValueError(
+                    f"{shot.get('id') or 'A shot'} invents ungrounded audible/visible sources in sounds "
+                    f"({', '.join(novel)}). Use only sources established by the request, references, or "
+                    "visible shot action and fields"
+                )
+    grounded_with_sounds = _sound_grounding_text(result_document, data, include_sounds=True)
+    novel_soundscape = _novel_sound_sources(
+        result_document.get("overall_soundscape"), grounded_with_sounds
+    )
+    if novel_soundscape:
+        raise ValueError(
+            "overall_soundscape invents sources not established by any shot or requested audio "
+            f"({', '.join(novel_soundscape)}); summarize only existing shot sounds and ambience"
+        )
 
 
 def _validate_requested_dialogue_mechanics(result_document, data):
@@ -4046,10 +4432,31 @@ def _validate_requested_dialogue_mechanics(result_document, data):
             )
 
 
+def _validate_requested_camera_mechanics(result_document, data):
+    content = _latest_user_content(data)
+    around_subject = re.search(
+        r"\b(?:camera|shot)\b.{0,60}\b(?:pan(?:s|ning)?|move(?:s|ing)?|circle(?:s|ing)?|"
+        r"orbit(?:s|ing)?|arc(?:s|ing)?)\b.{0,35}\baround\b|"
+        r"\b(?:circle(?:s|ing)?|orbit(?:s|ing)?)\b.{0,35}\b(?:her|him|them|subject|person|object)\b",
+        content,
+        re.IGNORECASE,
+    )
+    camera_types = [
+        _text((shot.get("camera") or {}).get("type"), 80)
+        for shot in result_document.get("shots") or []
+    ]
+    if around_subject and "Arc Shot" not in camera_types:
+        raise ValueError(
+            "The user requests an around-the-subject/orbiting camera move; use Arc Shot, not Pan Left/Right "
+            "or a static-position rotation"
+        )
+
+
 def _validate_requested_exact_literals(result_document, data):
     content = _latest_user_content(data)
     requested_dialogue = re.findall(
-        r"\b(?:says?|saying)\s+(?:exactly\s+)?[\"“](.*?)[\"”]",
+        r"\b(?:says?|saying|asks?|asking|whispers?|whispering|shouts?|shouting|"
+        r"sings?|singing)\s+(?:exactly\s+)?[\"\u201c](.*?)[\"\u201d]",
         content,
         re.IGNORECASE,
     )
@@ -4071,13 +4478,97 @@ def _validate_requested_exact_literals(result_document, data):
                 "Dialogue-step text must contain only spoken words; remove language tags and MiniMax markup "
                 "and use crosses_cut/cutoff/voiceover flags instead"
             )
+    requested_visible = re.findall(
+        r"\b(?:sign|visible\s+text|on[- ]screen\s+text|caption|label|display)\b"
+        r".{0,40}\b(?:visibly\s+)?(?:reads?|displays?|shows?|is)\s+"
+        r"[\"\u201c](.*?)[\"\u201d]",
+        content,
+        re.IGNORECASE,
+    )
+    visible_text = [
+        str(value)
+        for shot in result_document.get("shots") or []
+        for value in shot.get("visible_text") or []
+    ]
+    missing_visible = [value for value in requested_visible if value not in visible_text]
+    if missing_visible:
+        raise ValueError(
+            "Preserve each requested visible-text string verbatim in visible_text; missing exact visible text: "
+            + ", ".join(repr(value) for value in missing_visible)
+        )
+
+
+def _canonicalize_requested_dialogue_literals(proposal, data):
+    content = _latest_user_content(data)
+    requested = re.findall(
+        r"\b(?:says?|saying|asks?|asking|whispers?|whispering|shouts?|shouting|"
+        r"sings?|singing)\s+(?:exactly\s+)?[\"\u201c](.*?)[\"\u201d]",
+        content,
+        re.IGNORECASE,
+    )
+    requested_visible = re.findall(
+        r"\b(?:sign|visible\s+text|on[- ]screen\s+text|caption|label|display)\b"
+        r".{0,40}\b(?:visibly\s+)?(?:reads?|displays?|shows?|is)\s+"
+        r"[\"\u201c](.*?)[\"\u201d]",
+        content,
+        re.IGNORECASE,
+    )
+    if not requested and not requested_visible:
+        return proposal
+    proposal = copy.deepcopy(proposal)
+
+    def normalized(value):
+        return re.sub(r"[^\w]+", "", str(value or ""), flags=re.UNICODE).casefold()
+
+    dialogue_steps = []
+    for operation in proposal.get("operations") or []:
+        container = operation.get("fields") if operation.get("op") == "update_shot" else operation.get("shot")
+        if not isinstance(container, dict):
+            continue
+        dialogue_steps.extend(
+            step for step in container.get("steps") or []
+            if isinstance(step, dict) and _text(step.get("type"), 40).casefold() == "dialogue"
+        )
+    used = set()
+    existing = {_text(step.get("text"), 8_000) for step in dialogue_steps}
+    for exact in requested:
+        if exact in existing:
+            continue
+        matches = [
+            (index, step) for index, step in enumerate(dialogue_steps)
+            if index not in used and normalized(step.get("text")) == normalized(exact)
+        ]
+        if len(matches) == 1:
+            index, step = matches[0]
+            step["text"] = exact
+            used.add(index)
+    visible_items = []
+    for operation in proposal.get("operations") or []:
+        container = operation.get("fields") if operation.get("op") == "update_shot" else operation.get("shot")
+        if not isinstance(container, dict) or not isinstance(container.get("visible_text"), list):
+            continue
+        visible_items.extend((container["visible_text"], index) for index in range(len(container["visible_text"])))
+    for exact in requested_visible:
+        if any(_text(values[index], 8_000) == exact for values, index in visible_items):
+            continue
+        matches = [
+            (values, index) for values, index in visible_items
+            if normalized(values[index]) == normalized(exact)
+        ]
+        if len(matches) == 1:
+            values, index = matches[0]
+            values[index] = exact
+    return proposal
 
 
 def _validate_complete_project_placeholders(result_document, data):
-    if not re.search(r"\b(?:complete|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
+    if not re.search(r"\b(?:complete(?:ly)?|entire|full)\b", _latest_user_content(data), re.IGNORECASE):
         return
     generic = {
-        "composition": re.compile(r"^(?:the\s+)?composition\.?$", re.IGNORECASE),
+        "composition": re.compile(
+            r"^(?:(?:the\s+)?composition|(?:a\s+)?(?:medium[- ]wide|medium|wide|close[- ]up)\s+composition)\.?$",
+            re.IGNORECASE,
+        ),
         "subjects": re.compile(r"^(?:the\s+)?(?:primary\s+)?subject\.?$", re.IGNORECASE),
         "environment": re.compile(r"^(?:the\s+)?environment\.?$", re.IGNORECASE),
         "lighting": re.compile(r"^(?:the\s+)?lighting\.?$", re.IGNORECASE),
@@ -4102,6 +4593,13 @@ def _validate_complete_project_placeholders(result_document, data):
             re.IGNORECASE,
         ):
             failures.append(f"{shot.get('id')} camera target")
+        for step_index, step in enumerate(shot.get("steps") or [], 1):
+            if step.get("type") == "action" and re.fullmatch(
+                r"(?:action|a\s+concrete\s+visible\s+action|the\s+(?:subject|character)\s+acts?)\.?",
+                _text(step.get("text"), 8_000),
+                re.IGNORECASE,
+            ):
+                failures.append(f"{shot.get('id')} action step {step_index}")
     if failures:
         raise ValueError(
             "The complete project still contains placeholder production fields: " + ", ".join(failures)
@@ -4349,8 +4847,17 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             parsed["proposal"] = _canonicalize_requested_dialogue_speakers(
                 parsed["proposal"], document, request_data
             )
+            parsed["proposal"] = _canonicalize_requested_dialogue_literals(
+                parsed["proposal"], request_data
+            )
             parsed["proposal"] = _canonicalize_placeholder_camera_targets(
                 document, parsed["proposal"]
+            )
+            parsed["proposal"] = _restrict_ungrounded_audio_proposal(
+                document, parsed["proposal"], request_data
+            )
+            parsed["proposal"] = _enforce_requested_reference_coverage(
+                document, parsed["proposal"], request_data
             )
             _validate_private_subject_selectors(
                 document, None, request_data, proposal=parsed["proposal"]
@@ -4368,8 +4875,9 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             _validate_structured_shot_grammar(preview["document"])
             _validate_requested_reference_coverage(preview["document"], request_data)
             _validate_reference_prompt_length(preview["document"], request_data)
-            _validate_sound_entries(preview["document"])
+            _validate_sound_entries(preview["document"], request_data)
             _validate_requested_dialogue_mechanics(preview["document"], request_data)
+            _validate_requested_camera_mechanics(preview["document"], request_data)
             _validate_requested_exact_literals(preview["document"], request_data)
             _validate_complete_project_placeholders(preview["document"], request_data)
             _validate_selected_shot_quality(preview["document"], request_data)
@@ -4434,6 +4942,17 @@ def _report_director_progress(progress_callback, progress):
         pass
 
 
+def _generate_with_context_fallback(request_data, messages, images):
+    """Keep a reasoning-heavy local model from losing the entire proposal."""
+    try:
+        return generate_chat(request_data, messages, images)
+    except RuntimeError as exc:
+        mode = _text(request_data.get("thinking_mode"), 20).casefold()
+        if "exhausted the available-context" not in str(exc).casefold() or mode not in {"high", "medium"}:
+            raise
+        return generate_chat({**request_data, "thinking_mode": "Low"}, messages, images)
+
+
 def director_chat(data, progress_callback=None):
     attachments, vision_images = load_vision_images(data.get("attachments"))
     request_data = {**data, "attachments": attachments}
@@ -4478,7 +4997,7 @@ def director_chat(data, progress_callback=None):
         "phase": "director_generation",
         "grounded_images": len(vision_observations),
     })
-    raw = generate_chat(generation_request_data, messages, [])
+    raw = _generate_with_context_fallback(generation_request_data, messages, [])
     parsed = parse_director_response(
         raw,
         _text(data.get("selected_shot_id"), 80),
@@ -4504,6 +5023,11 @@ def director_chat(data, progress_callback=None):
             **generation_request_data,
             "max_response_tokens": retry_response_tokens,
             "temperature": PROPOSAL_CORRECTION_TEMPERATURE,
+            "thinking_mode": (
+                "Low"
+                if _text(request_data.get("thinking_mode"), 20).casefold() in {"high", "medium"}
+                else request_data.get("thinking_mode")
+            ),
         }
         for _attempt in range(PROPOSAL_CORRECTION_ATTEMPTS):
             if parsed["proposal"] is not None:
@@ -4513,12 +5037,13 @@ def director_chat(data, progress_callback=None):
                 "attempt": _attempt + 1,
                 "maximum_attempts": PROPOSAL_CORRECTION_ATTEMPTS,
             })
-            raw = generate_chat(
+            raw = _generate_with_context_fallback(
                 retry_request_data,
                 _proposal_retry_messages(
                     messages,
                     scope,
                     proposal_error=parsed["proposal_error"] or last_proposal_error,
+                    draft_proposal=parsed.get("pending_proposal"),
                 ),
                 [],
             )

@@ -2734,6 +2734,17 @@ function touchGeneration(promptId) {
   if (id) state.generationActivity.set(id, Date.now());
 }
 
+function markGenerationExecuting(promptId) {
+  const id = String(promptId || "");
+  const record = generationByPromptId(id);
+  if (!record) return false;
+  touchGeneration(id);
+  if (record.generation.status === "queued") {
+    updateGeneration(id, { status: "generating" });
+  }
+  return true;
+}
+
 function failGeneration(promptId, message) {
   const id = String(promptId || "");
   const record = generationByPromptId(id);
@@ -5140,15 +5151,12 @@ function setupProgressEvents() {
   const promptId = event => String(event?.detail?.prompt_id || event?.detail?.promptId || "");
   api.addEventListener("execution_start", event => {
     const id = promptId(event);
-    if (!generationByPromptId(id)) return;
-    touchGeneration(id);
-    updateGeneration(id, { status: "generating" });
+    if (!markGenerationExecuting(id)) return;
     state.generationProgress.set(id, { phase: "generating" });
   });
   api.addEventListener("progress", event => {
     const id = promptId(event);
-    if (!generationByPromptId(id)) return;
-    touchGeneration(id);
+    if (!markGenerationExecuting(id)) return;
     state.generationProgress.set(id, {
       phase: "generating",
       value: Number(event.detail?.value),
@@ -5164,11 +5172,11 @@ function setupProgressEvents() {
   }
   api.addEventListener("executing", event => {
     const id = promptId(event);
-    if (generationByPromptId(id)) touchGeneration(id);
+    markGenerationExecuting(id);
   });
   api.addEventListener("progress_state", event => {
     const id = promptId(event);
-    if (generationByPromptId(id)) touchGeneration(id);
+    markGenerationExecuting(id);
   });
   api.addEventListener("reconnecting", () => setApiConnected(false));
   api.addEventListener("reconnected", () => setApiConnected(true));

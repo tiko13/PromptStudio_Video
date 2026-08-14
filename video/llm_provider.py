@@ -15,6 +15,7 @@ DEFAULT_KOBOLD_URL = "http://localhost:5001"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
 AUTO_RESPONSE_FALLBACK_TOKENS = 4_096
+AUTO_RESPONSE_CONTEXT_CAP_TOKENS = 12_288
 MAX_RESPONSE_TOKENS = 131_072
 DEFAULT_REQUEST_TIMEOUT = 600
 MAX_REQUEST_TIMEOUT = 3_600
@@ -287,7 +288,11 @@ def _kobold_chat(data, messages, images):
                     f"The Director request uses {prompt_tokens} tokens and leaves too little room in "
                     f"KoboldCpp's {context_length}-token context. Reduce the Director context budget."
                 )
-            max_tokens = available if automatic_tokens else min(requested_tokens, available)
+            max_tokens = (
+                min(available, AUTO_RESPONSE_CONTEXT_CAP_TOKENS)
+                if automatic_tokens
+                else min(requested_tokens, available)
+            )
     payload = {
         "model": "koboldcpp",
         "messages": messages,

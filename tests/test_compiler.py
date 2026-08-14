@@ -47,6 +47,57 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("\noverall_soundscape:", prompt)
         self.assertIn("\nnon_diegetic_music:", prompt)
 
+    def test_every_camera_type_compiles_to_distinct_physical_motion(self):
+        expected = {
+            "Zoom In": "camera zooms in", "Zoom Out": "camera zooms out",
+            "Push In": "camera pushes in", "Pull Out": "camera pulls out",
+            "Pan Left": "camera pans left", "Pan Right": "camera pans right",
+            "Truck Left": "camera trucks left", "Truck Right": "camera trucks right",
+            "Tilt Up": "camera tilts up", "Tilt Down": "camera tilts down",
+            "Pedestal Up": "moves upward on a pedestal",
+            "Pedestal Down": "moves downward on a pedestal",
+            "Arc Shot": "moves in an arc around the subject",
+            "Tracking Shot": "follows the moving subject in a tracking shot",
+            "Static Shot": "holds a static shot", "POV": "adopts a POV perspective",
+            "Shake Slightly": "shakes slightly", "Shake Strongly": "shakes strongly",
+            "Roll Clockwise": "rolls clockwise around the lens axis",
+            "Roll Counterclockwise": "rolls counterclockwise around the lens axis",
+        }
+        for camera_type, phrase in expected.items():
+            with self.subTest(camera_type=camera_type):
+                value = base_document()
+                value["shots"][0]["camera"] = {
+                    "type": camera_type, "amplitude": "small", "speed": "slow",
+                    "target": "the baker",
+                }
+                prompt = compile_prompt(value)
+                self.assertIn(phrase, prompt)
+                self.assertIn("toward the baker", prompt)
+
+    def test_common_transitions_compile_at_exact_cut_time(self):
+        transitions = {
+            "the camera cuts to": "the camera cuts to",
+            "the shot cross-dissolves to": "the shot cross-dissolves to",
+            "the shot fades to": "the shot fades to",
+            "the shot wipes to": "the shot wipes to",
+            "the shot transitions to": "the shot transitions to",
+            "the shot changes to": "the shot changes to",
+            "the shot switches to": "the shot switches to",
+        }
+        for transition, phrase in transitions.items():
+            with self.subTest(transition=transition):
+                value = base_document(duration_seconds=8)
+                value["shots"].append({
+                    "id": "shot-2", "start": 3.25, "transition": transition,
+                    "composition": "A close-up frames the letter.",
+                    "subjects": "The baker holds the letter.",
+                    "environment": "The bakery counter remains behind it.",
+                    "lighting": "Warm counter light.",
+                    "steps": [{"type": "action", "text": "The letter opens."}],
+                })
+                prompt = compile_prompt(value)
+                self.assertIn(f"At 00:03.250, {phrase}", prompt)
+
     def test_base_modes_reject_reference_tokens_without_ref2va_sources(self):
         value = base_document()
         value["shots"][0]["composition"] = "<Subject 1> opens the shutters."
@@ -156,6 +207,78 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("established by <Picture 1> remain fully preserved", prompt)
         self.assertIn("The subject raises one hand.", prompt)
         self.assertIn("The camera pushes in", prompt)
+
+    def test_i2va_reanchors_same_person_and_exact_wardrobe_after_cut(self):
+        value = base_document(references=[{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+            "subject_candidates": [{
+                "name": "young woman", "location": "center",
+                "grounded_attributes": {
+                    "hair": "long, straight, brown",
+                    "face": "fair skin",
+                    "clothing": "red mini dress",
+                    "footwear": "barefoot",
+                },
+            }],
+        }])
+        value["shots"].append({
+            "id": "shot-2", "start": 2.5, "transition": "the camera cuts to",
+            "composition": "A medium-wide shot in a luxury bedroom.",
+            "subjects": "The same girl stands centrally in the room.",
+            "environment": "A luxury bedroom with plush furnishings.",
+            "lighting": "Soft diffused ambient light.",
+            "camera": {"type": "Arc Shot", "amplitude": "default", "speed": "slow", "target": "the girl"},
+            "steps": [{"type": "action", "text": "She stands gracefully."}],
+            "sounds": [
+                "Her silk robe rustles softly as the camera circles around her.",
+                "Her high heels click with each step.",
+                "Her silver bracelet jingles as she raises one hand.",
+            ],
+        })
+
+        prompt = compile_prompt(value)
+
+        shot_two = prompt.split("[Shot 2]", 1)[1]
+        self.assertIn("the same person shown in <Picture 1>", shot_two)
+        self.assertIn("hair (long, straight, brown)", shot_two)
+        self.assertIn("clothing (red mini dress)", shot_two)
+        self.assertIn("footwear (barefoot)", shot_two)
+        self.assertIn("exact wardrobe design, fit, sleeve and hem lengths", shot_two)
+        self.assertIn("there is no wardrobe change", shot_two)
+        self.assertIn("Her red mini dress rustles softly", shot_two)
+        self.assertNotIn("silk robe", shot_two)
+        self.assertIn("Her bare footsteps land softly in exact sync with each step", shot_two)
+        self.assertNotIn("high heels", shot_two)
+        self.assertNotIn("bracelet", shot_two)
+        shot_one = prompt.split("[Shot 1]", 1)[1].split("[Shot 2]", 1)[0]
+        self.assertNotIn("hair (long, straight, brown)", shot_one)
+        self.assertNotIn("clothing (red mini dress)", shot_one)
+
+    def test_i2va_explicit_wardrobe_change_keeps_identity_without_old_clothes(self):
+        value = base_document(references=[{
+            "kind": "image", "path": "first.png", "roles": ["first_frame"],
+            "subject_candidates": [{
+                "name": "young woman",
+                "grounded_attributes": {
+                    "hair": "long brown hair", "clothing": "red mini dress",
+                },
+            }],
+        }])
+        value["shots"].append({
+            "id": "shot-2", "start": 2.5,
+            "subjects": (
+                "The same woman preserves her face and body but deliberately changes only her "
+                "wardrobe from the red mini dress to a new blue suit and black dress shoes."
+            ),
+            "steps": [{"type": "action", "text": "She adjusts the jacket."}],
+        })
+
+        shot_two = compile_prompt(value).split("[Shot 2]", 1)[1]
+
+        self.assertIn("the same person shown in <Picture 1>", shot_two)
+        self.assertIn("hair (long brown hair)", shot_two)
+        self.assertNotIn("clothing (red mini dress)", shot_two)
+        self.assertNotIn("there is no wardrobe change", shot_two)
 
     def test_complete_silence_suppresses_every_audio_layer(self):
         value = base_document(complete_silence=True)

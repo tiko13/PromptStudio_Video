@@ -105,6 +105,214 @@ def _first_frame_speaker_anchor(document):
     return f"The {name} shown in {source}" if name and source else ""
 
 
+def _i2va_cut_subject_continuity(document, shot):
+    """Re-anchor a continuing first-frame person after an I2VA hard cut.
+
+    A bare phrase such as "the same girl" is not a useful visual constraint once
+    a new shot changes the scene.  Cached grounding stays out of Shot 1 because
+    its pixels are authoritative, but it can safely make a later reappearance
+    explicit without inventing traits.
+    """
+    reference = next(
+        (
+            item for item in document.get("references") or []
+            if item.get("kind") == "image"
+            and "first_frame" in set(item.get("roles") or [])
+        ),
+        None,
+    )
+    candidates = (reference or {}).get("subject_candidates") or []
+    if len(candidates) != 1:
+        return ""
+    candidate = candidates[0]
+    name = str(candidate.get("name") or "").strip().rstrip(" .")
+    name = re.sub(r"^(?:the|a|an)\s+", "", name, flags=re.IGNORECASE)
+    if not name:
+        return ""
+
+    subject_prose = " ".join(filter(None, (
+        str(shot.get("subjects") or ""),
+        str((shot.get("camera") or {}).get("target") or ""),
+        *(str(step.get("text") or "") for step in shot.get("steps") or []),
+    )))
+    # Do not force the opening person into a cut that clearly introduces a
+    # different person. Otherwise, ordinary nouns and pronouns are sufficient
+    # evidence that the first-frame person continues into this shot.
+    if re.search(
+        r"\b(?:different|another|new)\s+(?:girl|woman|boy|man|person|character|subject)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ):
+        return ""
+    name_words = [word for word in re.findall(r"[A-Za-z]+", name) if len(word) > 2]
+    continuation = re.search(
+        r"\b(?:same|she|her|he|him|his|they|them|their|girl|woman|boy|man|person|character|subject)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ) or any(re.search(rf"\b{re.escape(word)}\b", subject_prose, re.IGNORECASE) for word in name_words)
+    if not continuation:
+        return ""
+
+    source = str(reference.get("label") or "<Picture 1>").strip()
+    attributes = candidate.get("grounded_attributes") or {}
+    change_prefix = r"\b(?:changes?\s+into|now\s+wear(?:s|ing)|replaces?|different|new)\b.{0,80}"
+    changed_fields = set()
+    if re.search(change_prefix + r"\b(?:hair|hairstyle)\b", subject_prose, re.IGNORECASE):
+        changed_fields.add("hair")
+    if re.search(
+        change_prefix + r"\b(?:clothes|clothing|outfit|wardrobe|dress|gown|robe|shirt|top|"
+        r"blouse|jacket|coat|skirt|pants|trousers|shorts|suit|tuxedo)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ) or re.search(
+        r"\b(?:change|changes|changing|changed|switch|switches|switching|switched|replace|"
+        r"replaces|replacing|replaced)\b.{0,80}\b(?:clothes|clothing|outfit|wardrobe|dress|"
+        r"gown|robe|shirt|top|blouse|jacket|coat|skirt|pants|trousers|shorts|suit|tuxedo)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ):
+        changed_fields.add("clothing")
+    if re.search(
+        change_prefix + r"\b(?:shoes?|boots?|heels?|sandals?|sneakers?|footwear|barefoot)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ) or (
+        "clothing" in changed_fields
+        and re.search(r"\b(?:shoes?|boots?|heels?|sandals?|sneakers?|footwear|barefoot)\b", subject_prose, re.IGNORECASE)
+    ):
+        changed_fields.add("footwear")
+    if re.search(
+        change_prefix + r"\b(?:accessor(?:y|ies)|jewelry|bracelets?|necklaces?|earrings?|"
+        r"watches?|cufflinks?)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ):
+        changed_fields.add("accessories")
+    if re.search(
+        r"\b(?:entirely|completely|totally)\s+(?:different|new)\s+(?:appearance|look)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ):
+        changed_fields.update({"hair", "face", "clothing", "footwear", "accessories", "body", "other"})
+    attribute_labels = {
+        "hair": "hair",
+        "face": "facial appearance",
+        "clothing": "clothing",
+        "footwear": "footwear",
+        "accessories": "accessories",
+        "body": "body",
+        "other": "other visible traits",
+    }
+    grounded = [
+        f"{attribute_labels[field]} ({str(attributes.get(field) or '').strip().rstrip(' .')})"
+        for field in ("hair", "face", "clothing", "footwear", "accessories", "body", "other")
+        if str(attributes.get(field) or "").strip()
+        and field not in changed_fields
+    ]
+    traits = f", including {', '.join(grounded)}" if grounded else ""
+    wardrobe = (
+        ""
+        if changed_fields & {"clothing", "footwear", "accessories"}
+        else (
+            f" Preserve the exact wardrobe design, fit, sleeve and hem lengths, colors, materials, "
+            f"accessories, and footwear visible in {source}; there is no wardrobe change."
+        )
+    )
+    return (
+        f"The {name} is unmistakably the same person shown in {source}; facial identity, "
+        f"body proportions, and all unchanged appearance traits remain identical{traits}."
+        f"{wardrobe}"
+    )
+
+
+def _i2va_grounded_sound(document, shot, sound):
+    """Prevent an audible detail from silently redesigning anchored wardrobe."""
+    reference = next(
+        (
+            item for item in document.get("references") or []
+            if item.get("kind") == "image"
+            and "first_frame" in set(item.get("roles") or [])
+        ),
+        None,
+    )
+    candidates = (reference or {}).get("subject_candidates") or []
+    if len(candidates) != 1:
+        return sound
+    grounded_attributes = candidates[0].get("grounded_attributes") or {}
+    grounded_clothing = str(grounded_attributes.get("clothing") or "").strip().rstrip(" .")
+    grounded_footwear = str(grounded_attributes.get("footwear") or "").strip().rstrip(" .")
+    grounded_accessories = str(grounded_attributes.get("accessories") or "").strip().rstrip(" .")
+    if not any((grounded_clothing, grounded_footwear, grounded_accessories)):
+        return sound
+    subject_prose = " ".join(filter(None, (
+        str(shot.get("subjects") or ""),
+        *(str(step.get("text") or "") for step in shot.get("steps") or []),
+    )))
+    if re.search(
+        r"\b(?:changes?\s+into|now\s+wear(?:s|ing)|replaces?|different|new)\b.{0,80}"
+        r"\b(?:clothes|clothing|outfit|wardrobe|dress|gown|shirt|top|blouse|jacket|coat|"
+        r"skirt|pants|trousers|shorts|robe|suit|tuxedo)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ) or re.search(
+        r"\b(?:change|changes|changing|changed|switch|switches|switching|switched|replace|"
+        r"replaces|replacing|replaced)\b.{0,80}\b(?:clothes|clothing|outfit|wardrobe|dress|"
+        r"gown|shirt|top|blouse|jacket|coat|skirt|pants|trousers|shorts|robe|suit|tuxedo)\b",
+        subject_prose,
+        re.IGNORECASE,
+    ):
+        return sound
+
+    garment = re.compile(
+        r"\b(?:(?:soft|stiff|heavy|light|silk|silky|satin|satin-like|cotton|linen|"
+        r"leather|wool|velvet|denim|flowing|loose|tight)\s+){0,3}"
+        r"(?:robe|gown|dress|shirt|blouse|top|jacket|coat|skirt|pants|trousers|shorts)\b",
+        re.IGNORECASE,
+    )
+    grounded_words = set(re.findall(r"[a-z]+", grounded_clothing.casefold()))
+
+    def replace(match):
+        matched_words = set(re.findall(r"[a-z]+", match.group(0).casefold()))
+        garment_nouns = {
+            "robe", "gown", "dress", "shirt", "blouse", "top", "jacket", "coat",
+            "skirt", "pants", "trousers", "shorts",
+        }
+        return match.group(0) if matched_words & garment_nouns & grounded_words else grounded_clothing
+
+    result = garment.sub(replace, str(sound or "")) if grounded_clothing else str(sound or "")
+
+    footwear = re.compile(
+        r"\b(?:(?:high|stiletto|leather|rubber|heavy|hard|soft|bare)\s+){0,2}"
+        r"(?:heels?|shoes?|boots?|sandals?|sneakers?|footwear|feet)\b",
+        re.IGNORECASE,
+    )
+    footwear_words = set(re.findall(r"[a-z]+", grounded_footwear.casefold()))
+    if footwear.search(result):
+        if "barefoot" in footwear_words or "bare" in footwear_words:
+            # A grounded barefoot subject cannot produce heel/shoe/boot foley.
+            if re.search(r"\b(?:heel|shoe|boot|sandal|sneaker)s?\b", result, re.IGNORECASE):
+                return "Her bare footsteps land softly in exact sync with each step."
+        elif grounded_footwear:
+            result = footwear.sub(grounded_footwear, result)
+
+    accessory = re.compile(
+        r"\b(?:(?:metal|gold|silver|wooden|glass|delicate|heavy)\s+){0,2}"
+        r"(?:bracelets?|bangles?|necklaces?|earrings?|watches?|chains?|pendants?)\b",
+        re.IGNORECASE,
+    )
+    if accessory.search(result):
+        if not grounded_accessories:
+            return ""
+        grounded_accessory_words = set(re.findall(r"[a-z]+", grounded_accessories.casefold()))
+
+        def replace_accessory(match):
+            words = set(re.findall(r"[a-z]+", match.group(0).casefold()))
+            return match.group(0) if words & grounded_accessory_words else grounded_accessories
+
+        result = accessory.sub(replace_accessory, result)
+    return result
+
+
 def _dialogue_text(event, *, speaker_anchor=""):
     speaker = event["speaker"]
     if (
@@ -152,6 +360,8 @@ def _shot_text(
     first_frame_preserve_style=True,
     suppress_audio=False,
     speaker_anchor="",
+    subject_continuity="",
+    sound_texts=None,
 ):
     if index == 0:
         prefix = "[Shot 1]"
@@ -174,6 +384,8 @@ def _shot_text(
             parts.append(_sentence(reference_scope))
     if include_style:
         parts.append(_sentence(_canonical_tokens(include_style)))
+    if subject_continuity:
+        parts.append(_sentence(_canonical_tokens(subject_continuity)))
     visual_fields = () if first_frame_lock and index == 0 else (
         "composition", "subjects", "environment", "lighting"
     )
@@ -191,7 +403,10 @@ def _shot_text(
         escaped = visible.replace('"', '\\"')
         parts.append(_sentence(f'A visible text element reads "{escaped}"'))
     if not suppress_audio:
-        parts.extend(_sentence(_canonical_tokens(sound)) for sound in shot.get("sounds") or [])
+        parts.extend(
+            _sentence(_canonical_tokens(sound))
+            for sound in (shot.get("sounds") or [] if sound_texts is None else sound_texts)
+        )
     body = " ".join(part for part in parts if part)
     return f"{prefix} {body}".strip()
 
@@ -225,6 +440,16 @@ def _compile_base(document):
             first_frame_lock=mode in {"i2va", "fl2va"},
             suppress_audio=document["complete_silence"],
             speaker_anchor=speaker_anchor,
+            subject_continuity=(
+                _i2va_cut_subject_continuity(document, shot)
+                if mode == "i2va" and index > 0
+                else ""
+            ),
+            sound_texts=(
+                [_i2va_grounded_sound(document, shot, sound) for sound in shot.get("sounds") or []]
+                if mode == "i2va"
+                else None
+            ),
         )
         for index, shot in enumerate(document["shots"])
     )
