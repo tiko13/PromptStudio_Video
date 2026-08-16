@@ -320,6 +320,16 @@ Video Studio discovers saved ComfyUI workflows whose filenames begin with
 `[PSV]`. A compatible workflow currently needs exactly one executable
 `PSV_MiniMaxH3Director` and one native `SaveVideo` output.
 
+When Video Studio opens without any compatible workflow, it offers to recreate
+the bundled `[PSV] MiniMax H3` Normal and Turbo workflows. Before changing
+anything, a second confirmation lists every required asset and the remaining
+download size. Accepted setup reuses matching files from any configured ComfyUI
+model path and downloads the missing FL2VA/REF2VA diffusion models, Qwen text
+encoder, video/audio VAEs, and all four Turbo LoRAs. Downloads use resumable
+`.part` files; the completed model replaces its target atomically. The saved
+workflows are retargeted when an existing matching asset lives in a different
+configured subfolder.
+
 Projects and cached workflow snapshots are stored transactionally in ignored
 runtime files inside this repository. Every queued generation stores its
 normalized document, compiled prompt, effective duration, output routing, and

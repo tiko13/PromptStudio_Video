@@ -47,6 +47,11 @@ from .video.media import (
     MIN_REFERENCE_SECONDS,
 )
 from .video.director import director_chat, preview_changeset
+from .video.default_setup import (
+    default_model_setup_status,
+    start_default_model_setup,
+    workflow_setup_plan,
+)
 from .video.llm_provider import abort_generation, generation_status
 from .video.store import (
     StoreConflictError,
@@ -97,6 +102,7 @@ CAPABILITY = {
         "native_video_continuation",
         "native_h3_motion_context",
         "unified_studio_shell",
+        "default_workflow_setup",
     ],
     "standalone_page": "/extensions/PromptStudio_Video/prompt_studio_video.html",
 }
@@ -456,6 +462,27 @@ async def promptstudio_video_workflows_put(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
+async def promptstudio_video_default_workflows_get(_request):
+    try:
+        return web.json_response(await asyncio.to_thread(workflow_setup_plan))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def promptstudio_video_default_setup_post(_request):
+    try:
+        return web.json_response(await asyncio.to_thread(start_default_model_setup))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def promptstudio_video_default_setup_get(request):
+    try:
+        return web.json_response(default_model_setup_status(request.query.get("job_id")))
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 async def _director_body(request):
     if request.content_length is not None and request.content_length > MAX_DIRECTOR_REQUEST_BYTES:
         raise ValueError("Video Director request exceeds the 2 MB limit")
@@ -679,6 +706,9 @@ def register_routes():
     routes.put("/promptstudio-video/projects")(promptstudio_video_projects_put)
     routes.get("/promptstudio-video/workflows")(promptstudio_video_workflows_get)
     routes.put("/promptstudio-video/workflows")(promptstudio_video_workflows_put)
+    routes.get("/promptstudio-video/default-workflows")(promptstudio_video_default_workflows_get)
+    routes.get("/promptstudio-video/default-setup")(promptstudio_video_default_setup_get)
+    routes.post("/promptstudio-video/default-setup")(promptstudio_video_default_setup_post)
     routes.post("/promptstudio-video/director/chat")(promptstudio_video_director_chat)
     routes.get("/promptstudio-video/director/chat/{job_id}")(promptstudio_video_director_status)
     routes.post("/promptstudio-video/director/chat/{job_id}/cancel")(promptstudio_video_director_cancel)

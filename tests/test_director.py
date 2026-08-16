@@ -607,6 +607,8 @@ class DirectorTests(unittest.TestCase):
     def test_vision_grounding_contract_separates_pixels_from_requested_action(self):
         self.assertIn("report only concrete facts visible in their pixels", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("do not add the user's requested action", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("never pose or limb position", VISION_GROUNDING_SYSTEM_MESSAGE)
+        self.assertIn("held objects and weapons are not accessories", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("Return JSON only", VISION_GROUNDING_SYSTEM_MESSAGE)
         self.assertIn("grounded_attributes", VISION_GROUNDING_SYSTEM_MESSAGE)
 
@@ -2650,6 +2652,208 @@ class DirectorTests(unittest.TestCase):
         _validate_requested_project_result(document, {
             "messages": [{"role": "user", "content": "Create the complete video prompt."}],
         })
+
+    def test_complete_video_edit_inherits_environment_and_lighting(self):
+        document = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1",
+                "start": 0,
+                "composition": "The framing and composition of <Video 1> remain unchanged.",
+                "subjects": "<Subject 1> replaces the original performer throughout the shot.",
+                "environment": "",
+                "lighting": "",
+                "steps": [{
+                    "type": "action",
+                    "text": "<Subject 1> follows the original performance and motion from <Video 1>.",
+                }],
+            }],
+            "references": [
+                {
+                    "id": "reference-video",
+                    "kind": "video",
+                    "path": "source.mp4",
+                    "roles": ["video_edit"],
+                },
+                {
+                    "id": "reference-character",
+                    "kind": "image",
+                    "path": "character.png",
+                    "roles": ["subject"],
+                },
+            ],
+            "task_types": ["video editing", "reference generation"],
+        })
+
+        _validate_requested_project_result(document, {
+            "messages": [{
+                "role": "user",
+                "content": "Create the complete video edit and replace the character in every frame.",
+            }],
+        })
+
+    def test_video_edit_replacement_semantics_start_at_first_frame_and_preserve_motion(self):
+        document = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1", "start": 0,
+                "composition": "<Subject 1> occupies the source performer's framing in <Video 1>.",
+                "subjects": "<Subject 1> replaces the source performer.",
+                "steps": [{"type": "action", "text": "<Subject 1> follows <Video 1>'s motion."}],
+            }],
+            "references": [
+                {"id": "video", "kind": "video", "path": "source.mp4", "roles": ["video_edit"]},
+                {
+                    "id": "image", "kind": "image", "path": "soldier.png", "roles": ["subject"],
+                    "subject_candidates": [{"name": "person", "location": "center"}],
+                },
+            ],
+            "task_types": ["video editing", "reference generation"],
+        })
+        proposal = {
+            "summary": "Replace the performer",
+            "operations": [{"op": "update_project", "fields": {}}],
+        }
+        data = {
+            "messages": [{
+                "role": "user",
+                "content": "Replace the original character with the subject reference throughout the full video.",
+            }],
+        }
+
+        completed = _complete_grounded_reference_semantics(document, proposal, data)
+        fields = next(
+            operation["fields"]
+            for operation in completed["operations"]
+            if operation.get("op") == "update_project" and "summary" in operation.get("fields", {})
+        )
+
+        self.assertTrue(fields["summary"].startswith("The target video is an edited version of <Video 1>."))
+        self.assertIn("from the first frame through the final frame", fields["summary"])
+        subject_retention = next(
+            item for item in fields["retention_analysis"] if item["label"] == "<Subject 1>"
+        )
+        self.assertEqual(subject_retention["relationship"], "attribute_transfer")
+        self.assertIn("static pose and held objects are not transferred", subject_retention["detail"])
+
+    def test_video_edit_replacement_rejects_static_subject_image_pose_catalog(self):
+        document = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1", "start": 0,
+                "composition": "A medium-wide shot frames <Subject 1> in <Video 1>.",
+                "subjects": "<Subject 1> wears a blue jacket and dark pants in a standing pose.",
+                "steps": [{"type": "action", "text": "<Subject 1> follows <Video 1>'s motion."}],
+            }],
+            "references": [
+                {"id": "video", "kind": "video", "path": "source.mp4", "roles": ["video_edit"]},
+                {"id": "image", "kind": "image", "path": "soldier.png", "roles": ["subject"]},
+            ],
+            "task_types": ["video editing", "reference generation"],
+        })
+
+        with self.assertRaisesRegex(ValueError, "subject-only reference"):
+            _validate_subject_only_reference_prose(document, {
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Replace the character with the reference identity and exact wardrobe throughout the video."
+                    ),
+                }],
+            })
+
+    def test_video_edit_dialogue_change_keeps_preexisting_subject_catalog_valid(self):
+        original = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1", "start": 0,
+                "composition": "A medium-wide shot frames <Subject 1> in <Video 1>.",
+                "subjects": "<Subject 1> wears a blue jacket and dark pants in a standing pose.",
+                "steps": [{"type": "action", "text": "<Subject 1> follows <Video 1>'s motion."}],
+            }],
+            "references": [
+                {"id": "video", "kind": "video", "path": "source.mp4", "roles": ["video_edit"]},
+                {"id": "image", "kind": "image", "path": "soldier.png", "roles": ["subject"]},
+            ],
+            "task_types": ["video editing", "reference generation"],
+        })
+        result = copy.deepcopy(original)
+        result["shots"][0]["steps"].append({
+            "type": "dialogue", "speaker": "<Subject 1>", "speaker_id": "S1",
+            "language": "English", "performance": "speech", "text": "Testing, one two.",
+        })
+        request = {
+            "pending_plan": {
+                "original_request": "Replace the character with the subject reference throughout the video.",
+            },
+            "messages": [{"role": "user", "content": "Add the dialogue: Testing, one two."}],
+        }
+
+        _validate_subject_only_reference_prose(result, request, original)
+
+    def test_complete_video_edit_still_requires_concrete_subject_and_action(self):
+        document = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1",
+                "start": 0,
+                "composition": "The framing and composition of <Video 1> remain unchanged.",
+                "subjects": "",
+                "environment": "",
+                "lighting": "",
+                "steps": [],
+            }],
+            "references": [{
+                "id": "reference-video",
+                "kind": "video",
+                "path": "source.mp4",
+                "roles": ["video_edit"],
+            }],
+            "task_types": ["video editing"],
+        })
+
+        with self.assertRaisesRegex(ValueError, "subjects, action step"):
+            _validate_requested_project_result(document, {
+                "messages": [{"role": "user", "content": "Create the complete video edit."}],
+            })
+
+    def test_video_edit_context_explains_source_owned_environment_and_lighting(self):
+        document = normalize_document({
+            "version": 1,
+            "mode": "ref2va",
+            "duration_seconds": 5,
+            "shots": [{
+                "id": "shot-1",
+                "start": 0,
+                "steps": [{"type": "action", "text": "The performer crosses the frame."}],
+            }],
+            "references": [{
+                "id": "reference-video",
+                "kind": "video",
+                "path": "source.mp4",
+                "roles": ["video_edit"],
+            }],
+            "task_types": ["video editing"],
+        })
+
+        messages, _usage = build_provider_messages({
+            "scope": "project",
+            "document": document,
+            "messages": [{"role": "user", "content": "Create the complete edit."}],
+        })
+
+        self.assertIn("VIDEO-EDIT SOURCE OWNERSHIP", messages[0]["content"])
+        self.assertIn("environment or lighting empty", messages[0]["content"])
 
     def test_explicit_full_prompt_request_retries_missing_proposal_once(self):
         proposal_response = (

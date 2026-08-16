@@ -8,13 +8,15 @@ const TURBO_PROFILE_TYPE = "PSV_MiniMaxH3TurboProfile";
 const WORKFLOW_PREFIX = "[PSV]";
 const PROJECTS_ENDPOINT = "/promptstudio-video/projects";
 const WORKFLOWS_ENDPOINT = "/promptstudio-video/workflows";
+const DEFAULT_WORKFLOWS_ENDPOINT = "/promptstudio-video/default-workflows";
+const DEFAULT_SETUP_ENDPOINT = "/promptstudio-video/default-setup";
 const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
 const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
 const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
 const LLM_STATUS_ENDPOINT = "/promptstudio/prompt-studio/llm/status";
 const LLM_ABORT_ENDPOINT = "/promptstudio-video/llm/abort";
-const COMFY_RESTART_ENDPOINT = "/manager/reboot";
+const COMFY_RESTART_ENDPOINTS = ["/v2/manager/reboot", "/manager/reboot"];
 const DIRECTOR_JOB_POLL_MS = 1000;
 const DIRECTOR_STATUS_RETRY_LIMIT = 3;
 const KOBOLD_STATUS_POLL_MS = 3000;
@@ -93,8 +95,11 @@ const state = {
   projectSaveChain: Promise.resolve(),
   workflows: [],
   workflowRevision: 0,
+  defaultWorkflowSetupPrompted: false,
+  defaultSetupJobId: "",
   selectedShotId: null,
   generationProgress: new Map(),
+  activeGenerationPromptId: "",
   generationPollers: new Map(),
   generationControllers: new Map(),
   generationActivity: new Map(),
@@ -526,7 +531,11 @@ async function restartComfyUIFromStatus() {
   state.comfyRestartBusy = true;
   renderSystemStatusSummary();
   try {
-    const response = await api.fetchApi(COMFY_RESTART_ENDPOINT, { method: "POST" });
+    let response;
+    for (const endpoint of COMFY_RESTART_ENDPOINTS) {
+      response = await api.fetchApi(endpoint, { method: "POST" });
+      if (response.ok || ![404, 405].includes(response.status)) break;
+    }
     if (!response.ok) throw new Error(`ComfyUI Manager could not restart the server (${response.status}).`);
     const detail = state.panel?.querySelector("#psvstudio-comfy-status-detail");
     if (detail) detail.textContent = "Restarting; waiting to reconnect…";
@@ -2747,6 +2756,147 @@ async function saveWorkflowCache() {
   state.workflowRevision = Number(data.revision || state.workflowRevision);
 }
 
+function formatSetupBytes(value) {
+  const bytes = Math.max(0, Number(value || 0));
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes;
+  let unit = -1;
+  do {
+    amount /= 1024;
+    unit += 1;
+  } while (amount >= 1024 && unit < units.length - 1);
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+async function fetchDefaultWorkflowPlan() {
+  const response = await api.fetchApi(DEFAULT_WORKFLOWS_ENDPOINT);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Default Video Studio workflows could not be prepared.");
+  if (!Array.isArray(data.workflows) || data.workflows.length !== 2) {
+    throw new Error("Default Video Studio workflow package is incomplete.");
+  }
+  return data;
+}
+
+async function storeDefaultWorkflow(workflow) {
+  const userDataPath = `workflows/${workflow.path}`;
+  const response = typeof api.storeUserData === "function"
+    ? await api.storeUserData(userDataPath, workflow.data, {
+      overwrite: false, stringify: true, throwOnError: false, full_info: true,
+    })
+    : await api.fetchApi(`/userdata/${encodeURIComponent(userDataPath)}?overwrite=false&full_info=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(workflow.data),
+    });
+  if (!response.ok && response.status !== 409) {
+    throw new Error(`ComfyUI could not save ${workflow.path} (${response.status}).`);
+  }
+}
+
+function defaultSetupWarning(plan) {
+  const models = (plan.models || []).map(model => `• ${model.name}`).join("\n");
+  const missing = Number(plan.missing_bytes || 0);
+  const download = missing
+    ? `${formatSetupBytes(missing)} still needs to be downloaded.`
+    : "All required files are already installed and will be reused.";
+  return [
+    "Creating the Normal and Turbo workflows will also install every model and LoRA they currently use.",
+    "",
+    models,
+    "",
+    `The complete asset set is ${formatSetupBytes(plan.total_bytes)}. ${download}`,
+    "Existing matching files are reused. Missing downloads are resumable.",
+    "",
+    "Continue and create both ready-to-use workflows?",
+  ].join("\n");
+}
+
+async function pollDefaultSetup(jobId) {
+  state.defaultSetupJobId = String(jobId || "");
+  if (!state.defaultSetupJobId) return;
+  try {
+    while (state.defaultSetupJobId === String(jobId)) {
+      const response = await api.fetchApi(`${DEFAULT_SETUP_ENDPOINT}?job_id=${encodeURIComponent(jobId)}`);
+      const job = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(job.error || "The default model download status could not be read.");
+      if (job.status === "complete") {
+        state.defaultSetupJobId = "";
+        if (typeof app.refreshComboInNodes === "function") await app.refreshComboInNodes();
+        setStatus("Default Normal and Turbo workflows are ready. All required models and LoRAs are installed.", "ready");
+        return;
+      }
+      if (job.status === "error") {
+        state.defaultSetupJobId = "";
+        setStatus(`Default workflow setup stopped: ${job.error || "model download failed"}. Reload Video Studio to retry the resumable downloads.`, "error");
+        return;
+      }
+      if (job.status === "idle") {
+        state.defaultSetupJobId = "";
+        return;
+      }
+      const completed = formatSetupBytes(job.downloaded_bytes);
+      const total = formatSetupBytes(job.total_bytes);
+      const current = job.current_model ? ` · ${job.current_model}` : "";
+      setStatus(`Installing default workflow models: ${completed} / ${total}${current}`, "busy");
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } catch (error) {
+    state.defaultSetupJobId = "";
+    setStatus(`${error.message || error} The model downloads remain resumable.`, "warning");
+  }
+}
+
+async function startDefaultWorkflowSetup(plan) {
+  setStatus("Creating the default Normal and Turbo workflows…", "busy");
+  for (const workflow of plan.workflows) await storeDefaultWorkflow(workflow);
+  const response = await api.fetchApi(DEFAULT_SETUP_ENDPOINT, { method: "POST" });
+  const job = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(job.error || "Default model downloads could not be started.");
+  await refreshWorkflows({ announce: false });
+  if (job.status === "complete") {
+    if (typeof app.refreshComboInNodes === "function") await app.refreshComboInNodes();
+    setStatus("Default Normal and Turbo workflows are ready. All required models and LoRAs were already installed.", "ready");
+  } else {
+    void pollDefaultSetup(job.id);
+  }
+}
+
+async function offerDefaultWorkflowSetup() {
+  if (state.workflows.length || state.defaultWorkflowSetupPrompted) return false;
+  state.defaultWorkflowSetupPrompted = true;
+  const view = state.panel?.ownerDocument.defaultView;
+  if (!view?.confirm("No compatible Prompt Studio Video workflow was found. Create the default Normal and Turbo workflows?")) {
+    return false;
+  }
+  const plan = await fetchDefaultWorkflowPlan();
+  if (!view.confirm(defaultSetupWarning(plan))) return false;
+  await startDefaultWorkflowSetup(plan);
+  return true;
+}
+
+async function resumeDefaultSetupMonitor() {
+  const response = await api.fetchApi(DEFAULT_SETUP_ENDPOINT);
+  if (!response.ok) return;
+  const job = await response.json().catch(() => ({}));
+  if (["starting", "downloading"].includes(job.status) && job.id) {
+    void pollDefaultSetup(job.id);
+    return;
+  }
+  const defaultPaths = new Set(["[PSV] MiniMax H3.json", "[PSV] MiniMax H3 Turbo.json"]);
+  if (![...defaultPaths].every(path => state.workflows.some(workflow => workflow.path === path))) return;
+  const plan = await fetchDefaultWorkflowPlan();
+  if (!Number(plan.missing_bytes || 0)) return;
+  const view = state.panel?.ownerDocument.defaultView;
+  if (!view?.confirm(`The default Video Studio workflows still need ${formatSetupBytes(plan.missing_bytes)} of models and LoRAs. Resume the downloads now?`)) return;
+  const startResponse = await api.fetchApi(DEFAULT_SETUP_ENDPOINT, { method: "POST" });
+  const started = await startResponse.json().catch(() => ({}));
+  if (!startResponse.ok) throw new Error(started.error || "Default model downloads could not be resumed.");
+  if (started.status === "complete") setStatus("Default Video Studio models and LoRAs are installed.", "ready");
+  else void pollDefaultSetup(started.id);
+}
+
 async function refreshWorkflows({ announce = true } = {}) {
   const previous = state.workflows;
   const cached = new Map(previous.map(workflow => [workflow.path, workflow]));
@@ -3040,6 +3190,7 @@ function stopGenerationPolling(promptId) {
   state.generationPollers.delete(id);
   state.generationActivity.delete(id);
   state.generationProgress.delete(id);
+  if (state.activeGenerationPromptId === id) state.activeGenerationPromptId = "";
 }
 
 async function cancelVideoGeneration(projectId, generationId) {
@@ -3076,6 +3227,7 @@ function markGenerationExecuting(promptId) {
   const id = String(promptId || "");
   const record = generationByPromptId(id);
   if (!record) return false;
+  state.activeGenerationPromptId = id;
   touchGeneration(id);
   if (record.generation.status === "queued") {
     updateGeneration(id, { status: "generating" });
@@ -5118,6 +5270,7 @@ function renderGenerations() {
       fill.style.setProperty("--progress", `${percent}%`);
       bar.append(fill);
       body.append(bar);
+      if (progress.phase === "finalizing") body.append(el("small", "psvstudio-help", "Finalizing…"));
       if (progress.phase === "assembling") body.append(el("small", "psvstudio-help", "Extension rendered · assembling the cumulative version…"));
     }
     if (generation.error) body.append(el("div", "psvstudio-help", generation.error));
@@ -5516,7 +5669,13 @@ function buildPanel() {
 }
 
 function setupProgressEvents() {
-  const promptId = event => String(event?.detail?.prompt_id || event?.detail?.promptId || "");
+  const promptId = event => String(
+    event?.detail?.prompt_id || event?.detail?.promptId || state.activeGenerationPromptId || "",
+  );
+  const updateProgress = (id, changes) => {
+    const current = state.generationProgress.get(id) || {};
+    state.generationProgress.set(id, { ...current, ...changes });
+  };
   const runningProgress = event => {
     const nodes = event?.detail?.nodes;
     if (!nodes || typeof nodes !== "object") return null;
@@ -5529,12 +5688,16 @@ function setupProgressEvents() {
   api.addEventListener("execution_start", event => {
     const id = promptId(event);
     if (!markGenerationExecuting(id)) return;
-    state.generationProgress.set(id, { phase: "generating" });
+    updateProgress(id, { phase: "generating" });
   });
   api.addEventListener("progress", event => {
     const id = promptId(event);
     if (!markGenerationExecuting(id)) return;
-    state.generationProgress.set(id, {
+    if (state.generationProgress.get(id)?.phase === "finalizing") {
+      renderGenerations();
+      return;
+    }
+    updateProgress(id, {
       phase: "generating",
       value: Number(event.detail?.value),
       max: Number(event.detail?.max),
@@ -5550,14 +5713,27 @@ function setupProgressEvents() {
   api.addEventListener("executing", event => {
     const id = promptId(event);
     if (!markGenerationExecuting(id)) return;
-    state.generationProgress.set(id, { phase: "generating" });
+    const current = state.generationProgress.get(id) || {};
+    const samplerComplete = Number.isFinite(current.value) && Number.isFinite(current.max)
+      && current.max > 0 && current.value >= current.max;
+    const node = event?.detail && typeof event.detail === "object" ? event.detail.node : event?.detail;
+    updateProgress(id, { phase: node == null || samplerComplete ? "finalizing" : "generating" });
     renderGenerations();
   });
   api.addEventListener("progress_state", event => {
     const id = promptId(event);
     if (!markGenerationExecuting(id)) return;
     const progress = runningProgress(event);
-    state.generationProgress.set(id, { phase: "generating", ...(progress || {}) });
+    const current = state.generationProgress.get(id) || {};
+    if (current.phase !== "finalizing") {
+      updateProgress(id, { phase: progress ? "generating" : current.phase || "generating", ...(progress || {}) });
+    }
+    renderGenerations();
+  });
+  api.addEventListener("execution_success", event => {
+    const id = promptId(event);
+    if (!markGenerationExecuting(id)) return;
+    updateProgress(id, { phase: "finalizing" });
     renderGenerations();
   });
   api.addEventListener("reconnecting", () => setApiConnected(false));
@@ -5802,6 +5978,8 @@ app.registerExtension({
       if (!state.projects.length) setStatus("Create a video project to begin.", "ready");
       else if (!state.workflows.length) setStatus("No [PSV] workflow found. Save the working workflow with a [PSV] filename prefix, then refresh.", "warning");
       else setStatus("Video Studio is ready.", "ready");
+      if (!state.workflows.length) await offerDefaultWorkflowSetup();
+      else await resumeDefaultSetupMonitor();
       resumeGenerationPolling();
       resumeVideoPreparations();
       resumeDirectorJobs();

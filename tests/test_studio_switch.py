@@ -65,14 +65,33 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("Number(running.max)", events)
 
         executing_start = events.index('api.addEventListener("executing"')
-        executing_handler = events[executing_start:executing_start + 350]
-        self.assertIn('state.generationProgress.set(id, { phase: "generating" })', executing_handler)
+        executing_handler = events[executing_start:executing_start + 700]
+        self.assertIn("samplerComplete", executing_handler)
+        self.assertIn('node == null || samplerComplete ? "finalizing" : "generating"', executing_handler)
+        self.assertIn("updateProgress(id", executing_handler)
 
         state_start = events.index('api.addEventListener("progress_state"')
         state_handler = events[state_start:state_start + 450]
         self.assertIn("const progress = runningProgress(event)", state_handler)
         self.assertIn("...(progress || {})", state_handler)
         self.assertIn("renderGenerations()", state_handler)
+
+    def test_completed_sampler_progress_stays_visible_while_video_finalizes(self):
+        render_start = self.source.index("function renderGenerations")
+        render_end = self.source.index("function showCompiledPrompt", render_start)
+        render = self.source[render_start:render_end]
+        events_start = self.source.index("function setupProgressEvents")
+        events_end = self.source.index("function setStandaloneVisibility", events_start)
+        events = self.source[events_start:events_end]
+
+        self.assertIn('{ ...current, ...changes }', events)
+        self.assertIn("state.activeGenerationPromptId", events)
+        self.assertIn('api.addEventListener("execution_success"', events)
+        self.assertIn('phase: "finalizing"', events)
+        self.assertIn('?.phase === "finalizing"', events)
+        self.assertIn('current.phase !== "finalizing"', events)
+        self.assertIn('progress.phase === "finalizing"', render)
+        self.assertIn('"Finalizing…"', render)
 
     def test_turbo_profile_is_visible_and_follows_backend_routing_order(self):
         helper_start = self.source.index("function resolvedTurboProfile")
@@ -97,6 +116,26 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("Shared Prompt Studio LLM", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/config-builder", self.routes)
+
+    def test_restart_uses_manager_v4_with_a_legacy_fallback(self):
+        self.assertIn('["/v2/manager/reboot", "/manager/reboot"]', self.source)
+        restart_start = self.source.index("async function restartComfyUIFromStatus")
+        restart_end = self.source.index("\nfunction startKoboldStatusMonitor", restart_start)
+        restart = self.source[restart_start:restart_end]
+        self.assertIn("for (const endpoint of COMFY_RESTART_ENDPOINTS)", restart)
+        self.assertIn("![404, 405].includes(response.status)", restart)
+
+    def test_empty_video_studio_offers_complete_default_workflow_setup(self):
+        self.assertIn('"default_workflow_setup"', self.routes)
+        self.assertIn('/promptstudio-video/default-workflows', self.routes)
+        self.assertIn('/promptstudio-video/default-setup', self.routes)
+        self.assertIn("async function offerDefaultWorkflowSetup", self.source)
+        self.assertIn("Create the default Normal and Turbo workflows?", self.source)
+        self.assertIn("install every model and LoRA they currently use", self.source)
+        self.assertIn("Missing downloads are resumable.", self.source)
+        self.assertIn("await offerDefaultWorkflowSetup()", self.source)
+        self.assertIn("overwrite: false", self.source)
+        self.assertIn("void pollDefaultSetup(job.id)", self.source)
 
     def test_director_progress_prefers_live_token_counts(self):
         start = self.source.index("function directorJobStatusText")

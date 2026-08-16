@@ -521,6 +521,50 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("<Video 1> (guides [Shot 1]): fully_preserved", prompt)
         self.assertIn("<Audio 1> (guides the speaker in [Shot 1]): reference", prompt)
 
+    def test_video_edit_replacement_starts_immediately_and_uses_source_motion(self):
+        value = base_document(
+            mode="ref2va",
+            main_description=(
+                "The target video is an edited version of <Video 1>, replacing the original performer with "
+                "<Subject 1> throughout. The camera work is preserved exactly."
+            ),
+            references=[
+                {"kind": "video", "path": "source.mp4", "roles": ["video_edit"]},
+                {"kind": "image", "path": "soldier.png", "roles": ["subject"]},
+            ],
+            task_types=["reference generation", "video editing"],
+            subject_definitions=[
+                {"label": "Video 1", "text": "is the referenced video source."},
+                {"label": "Subject 1", "text": "is only the person in <Picture 1>."},
+            ],
+            summary="The target video uses <Video 1> and <Subject 1>.",
+            retention_analysis=[
+                {"label": "<Video 1>", "where": "appears in [Shot 1]", "relationship": "fully_preserved", "detail": "The video is retained."},
+                {"label": "<Subject 1>", "where": "appears in [Shot 1]", "relationship": "fully_preserved", "detail": "The subject is retained."},
+            ],
+        )
+        value["shots"][0].update({
+            "composition": "A medium-wide shot frames <Subject 1> in <Video 1>.",
+            "subjects": "<Subject 1>: a tactical operator with a rifle, standing still with the right arm raised.",
+            "camera": {"type": "Static Shot", "amplitude": "default", "speed": "default", "target": ""},
+            "steps": [{
+                "type": "action",
+                "text": "<Subject 1> performs the same movement as the source performer in <Video 1>.",
+            }],
+        })
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("The target video is an edited version of <Video 1>.", prompt)
+        self.assertIn("From the first visible frame through the final frame", prompt)
+        self.assertIn("<Video 1> supplies every body motion, pose change, gesture", prompt)
+        self.assertIn("the subject reference supplies no action or static pose", prompt)
+        self.assertIn("<Subject 1> (appears in [Shot 1]): attribute_transfer", prompt)
+        self.assertIn("static pose, held objects, and action do not transfer", prompt)
+        self.assertNotIn("rifle", prompt)
+        self.assertNotIn("right arm raised", prompt)
+        self.assertNotIn("camera holds a static shot", prompt)
+
     def test_voiceover_closes_lips_and_supports_cutoff(self):
         value = base_document()
         value["shots"][0]["dialogue"][0].update({"voiceover": True, "cutoff": True})

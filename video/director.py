@@ -303,7 +303,7 @@ Inspect the attached images directly and report only concrete facts visible in t
 
 For a person, prioritize visibly supported hair color/style, face and skin appearance, clothing type/color/material, footwear, accessories, pose, framing, and immediate background. For another subject type, provide equivalently concrete colors, shapes, materials, textures, components, layout, and spatial relationships. For style, action, pose, camera, storyboard, first-frame, or last-frame usages, also describe the visible composition and treatment relevant to that usage. For action usage, report only the visible body/object state, interaction, direction, and motion cues; do not invent movement before or after the depicted instant.
 
-Follow assigned_usage strictly. For scene usage, report the environment, furnishings, architecture, materials, layout, and lighting while omitting a visible person's identity and wardrobe unless required to explain spatial scale. For style usage, report rendering medium, shapes, linework, texture, palette, and compositional treatment while omitting depicted character identity and wardrobe. For subject, first_frame, and last_frame usage, identify each independently selectable primary subject with a short neutral noun phrase such as "young woman", "dog", or "car". Add a concise location whenever more than one compatible subject is present, such as "left", "center", or "right". Do not put clothing, hair, facial features, pose, mood, background, or prompt-like prose in a subject name. Also return visual_selectors: short natural aliases a user could use to identify that subject from visible hair, clothing, color, accessories, or other distinguishing pixels, for example "person in black", "white shirt", or "woman with blonde hair". Include only grounded distinguishing attributes and useful wording variants. For every subject, also return grounded_attributes as an object containing only visibly supported concise values under hair, face, clothing, footwear, accessories, body, or other. visual_selectors and grounded_attributes are persistent private metadata and must never be treated as requested prompt content.
+Follow assigned_usage strictly. For scene usage, report the environment, furnishings, architecture, materials, layout, and lighting while omitting a visible person's identity and wardrobe unless required to explain spatial scale. For style usage, report rendering medium, shapes, linework, texture, palette, and compositional treatment while omitting depicted character identity and wardrobe. For subject, first_frame, and last_frame usage, identify each independently selectable primary subject with a short neutral noun phrase such as "young woman", "dog", or "car". Add a concise location whenever more than one compatible subject is present, such as "left", "center", or "right". Do not put clothing, hair, facial features, pose, mood, background, or prompt-like prose in a subject name. Also return visual_selectors: short natural aliases a user could use to identify that subject from visible hair, clothing, color, accessories, or other distinguishing pixels, for example "person in black", "white shirt", or "woman with blonde hair". Include only grounded distinguishing attributes and useful wording variants. For every subject, also return grounded_attributes as an object containing only visibly supported concise values under hair, face, clothing, footwear, accessories, body, or other. For subject usage, grounded_attributes.body contains only stable physique or proportion information, never pose or limb position; held objects and weapons are not accessories and must be omitted from identity metadata unless assigned_usage is pose or action. visual_selectors and grounded_attributes are persistent private metadata and must never be treated as requested prompt content.
 
 Return JSON only with one entry per image in the same order: an object containing an images array. Each array item must contain integer index, a non-empty observations string, and a subjects array. Each subjects item must contain a short name, a visual_selectors string array, a grounded_attributes object, and may contain a short location. Use an empty subjects array when the assigned usage is not subject-oriented or no independently selectable subject is visible. Do not use Markdown fences or commentary."""
 
@@ -314,6 +314,12 @@ The supplied first-frame image is the sole authority for everything already visi
 For [Shot 1], leave composition, subjects, environment, and lighting unchanged; express only requested action/state changes, camera motion, dialogue, visible text, and sound. Do not update the project style unless the project contains a separately assigned style reference, in which case that source controls only the rendering treatment while the first frame still controls its anchored visible content and layout. For later shots that continue the same place and look, leave environment and lighting unchanged/empty so they inherit the first-frame scene. Populate environment or lighting only when the user explicitly requests that a later shot change location, setting, weather, time of day, or illumination; describe only the requested change, not an invented version of the original. A request for a complete/full prompt does not authorize filling these anchored visual fields.
 
 After a cut, if a person from the first frame reappears, "the same girl/person" alone is not an adequate continuity instruction. Bind that person explicitly to <Picture 1> and state that facial identity, body proportions, hair, exact wardrobe design and fit, accessories, and footwear remain unchanged unless the user explicitly requested an appearance or wardrobe change. A location or lighting change never implies a character redesign. Sound descriptions must not invent a garment, footwear, accessory, or material: write a neutral clothing/fabric sound or use only the grounded first-frame item. For example, never turn an anchored dress into a "silk robe" merely to describe rustling."""
+
+
+VIDEO_EDIT_DIRECTOR_POLICY = """VIDEO-EDIT SOURCE OWNERSHIP (REF2VA video editing tasks):
+An input assigned as a video editing source owns the target video's unchanged environment and lighting. Leave an existing shot's environment or lighting empty when the user did not request that property to change; an empty value inherits it from the editing video and must not be filled with invented source details merely because the user requested a complete/full prompt. Populate either field only when the user explicitly requests a corresponding scene, setting, weather, time-of-day, exposure, or illumination change.
+
+For character or object replacement, the replacement is continuous from the source video's first visible frame through its final frame. The editing video supplies every original action, body motion, pose change, gesture, locomotion path, timing, screen position, scale, occlusion, prop interaction, and camera relationship. The subject image supplies only the replacement identity and appearance; never copy its still pose, raised limbs, held objects, background, framing, or action into shot prose. Use the canonical <Subject N> label instead of cataloging image traits. State the continuous source-video motion ownership explicitly in the applicable shot action."""
 
 
 BASE_KEYFRAME_DIRECTOR_POLICY = """BASE KEYFRAME MODE (I2VA / FL2VA / L2VA):
@@ -897,6 +903,12 @@ def build_provider_messages(data):
         system_message += "\n\n" + BASE_KEYFRAME_DIRECTOR_POLICY
     if _has_first_frame_anchor(document):
         system_message += "\n\n" + I2VA_DIRECTOR_POLICY
+    if any(
+        reference.get("kind") == "video"
+        and "video_edit" in set(reference.get("roles") or [])
+        for reference in document.get("references") or []
+    ):
+        system_message += "\n\n" + VIDEO_EDIT_DIRECTOR_POLICY
     prompt_guide_chars = 0
     prompt_guides = []
     if data.get("optimize_prompt_generation", True) is False:
@@ -2325,6 +2337,10 @@ def _reference_role_description(reference):
         return "referenced camera treatment"
     if roles & {"storyboard", "first_frame", "last_frame"}:
         return "referenced visual anchor"
+    if "video_edit" in roles:
+        return "source video for the target video edit"
+    if "video_continue" in roles:
+        return "source video for the target video continuation"
     if reference.get("kind") == "video":
         return "referenced video source"
     if reference.get("kind") == "audio":
@@ -2342,6 +2358,26 @@ def _anchor_subject_binding_requested(data, source_token):
     picture = rf"<?\s*Picture\s+{number}\s*>?"
     return bool(
         re.search(rf"\b{subject}\b\s+(?:shown\s+in|from|in)\s+{picture}", content, re.IGNORECASE)
+    )
+
+
+def _video_edit_replacement_requested(data):
+    pending = data.get("pending_plan") if isinstance(data.get("pending_plan"), dict) else {}
+    text = " ".join(filter(None, (
+        _text(pending.get("original_request"), 2_000),
+        _latest_user_content(data),
+    )))
+    return bool(
+        re.search(
+            r"\b(?:replac(?:e|es|ed|ing|ement)|swap(?:s|ped|ping)?|substitut(?:e|es|ed|ing|ion))\b",
+            text,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(?:character|subject|person|woman|girl|man|boy|performer|actor|identity)\b",
+            text,
+            re.IGNORECASE,
+        )
     )
 
 
@@ -2369,6 +2405,7 @@ def _complete_grounded_reference_semantics(document, proposal, data):
             if name in fields:
                 semantic[name] = copy.deepcopy(fields[name])
 
+    replacement_requested = _video_edit_replacement_requested(data)
     facts_by_id = _reference_observations_by_id(document, data)
     candidates_by_id = _reference_subject_candidates_by_id(document, data)
     subject_bindings = _reference_subject_bindings(document, data)
@@ -2466,8 +2503,12 @@ def _complete_grounded_reference_semantics(document, proposal, data):
                 retention_value = {
                     "label": token,
                     "where": _text((retention or {}).get("where"), 2_000) or "throughout the video",
-                    "relationship": "fully_preserved",
-                    "detail": _subject_retention_text(binding),
+                    "relationship": "attribute_transfer" if replacement_requested else "fully_preserved",
+                    "detail": (
+                        f"{token}'s identity and appearance from {source_token} are transferred continuously from "
+                        "the first frame through the final frame; its static pose and held objects are not transferred."
+                        if replacement_requested else _subject_retention_text(binding)
+                    ),
                 }
                 if retention is None:
                     semantic["retention_analysis"].append(retention_value)
@@ -2573,6 +2614,8 @@ def _complete_grounded_reference_semantics(document, proposal, data):
         )
         if reference.get("kind") == "audio":
             relationship = "fully_copy" if "audio_copy" in roles else "reference"
+        elif replacement_requested and "subject" in roles and reference.get("kind") == "image":
+            relationship = "attribute_transfer"
         elif roles & {"style", "action", "pose", "camera"} and "subject" not in roles:
             relationship = "attribute_transfer"
         else:
@@ -2583,7 +2626,12 @@ def _complete_grounded_reference_semantics(document, proposal, data):
                     f"The complete anchored composition and appearance established by {source_token} are preserved."
                 )
             elif "subject" in roles and reference.get("kind") == "image":
-                retention_detail = f"{token}'s identity and appearance from {source_token} are preserved."
+                retention_detail = (
+                    f"{token}'s identity and appearance from {source_token} are transferred continuously from "
+                    "the first frame through the final frame; its static pose and held objects are not transferred."
+                    if replacement_requested else
+                    f"{token}'s identity and appearance from {source_token} are preserved."
+                )
             else:
                 retention_detail = facts or f"The assigned {role_description} remains consistent."
             retention = {
@@ -2600,6 +2648,9 @@ def _complete_grounded_reference_semantics(document, proposal, data):
                 retention["where"] = "throughout the video"
             if "subject" in roles and reference.get("kind") == "image":
                 retention["detail"] = (
+                    f"{token}'s identity and appearance from {source_token} are transferred continuously from "
+                    "the first frame through the final frame; its static pose and held objects are not transferred."
+                    if replacement_requested else
                     f"{token}'s identity and appearance from {source_token} are preserved."
                 )
             elif roles & {"first_frame", "last_frame"}:
@@ -2693,7 +2744,24 @@ def _complete_grounded_reference_semantics(document, proposal, data):
         if reference.get("kind") == "image"
         and set(reference.get("roles") or []) == {"subject"}
     ]
-    if subject_bindings and required_tokens and first_frame and subject_only_references:
+    video_edit_sources = [
+        reference for reference in document.get("references") or []
+        if reference.get("kind") == "video"
+        and "video_edit" in set(reference.get("roles") or [])
+    ]
+    if video_edit_sources:
+        video_token = _text(video_edit_sources[0].get("label"), 80)
+        semantic["summary"] = f"The target video is an edited version of {video_token}."
+        replacement_tokens = list(dict.fromkeys(binding["token"] for binding in subject_bindings))
+        if replacement_requested and replacement_tokens:
+            subjects = " and ".join(replacement_tokens)
+            semantic["summary"] += (
+                f" {subjects} continuously replace the corresponding source-video subjects from the first "
+                "frame through the final frame while inheriting all source-video motion and timing."
+            )
+        elif required_tokens:
+            semantic["summary"] += " The edit uses " + ", ".join(required_tokens) + "."
+    elif subject_bindings and required_tokens and first_frame and subject_only_references:
         semantic["summary"] = (
             "The target video develops from "
             f"{first_frame['label']} with {', '.join(required_tokens[1:])}; "
@@ -3479,6 +3547,13 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error="", draft_p
         if "private visual selector" in proposal_error.casefold()
         else ""
     )
+    subject_only_feedback = (
+        " Use the canonical <Subject N> label alone for the replacement identity and appearance; remove every "
+        "catalog of source-image clothing, gear, held objects, limb positions, and static pose from shot prose. "
+        "State that <Video N> supplies motion and pose continuously from the first frame through the final frame."
+        if "subject-only reference" in proposal_error.casefold()
+        else ""
+    )
     relationship_feedback = (
         " Set every retention_analysis relationship to one exact allowed value. Visual: fully_preserved, "
         "partially_preserved, attribute_transfer, or weak_reference. Audio: fully_copy, partially_copy, "
@@ -3581,7 +3656,8 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error="", draft_p
             "content": (
                 f"Correct the response now for the {scope_name}. The request explicitly requires document changes."
                 f"{validation_feedback}{timing_feedback}{reference_feedback}{selector_feedback}"
-                f"{relationship_feedback}{i2va_feedback}{steps_feedback}{completeness_feedback}{speaker_feedback}"
+                f"{subject_only_feedback}{relationship_feedback}{i2va_feedback}{steps_feedback}"
+                f"{completeness_feedback}{speaker_feedback}"
                 f"{structured_fields_feedback}{sound_feedback}{placeholder_feedback}{continuity_feedback}"
                 f"{literal_feedback} "
                 f"Return a brief answer followed by exactly one valid JSON change set between {CHANGESET_BEGIN} "
@@ -3953,9 +4029,17 @@ def _validate_requested_project_result(result_document, data):
             )
     if not re.search(r"\b(?:complete(?:ly)?|entire|full)\b", content, re.IGNORECASE):
         return
-    required_fields = () if _has_first_frame_anchor(result_document) else (
-        "composition", "subjects", "environment", "lighting"
+    has_video_edit_source = any(
+        reference.get("kind") == "video"
+        and "video_edit" in set(reference.get("roles") or [])
+        for reference in result_document.get("references") or []
     )
+    if _has_first_frame_anchor(result_document):
+        required_fields = ()
+    elif has_video_edit_source:
+        required_fields = ("composition", "subjects")
+    else:
+        required_fields = ("composition", "subjects", "environment", "lighting")
     incomplete_shots = []
     for shot in result_document["shots"]:
         missing = [name for name in required_fields if not _text(shot.get(name))]
@@ -4711,15 +4795,22 @@ def _validate_selected_shot_quality(result_document, data):
         )
 
 
-def _validate_subject_only_reference_prose(result_document, data):
-    if _explicit_subject_attribute_request(data):
+def _validate_subject_only_reference_prose(result_document, data, original_document=None):
+    video_edit_replacement = _video_edit_replacement_requested(data) and any(
+        reference.get("kind") == "video"
+        and "video_edit" in set(reference.get("roles") or [])
+        for reference in result_document.get("references") or []
+    )
+    if _explicit_subject_attribute_request(data) and not video_edit_replacement:
         return
     subject_only = [
         reference for reference in result_document.get("references") or []
         if reference.get("kind") == "image"
         and set(reference.get("roles") or []) == {"subject"}
     ]
-    if not subject_only or len(result_document.get("references") or []) != 1:
+    if not subject_only or (
+        not video_edit_replacement and len(result_document.get("references") or []) != 1
+    ):
         return
     source_tokens = {_text(item.get("label"), 80).casefold() for item in subject_only}
     appearance = re.compile(
@@ -4727,9 +4818,8 @@ def _validate_subject_only_reference_prose(result_document, data):
         r"trousers|pants|shorts|boots?|shoes?|necklace|earrings?|outfit|wardrobe|wearing)\b",
         re.IGNORECASE,
     )
-    offenders = []
-    for shot in result_document.get("shots") or []:
-        values = [
+    def prose_values(shot):
+        return [
             shot.get("composition"), shot.get("subjects"), shot.get("environment"),
             shot.get("lighting"), shot.get("notes"), (shot.get("camera") or {}).get("target"),
             *(
@@ -4738,8 +4828,29 @@ def _validate_subject_only_reference_prose(result_document, data):
                 if isinstance(step, dict) and step.get("type") == "action"
             ),
         ]
-        prose = "\n".join(_text(value) for value in values)
-        if any(token and token in prose.casefold() for token in source_tokens) or appearance.search(prose):
+
+    original_by_id = {
+        shot.get("id"): shot for shot in (original_document or {}).get("shots") or []
+    }
+    offenders = []
+    for shot in result_document.get("shots") or []:
+        original_values = [
+            _text(value) for value in prose_values(original_by_id.get(shot.get("id"), {}))
+        ]
+        introduced_violation = False
+        for value in prose_values(shot):
+            prose = _text(value)
+            if not (
+                any(token and token in prose.casefold() for token in source_tokens)
+                or appearance.search(prose)
+            ):
+                continue
+            if prose in original_values:
+                original_values.remove(prose)
+                continue
+            introduced_violation = True
+            break
+        if introduced_violation:
             offenders.append(shot.get("id") or "unnamed shot")
     if offenders:
         raise ValueError(
@@ -4881,7 +4992,7 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
             _validate_requested_exact_literals(preview["document"], request_data)
             _validate_complete_project_placeholders(preview["document"], request_data)
             _validate_selected_shot_quality(preview["document"], request_data)
-            _validate_subject_only_reference_prose(preview["document"], request_data)
+            _validate_subject_only_reference_prose(preview["document"], request_data, document)
             _validate_requested_step_order(preview["document"], request_data)
         if request_data and parsed["proposal"]["scope"]["type"] == "project":
             _validate_requested_project_result(preview["document"], request_data)

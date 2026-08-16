@@ -470,12 +470,21 @@ def _definition_lines(document):
     return lines
 
 
-def _retention_lines(document):
+def _retention_lines(document, replacement_tokens=()):
     lines = []
+    replacement_tokens = {token.casefold() for token in replacement_tokens}
     for item in document["retention_analysis"]:
         where = f" ({item['where']})" if item["where"] else ""
-        detail = f" - {item['detail']}" if item["detail"] else ""
-        lines.append(_canonical_tokens(f"{item['label']}{where}: {item['relationship']}{detail}"))
+        relationship = item["relationship"]
+        detail_text = item["detail"]
+        if _canonical_tokens(item["label"]).casefold() in replacement_tokens:
+            relationship = "attribute_transfer"
+            detail_text = (
+                "Identity and appearance transfer continuously from the first frame through the final frame; "
+                "the subject reference's static pose, held objects, and action do not transfer."
+            )
+        detail = f" - {detail_text}" if detail_text else ""
+        lines.append(_canonical_tokens(f"{item['label']}{where}: {relationship}{detail}"))
     return lines
 
 
@@ -528,11 +537,65 @@ def _first_frame_reference_scope(document):
     )
 
 
+def _video_edit_replacement_scope(document):
+    video_tokens = [
+        reference.get("label") or ""
+        for reference in document.get("references") or []
+        if reference.get("kind") == "video"
+        and "video_edit" in set(reference.get("roles") or [])
+    ]
+    if not video_tokens:
+        return "", [], ""
+    subject_sources = {
+        (reference.get("label") or "").casefold()
+        for reference in document.get("references") or []
+        if reference.get("kind") == "image"
+        and set(reference.get("roles") or []) == {"subject"}
+    }
+    subject_tokens = [
+        f"<{definition['label'].strip('<>')}>"
+        for definition in document.get("subject_definitions") or []
+        if str(definition.get("label") or "").casefold().startswith("subject")
+        and any(
+            source and source in str(definition.get("text") or "").casefold()
+            for source in subject_sources
+        )
+    ]
+    semantic_parts = [document.get("main_description"), document.get("summary")]
+    for shot in document.get("shots") or []:
+        semantic_parts.extend(shot.get(name) for name in ("composition", "subjects", "notes"))
+        semantic_parts.extend(
+            step.get("text")
+            for step in shot.get("steps") or []
+            if isinstance(step, dict) and step.get("type") == "action"
+        )
+    semantic_text = "\n".join(str(value or "") for value in semantic_parts)
+    replacement = re.search(
+        r"\b(?:replac(?:e|es|ed|ing|ement)|swap(?:s|ped|ping)?|substitut(?:e|es|ed|ing|ion))\b",
+        semantic_text,
+        re.IGNORECASE,
+    )
+    if not replacement or not subject_tokens:
+        return video_tokens[0], [], semantic_text
+    return video_tokens[0], list(dict.fromkeys(subject_tokens)), semantic_text
+
+
 def _compile_reference(document):
     definitions = "\n".join(_definition_lines(document))
     task_types = document["task_types"] or ["reference generation"]
-    summary = _canonical_tokens(f"[{' + '.join(task_types)}] {document['summary']}".rstrip())
-    retention = "\n".join(_retention_lines(document))
+    video_edit_token, replacement_tokens, replacement_semantics = _video_edit_replacement_scope(document)
+    summary_text = document["summary"]
+    if video_edit_token and not re.search(
+        r"\btarget video is an edited version of\b",
+        str(summary_text or ""),
+        re.IGNORECASE,
+    ):
+        summary_text = " ".join(filter(None, (
+            f"The target video is an edited version of {video_edit_token}.",
+            str(summary_text or "").strip(),
+        )))
+    summary = _canonical_tokens(f"[{' + '.join(task_types)}] {summary_text}".rstrip())
+    retention = "\n".join(_retention_lines(document, replacement_tokens))
     first_frame_token, reference_scope = _first_frame_reference_scope(document)
     external_style_tokens = []
     for reference in document.get("references") or []:
@@ -554,8 +617,48 @@ def _compile_reference(document):
             external_style_tokens
         ) + "."
         reference_scope = " ".join(part for part in (reference_scope, style_scope) if part)
-    shots = " ".join(
-        _shot_text(
+    shot_parts = []
+    for index, original_shot in enumerate(document["shots"]):
+        shot = original_shot
+        subject_continuity = ""
+        if replacement_tokens:
+            shot_blob = " ".join(str(value or "") for value in (
+                original_shot.get("composition"), original_shot.get("subjects"),
+                original_shot.get("notes"),
+                *(step.get("text") for step in original_shot.get("steps") or [] if isinstance(step, dict)),
+            ))
+            active_tokens = [
+                token for token in replacement_tokens
+                if token.casefold() in shot_blob.casefold()
+            ] or (replacement_tokens if len(document["shots"]) == 1 else [])
+            if active_tokens:
+                subjects = " and ".join(active_tokens)
+                verb = "replaces" if len(active_tokens) == 1 else "replace"
+                shot = dict(original_shot)
+                shot["subjects"] = (
+                    f"From the first visible frame through the final frame, {subjects} {verb} only the "
+                    f"corresponding source-video subject's identity and appearance in {video_edit_token}; "
+                    "source-video screen position, scale, occlusion, props, and object contact remain unchanged."
+                )
+                subject_continuity = (
+                    f"Throughout the complete shot from its first frame onward, {video_edit_token} supplies every "
+                    f"body motion, pose change, gesture, locomotion path, and timing for {subjects}; the subject "
+                    "reference supplies no action or static pose."
+                )
+                camera = original_shot.get("camera") or {}
+                if (
+                    camera.get("type") == "Static Shot"
+                    and camera.get("amplitude") in {None, "", "default"}
+                    and camera.get("speed") in {None, "", "default"}
+                    and not camera.get("target")
+                    and re.search(
+                        r"\bcamera\b.{0,80}\b(?:preserv|unchang|same|identical|exact)",
+                        replacement_semantics,
+                        re.IGNORECASE,
+                    )
+                ):
+                    shot["camera"] = {}
+        shot_parts.append(_shot_text(
             shot,
             index,
             first_frame_lock=bool(index == 0 and any(
@@ -566,9 +669,9 @@ def _compile_reference(document):
             reference_scope=reference_scope if index == 0 else "",
             first_frame_preserve_style=not external_style_tokens,
             suppress_audio=document["complete_silence"],
-        )
-        for index, shot in enumerate(document["shots"])
-    )
+            subject_continuity=subject_continuity,
+        ))
+    shots = " ".join(shot_parts)
     has_first_frame = any(
         "first_frame" in reference.get("roles", [])
         for reference in document.get("references") or []

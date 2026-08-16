@@ -421,7 +421,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-media-library-settings textarea { min-height: 70px; }
 .psvstudio-media-library-actions { display: flex; justify-content: flex-end; padding-top: 1px; }
 
-.psvstudio-shot-editor-dialog { width: min(1180px, calc(100vw - 28px)); height: min(860px, calc(100vh - 28px)); padding: 0; overflow: hidden; color: var(--psv-text); background: #11131b; border: 1px solid var(--psv-border-strong); border-radius: 16px; box-shadow: 0 28px 90px rgba(0, 0, 0, .68); }
+.psvstudio-shot-editor-dialog { width: min(1180px, calc(100vw - 28px)); height: min(860px, calc(100vh - 28px)); height: min(860px, calc(100dvh - 28px)); max-height: calc(100vh - 28px); max-height: calc(100dvh - 28px); padding: 0; overflow: hidden; color: var(--psv-text); background: #11131b; border: 1px solid var(--psv-border-strong); border-radius: 16px; box-shadow: 0 28px 90px rgba(0, 0, 0, .68); }
 .psvstudio-shot-editor-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .psvstudio-shot-editor-dialog::backdrop { background: rgba(0, 0, 0, .78); backdrop-filter: blur(3px); }
 .psvstudio-shot-editor-header, .psvstudio-shot-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: rgba(22, 24, 35, .97); }
@@ -432,13 +432,14 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-shot-editor-heading h2 { font-size: 15px; }
 .psvstudio-shot-editor-heading small, .psvstudio-shot-sequence-header small { color: var(--psv-muted); font-size: 10px; }
 .psvstudio-shot-editor-workspace { min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(270px, 340px) minmax(0, 1fr); }
-.psvstudio-shot-editor-setup { min-height: 0; display: grid; align-content: start; gap: 8px; overflow: auto; padding: 12px; background: rgba(8, 9, 14, .45); border-right: 1px solid var(--psv-border); scrollbar-width: thin; }
-.psvstudio-shot-sequence { min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
-.psvstudio-shot-sequence-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; border-bottom: 1px solid var(--psv-border); }
+.psvstudio-shot-editor-setup { min-height: 0; display: grid; grid-auto-rows: max-content; align-content: start; gap: 8px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 12px; background: rgba(8, 9, 14, .45); border-right: 1px solid var(--psv-border); scrollbar-color: rgba(150, 134, 218, .62) rgba(255, 255, 255, .025); scrollbar-gutter: stable; scrollbar-width: thin; touch-action: pan-y; }
+.psvstudio-shot-editor-setup .psvstudio-inspector-section-body { max-height: clamp(220px, 46vh, 520px); overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: rgba(150, 134, 218, .55) transparent; scrollbar-gutter: stable; scrollbar-width: thin; touch-action: pan-y; }
+.psvstudio-shot-sequence { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto max-content; align-content: start; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: rgba(150, 134, 218, .62) rgba(255, 255, 255, .025); scrollbar-gutter: stable; scrollbar-width: thin; touch-action: pan-y; }
+.psvstudio-shot-sequence-header { position: sticky; z-index: 2; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: #11131b; border-bottom: 1px solid var(--psv-border); }
 .psvstudio-shot-sequence-header > div:first-child { display: grid; gap: 3px; }
 .psvstudio-shot-sequence-header > .psvstudio-inline { justify-content: flex-end; flex-wrap: wrap; }
 .psvstudio-shot-sequence-header h3 { font-size: 14px; }
-.psvstudio-step-list { min-height: 0; flex: 1 1 0; display: grid; align-content: start; gap: 10px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 14px; outline: 0; scrollbar-color: rgba(150, 134, 218, .62) rgba(255, 255, 255, .025); scrollbar-gutter: stable; scrollbar-width: thin; touch-action: pan-y; }
+.psvstudio-step-list { min-width: 0; display: grid; align-content: start; gap: 10px; overflow: visible; padding: 14px; outline: 0; }
 .psvstudio-step-list:focus-visible { box-shadow: inset 0 0 0 2px rgba(141, 115, 255, .45); }
 .psvstudio-step-card { overflow: hidden; background: var(--psv-panel); border: 1px solid var(--psv-border); border-radius: 12px; }
 .psvstudio-step-card.is-action { border-left: 3px solid #7397e8; }
@@ -589,9 +590,10 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
   .psvstudio-director-reference-card { min-width: 210px; }
   .psvstudio-director-message { max-width: 96%; }
   .psvstudio-director-settings-grid { grid-template-columns: 1fr; }
-  .psvstudio-shot-editor-dialog { width: 100vw; height: 100vh; max-width: none; max-height: none; border: 0; border-radius: 0; }
+  .psvstudio-shot-editor-dialog { width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none; border: 0; border-radius: 0; }
   .psvstudio-shot-editor-workspace { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
   .psvstudio-shot-editor-setup { max-height: 38vh; border-right: 0; border-bottom: 1px solid var(--psv-border); }
+  .psvstudio-shot-editor-setup .psvstudio-inspector-section-body { max-height: 30vh; }
   .psvstudio-shot-sequence-header, .psvstudio-shot-editor-footer { align-items: stretch; flex-direction: column; }
   .psvstudio-shot-editor-footer > .psvstudio-inline { justify-content: flex-end; flex-wrap: wrap; }
   .psvstudio-step-header { grid-template-columns: auto minmax(0, 1fr); }
