@@ -12,8 +12,8 @@ const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
 const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
 const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
-const LLM_STATUS_ENDPOINT = "/promptstudio-video/llm/status";
-const KOBOLD_ABORT_ENDPOINT = "/promptstudio-video/kobold/abort";
+const LLM_STATUS_ENDPOINT = "/promptstudio/prompt-studio/llm/status";
+const LLM_ABORT_ENDPOINT = "/promptstudio-video/llm/abort";
 const COMFY_RESTART_ENDPOINT = "/manager/reboot";
 const DIRECTOR_JOB_POLL_MS = 1000;
 const DIRECTOR_STATUS_RETRY_LIMIT = 3;
@@ -23,6 +23,7 @@ const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
 const VIDEO_STUDIO_SETTINGS_KEY = "promptstudio.video.studio.settings.v1";
 const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
 const IMAGE_CONSULT_SETTINGS_KEY = "promptstudio.promptStudio.consult.settings.v1";
+const IMAGE_LLM_PROFILES_KEY = "promptstudio.promptStudio.llmProfiles.v1";
 const CANVAS_MEDIA_ROLES = new Set(["first_frame", "last_frame", "video_edit", "video_continue"]);
 const DIRECTOR_MAX_IMAGES = 4;
 const DIRECTOR_IMAGE_USAGES = Object.freeze([
@@ -219,6 +220,13 @@ function storedObject(key) {
   }
 }
 
+function primaryLlmProfile(studioSettings) {
+  const store = storedObject(IMAGE_LLM_PROFILES_KEY);
+  const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+  const selected = String(studioSettings?.llm_profile || "");
+  return profiles.find(profile => String(profile?.id || "") === selected) || {};
+}
+
 function videoStudioSettings() {
   const stored = storedObject(VIDEO_STUDIO_SETTINGS_KEY);
   return {
@@ -250,25 +258,44 @@ function directorSettings() {
   const studio = storedObject(IMAGE_STUDIO_SETTINGS_KEY);
   const consult = storedObject(IMAGE_CONSULT_SETTINGS_KEY);
   const video = storedObject(DIRECTOR_SETTINGS_KEY);
+  const profile = primaryLlmProfile(studio);
+  const thinkingMode = profile.thinking_mode || studio.thinking_mode || video.thinking_mode || consult.thinking_mode || "Disabled";
+  const thinkingEnabled = thinkingModeEnablesReasoning(thinkingMode);
+  const profileValue = (standardKey, thinkingKey, fallback) => Number(
+    (thinkingEnabled ? profile[thinkingKey] : profile[standardKey])
+      ?? profile[standardKey]
+      ?? video[standardKey]
+      ?? consult[standardKey]
+      ?? fallback,
+  );
   const storedResponseTokens = Number(video.max_response_tokens);
   const storedTimeout = Number(video.request_timeout);
   const responseTokens = !Object.hasOwn(video, "max_response_tokens") || storedResponseTokens === 700
     ? 0
     : Math.max(0, Math.min(131072, Number.isFinite(storedResponseTokens) ? storedResponseTokens : 0));
   return {
-    llm_provider: video.llm_provider || studio.llm_provider || "koboldcpp",
-    kobold_url: video.kobold_url || studio.kobold_url || "http://localhost:5001",
-    ollama_url: video.ollama_url || studio.ollama_url || "http://localhost:11434",
-    ollama_model: video.ollama_model || studio.ollama_model || "",
-    thinking_mode: video.thinking_mode || consult.thinking_mode || "Disabled",
+    llm_provider: normalizeLlmProvider(studio.llm_provider || video.llm_provider || "koboldcpp"),
+    kobold_url: studio.kobold_url || video.kobold_url || "http://localhost:5001",
+    ollama_url: studio.ollama_url || video.ollama_url || "http://localhost:11434",
+    ollama_model: studio.ollama_model || video.ollama_model || "",
+    llamacpp_url: studio.llamacpp_url || "http://localhost:8080",
+    llamacpp_model: studio.llamacpp_model || "",
+    llamacpp_executable: studio.llamacpp_executable || "",
+    llamacpp_config_profile: studio.llamacpp_config_profile || "",
+    llamacpp_reasoning_budget_tokens: Math.max(0, Math.min(
+      262144,
+      Number(profile.llamacpp_reasoning_budget_tokens ?? studio.llamacpp_reasoning_budget_tokens ?? 0),
+    )),
+    thinking_mode: thinkingMode,
     max_response_tokens: responseTokens,
     context_budget_chars: Math.max(4000, Math.min(32000, Number(video.context_budget_chars || 8000))),
-    temperature: Number(video.temperature ?? consult.temperature ?? 0.7),
-    top_p: Number(video.top_p ?? consult.top_p ?? 0.9),
-    top_k: Number(video.top_k ?? consult.top_k ?? 100),
-    min_p: Number(video.min_p ?? consult.min_p ?? 0),
-    rep_pen: Number(video.rep_pen ?? consult.rep_pen ?? 1.05),
-    rep_pen_range: Number(video.rep_pen_range ?? consult.rep_pen_range ?? 360),
+    temperature: profileValue("temperature", "thinking_temperature", 0.7),
+    top_p: profileValue("top_p", "thinking_top_p", 0.9),
+    top_k: profileValue("top_k", "thinking_top_k", 100),
+    min_p: profileValue("min_p", "thinking_min_p", 0),
+    presence_penalty: profileValue("presence_penalty", "thinking_presence_penalty", 0),
+    rep_pen: profileValue("rep_pen", "thinking_rep_pen", 1.05),
+    rep_pen_range: profileValue("rep_pen_range", "thinking_rep_pen_range", 360),
     sampler_seed: Number(video.sampler_seed ?? consult.sampler_seed ?? -1),
     request_timeout: !Object.hasOwn(video, "request_timeout") || storedTimeout === 120
       ? 600
@@ -280,22 +307,55 @@ function directorControlValue(dialog, id) {
   return dialog?.querySelector(`#${id}`)?.value;
 }
 
+function normalizeLlmProvider(value) {
+  const provider = String(value || "").trim().toLowerCase();
+  return ["koboldcpp", "ollama", "llamacpp"].includes(provider) ? provider : "koboldcpp";
+}
+
+function llmProviderDisplayName(provider) {
+  return { koboldcpp: "KoboldCpp", ollama: "Ollama", llamacpp: "Llama.cpp" }[
+    normalizeLlmProvider(provider)
+  ];
+}
+
+function thinkingModeEnablesReasoning(mode) {
+  return !["disabled", "none"].includes(String(mode || "").trim().toLowerCase());
+}
+
+function llmActivityLabel(status = {}, thinkingEnabled = false) {
+  if (status.generation_phase === "thinking") return "Thinking";
+  if (status.generation_phase === "generating") return "Generating";
+  if (status.generation_phase === "thinking_or_generating" || thinkingEnabled) return "Thinking / generating";
+  return "Generating";
+}
+
+function llmGeneratedTokenCount(status = {}) {
+  if (status.generated_tokens == null || status.generated_tokens === "") return null;
+  const tokens = Number(status.generated_tokens);
+  return Number.isFinite(tokens) && tokens >= 0 ? Math.trunc(tokens) : null;
+}
+
 function saveDirectorSettings(dialog = state.directorDialog) {
   if (!dialog) return directorSettings();
+  const shared = directorSettings();
   const settings = {
-    llm_provider: directorControlValue(dialog, "psvstudio-director-provider") || "koboldcpp",
-    kobold_url: directorControlValue(dialog, "psvstudio-director-kobold-url") || "http://localhost:5001",
-    ollama_url: directorControlValue(dialog, "psvstudio-director-ollama-url") || "http://localhost:11434",
-    ollama_model: directorControlValue(dialog, "psvstudio-director-ollama-model") || "",
-    thinking_mode: directorControlValue(dialog, "psvstudio-director-thinking") || "Disabled",
+    llm_provider: shared.llm_provider,
+    kobold_url: shared.kobold_url,
+    ollama_url: shared.ollama_url,
+    ollama_model: shared.ollama_model,
+    llamacpp_url: shared.llamacpp_url,
+    llamacpp_model: shared.llamacpp_model,
+    llamacpp_reasoning_budget_tokens: shared.llamacpp_reasoning_budget_tokens,
+    thinking_mode: shared.thinking_mode,
     max_response_tokens: Math.max(0, Math.min(131072, Number(directorControlValue(dialog, "psvstudio-director-max-tokens") || 0))),
     context_budget_chars: Number(directorControlValue(dialog, "psvstudio-director-context-budget") || 8000),
-    temperature: 0.7,
-    top_p: 0.9,
-    top_k: 100,
-    min_p: 0,
-    rep_pen: 1.05,
-    rep_pen_range: 360,
+    temperature: shared.temperature,
+    top_p: shared.top_p,
+    top_k: shared.top_k,
+    min_p: shared.min_p,
+    presence_penalty: shared.presence_penalty,
+    rep_pen: shared.rep_pen,
+    rep_pen_range: shared.rep_pen_range,
     sampler_seed: -1,
     request_timeout: Math.max(5, Math.min(3600, Number(directorControlValue(dialog, "psvstudio-director-timeout") || 600))),
   };
@@ -319,9 +379,10 @@ function renderSystemStatusSummary() {
   if (!control || !label || !comfyDetail || !restart) return;
 
   const llm = state.llmStatusSnapshot;
-  const provider = llm?.provider === "ollama" ? "ollama" : directorSettings().llm_provider;
+  const provider = normalizeLlmProvider(llm?.provider || directorSettings().llm_provider);
   const llmUnhealthy = llm?.reachable === false
-    || (provider === "ollama" && llm?.reachable === true && (!llm.model || llm.model_installed === false));
+    || (["ollama", "llamacpp"].includes(provider)
+      && llm?.reachable === true && (!llm.model || llm.model_installed === false));
   const checking = !llm || llm.checking === true;
   const comfyProcessing = comfyUiIsProcessing();
   const processing = checking
@@ -358,7 +419,7 @@ function renderSystemStatusSummary() {
   restart.textContent = state.comfyRestartBusy ? "Restarting…" : "Restart ComfyUI";
 }
 
-function renderKoboldStatus(status = {}) {
+function renderLlmStatus(status = {}) {
   const control = state.panel?.querySelector("#psvstudio-kobold-control");
   const label = control?.querySelector("#psvstudio-kobold-status-label");
   const detail = control?.querySelector("#psvstudio-kobold-status-detail");
@@ -368,16 +429,22 @@ function renderKoboldStatus(status = {}) {
   const stop = control?.querySelector("#psvstudio-kobold-stop");
   const stopHelp = control?.querySelector("#psvstudio-kobold-stop-help");
   if (!control || !label || !detail || !model || !vision || !heading || !stop || !stopHelp) return;
-  const provider = status.provider === "ollama" ? "ollama" : directorSettings().llm_provider;
+  const provider = normalizeLlmProvider(status.provider || directorSettings().llm_provider);
   const isOllama = provider === "ollama";
-  const providerName = isOllama ? "Ollama" : "KoboldCpp";
+  const isLlamacpp = provider === "llamacpp";
+  const providerName = llmProviderDisplayName(provider);
   const reachable = status.reachable === true;
   const busy = !isOllama && reachable && status.busy === true;
   state.llmStatusSnapshot = { ...status, provider };
+  control.dataset.provider = provider;
   heading.textContent = providerName;
   const characters = Number(status.generated_characters);
+  const generatedTokens = llmGeneratedTokenCount(status);
+  const activity = llmActivityLabel(status, thinkingModeEnablesReasoning(directorSettings().thinking_mode));
   detail.textContent = status.message || (busy
-    ? `Generation active${Number.isFinite(characters) && characters > 0 ? ` · ${characters.toLocaleString()} characters` : ""}`
+    ? `${activity}${generatedTokens != null
+      ? ` · ${generatedTokens.toLocaleString()} tokens`
+      : (Number.isFinite(characters) && characters > 0 ? ` · ${characters.toLocaleString()} characters` : "")}`
     : (reachable ? "Ready for local requests." : `${providerName} could not be reached.`));
   const modelName = typeof status.model === "string" ? status.model.trim() : "";
   model.textContent = modelName || (reachable ? "Unavailable" : "—");
@@ -387,7 +454,10 @@ function renderKoboldStatus(status = {}) {
   stop.hidden = isOllama;
   stopHelp.hidden = isOllama;
   stop.disabled = !busy || state.koboldAbortBusy;
-  stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Stop generation";
+  stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Force stop generation";
+  stopHelp.textContent = isLlamacpp
+    ? "Stops Video Studio text streams only. Manage the Llama.cpp server in Prompt Studio settings."
+    : "Stops text generation only. KoboldCpp stays loaded.";
   renderSystemStatusSummary();
 }
 
@@ -395,7 +465,9 @@ async function refreshKoboldStatus() {
   if (state.koboldStatusRequest) return state.koboldStatusRequest;
   const settings = directorSettings();
   const control = state.panel?.querySelector("#psvstudio-kobold-control");
-  if (!control || control.dataset.state === "checking") renderKoboldStatus({ checking: true });
+  if (!control || control.dataset.provider !== settings.llm_provider || control.dataset.state === "checking") {
+    renderLlmStatus({ provider: settings.llm_provider, checking: true });
+  }
   state.koboldStatusRequest = (async () => {
     try {
       const response = await api.fetchApi(LLM_STATUS_ENDPOINT, {
@@ -404,11 +476,11 @@ async function refreshKoboldStatus() {
         body: JSON.stringify(settings),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `${settings.llm_provider === "ollama" ? "Ollama" : "KoboldCpp"} status failed (${response.status}).`);
-      renderKoboldStatus(data);
+      if (!response.ok) throw new Error(data.error || `${llmProviderDisplayName(settings.llm_provider)} status failed (${response.status}).`);
+      renderLlmStatus(data);
       return data;
     } catch (error) {
-      renderKoboldStatus({ reachable: false, message: error.message || String(error) });
+      renderLlmStatus({ provider: settings.llm_provider, reachable: false, message: error.message || String(error) });
       return null;
     } finally {
       state.koboldStatusRequest = null;
@@ -417,25 +489,30 @@ async function refreshKoboldStatus() {
   return state.koboldStatusRequest;
 }
 
-async function stopKoboldGeneration() {
-  if (state.koboldAbortBusy) return;
+async function stopLlmGeneration() {
+  const settings = directorSettings();
+  const provider = normalizeLlmProvider(settings.llm_provider);
+  if (!["koboldcpp", "llamacpp"].includes(provider) || state.koboldAbortBusy) return;
   state.koboldAbortBusy = true;
-  renderKoboldStatus({ reachable: true, busy: true, message: "Sending stop signal…" });
+  renderLlmStatus({ provider, reachable: true, busy: true, message: "Sending force-stop signal…" });
   try {
-    const response = await api.fetchApi(KOBOLD_ABORT_ENDPOINT, {
+    const response = await api.fetchApi(LLM_ABORT_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kobold_url: directorSettings().kobold_url }),
+      body: JSON.stringify(settings),
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `KoboldCpp stop failed (${response.status}).`);
-    renderKoboldStatus({
+    if (!response.ok) throw new Error(data.error || `${llmProviderDisplayName(provider)} stop failed (${response.status}).`);
+    renderLlmStatus({
+      provider,
       reachable: true,
       busy: data.success !== true,
-      message: data.success ? "Stop signal accepted." : "KoboldCpp reported no abortable generation.",
+      message: data.success
+        ? "Stop signal accepted."
+        : `${llmProviderDisplayName(provider)} reported no Video Studio generation to stop.`,
     });
   } catch (error) {
-    renderKoboldStatus({ reachable: false, message: error.message || String(error) });
+    renderLlmStatus({ provider, reachable: false, message: error.message || String(error) });
   } finally {
     state.koboldAbortBusy = false;
     window.setTimeout(refreshKoboldStatus, 500);
@@ -1144,20 +1221,19 @@ function ensureDirectorDialog() {
     </div>
     </div>
     <details class="psvstudio-director-settings"><summary>Local LLM and context settings</summary><div class="psvstudio-director-settings-grid">
-      <label><span>Provider</span><select id="psvstudio-director-provider"><option value="koboldcpp">KoboldCpp</option><option value="ollama">Ollama</option></select></label>
-      <label><span>Thinking</span><select id="psvstudio-director-thinking">${["Disabled", "Minimal", "Low", "Medium", "High"].map(value => `<option value="${value}">${value}</option>`).join("")}</select></label>
-      <label><span>KoboldCpp URL</span><input id="psvstudio-director-kobold-url" /></label>
-      <label><span>Ollama URL</span><input id="psvstudio-director-ollama-url" /></label>
-      <label><span>Ollama model</span><input id="psvstudio-director-ollama-model" placeholder="model:tag" /></label>
+      <div class="psvstudio-director-shared-llm"><span>Shared Prompt Studio LLM</span><strong id="psvstudio-director-shared-llm"></strong><small>Provider, endpoint, model, profile, thinking, and samplers are managed in the primary Prompt Studio settings.</small></div>
       <label><span>Response tokens · 0 = full available context</span><input id="psvstudio-director-max-tokens" type="number" min="0" max="131072" step="128" /></label>
       <label><span>Context characters</span><input id="psvstudio-director-context-budget" type="number" min="4000" max="32000" step="1000" /></label>
       <label><span>Request timeout seconds</span><input id="psvstudio-director-timeout" type="number" min="5" max="3600" step="30" /></label>
-    </div><small>Approved document state plus at most ten recent messages are sent. Older conversation stays stored locally.</small></details>`;
-  dialog.querySelector("#psvstudio-director-provider").value = settings.llm_provider;
-  dialog.querySelector("#psvstudio-director-thinking").value = settings.thinking_mode;
-  dialog.querySelector("#psvstudio-director-kobold-url").value = settings.kobold_url;
-  dialog.querySelector("#psvstudio-director-ollama-url").value = settings.ollama_url;
-  dialog.querySelector("#psvstudio-director-ollama-model").value = settings.ollama_model;
+    </div><small>Llama.cpp endpoint, model, reasoning cap, and server management come from the primary Prompt Studio settings. Approved document state plus at most ten recent messages are sent.</small></details>`;
+  const sharedModel = settings.llm_provider === "ollama"
+    ? settings.ollama_model
+    : (settings.llm_provider === "llamacpp" ? settings.llamacpp_model : "active model");
+  dialog.querySelector("#psvstudio-director-shared-llm").textContent = [
+    llmProviderDisplayName(settings.llm_provider),
+    sharedModel,
+    settings.thinking_mode,
+  ].filter(Boolean).join(" · ");
   dialog.querySelector("#psvstudio-director-max-tokens").value = String(settings.max_response_tokens);
   dialog.querySelector("#psvstudio-director-context-budget").value = String(settings.context_budget_chars);
   dialog.querySelector("#psvstudio-director-timeout").value = String(settings.request_timeout);
@@ -1307,20 +1383,29 @@ function directorJobStatusText(job) {
       ? `Grounding complete for ${groundedImages} image${groundedImages === 1 ? "" : "s"} · `
       : "";
     const characters = Number(provider.generated_characters);
+    const tokens = llmGeneratedTokenCount(provider);
+    const activity = llmActivityLabel(provider, thinkingModeEnablesReasoning(directorSettings().thinking_mode));
+    if (provider.busy && tokens != null) {
+      return `${prefix}${activity} · ${tokens.toLocaleString()} tokens received…`;
+    }
     if (provider.busy && Number.isFinite(characters) && characters > 0) {
-      return `${prefix}Director is generating · ${characters.toLocaleString()} characters received…`;
+      return `${prefix}${activity} · ${characters.toLocaleString()} characters received…`;
     }
     return `${prefix}Director is generating the response…`;
   }
-  if (provider.provider !== "koboldcpp") return "The local Director is still working…";
-  if (provider.reachable === false) return "Director is running; KoboldCpp status is temporarily unavailable…";
+  const providerName = llmProviderDisplayName(provider.provider || directorSettings().llm_provider);
+  if (provider.provider === "ollama") return "The local Director is still working…";
+  if (provider.reachable === false) return `Director is running; ${providerName} status is temporarily unavailable…`;
   if (provider.busy) {
+    const tokens = llmGeneratedTokenCount(provider);
+    const activity = llmActivityLabel(provider, thinkingModeEnablesReasoning(directorSettings().thinking_mode));
+    if (tokens != null) return `${providerName} · ${activity.toLowerCase()} · ${tokens.toLocaleString()} tokens received…`;
     const characters = Number(provider.generated_characters);
     return Number.isFinite(characters) && characters > 0
-      ? `KoboldCpp is still generating · ${characters.toLocaleString()} characters received…`
-      : "KoboldCpp is still processing the prompt…";
+      ? `${providerName} is still generating · ${characters.toLocaleString()} characters received…`
+      : `${providerName} is still processing the prompt…`;
   }
-  return "Director is validating KoboldCpp's response…";
+  return `Director is validating ${providerName}'s response…`;
 }
 
 async function pollDirectorJob(jobId, sessionId) {
@@ -5381,7 +5466,7 @@ function buildPanel() {
   panel.querySelector("#psvstudio-optimize-prompt-generation").addEventListener("change", event => {
     saveVideoStudioSettings(event.target.checked);
   });
-  panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopKoboldGeneration);
+  panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopLlmGeneration);
   panel.querySelector("#psvstudio-comfy-restart").addEventListener("click", restartComfyUIFromStatus);
   panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
     const project = activeProject();

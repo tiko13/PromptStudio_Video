@@ -5,9 +5,13 @@ It is normally installed at:
 
 `C:\EasyDiffusion\ComfyUI\custom_nodes\PromptStudio_Video`
 
-Keep video-specific nodes, prompt contracts, workflows, routes, and frontend code
-in this repository. The image-oriented `ComfyUI_PromptStudio` repository should
-only receive capability detection, settings, and navigation integration.
+## Unified Prompt Studio product scope
+
+- Treat this repository and the sibling `ComfyUI_PromptStudio` repository as one product and one implementation scope, even though they are technically separate Git repositories.
+- For every feature, fix, provider, endpoint, settings change, or contract change, check both repositories. When a Prompt Studio change applies to Video Studio, implement and verify the required Video Studio integration in the same task; do not leave Video Studio with an accidental capability gap.
+- `PromptStudio_Video` depends on `ComfyUI_PromptStudio`. Prefer implementing non-video-specific capabilities once in Prompt Studio, then consume them here. In particular, reuse shared provider/LLM endpoint handling, settings, services, utilities, and contracts rather than creating a second implementation.
+- Keep video-specific nodes, prompt logic, workflows, routes, UI, and adapters in this repository. Add only the thin integration needed to expose shared Prompt Studio capabilities to Video Studio.
+- A change is complete only after checking both repositories for compatibility, integration, and relevant tests. Do not search, edit, initialize, stage, or commit the parent ComfyUI checkout unless the user explicitly requests parent-runtime work.
 
 ## Runtime boundaries
 

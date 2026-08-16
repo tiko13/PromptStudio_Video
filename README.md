@@ -62,6 +62,8 @@ This repository is under active development. The sections below cover requiremen
 
 ## Requirements
 
+- The companion `ComfyUI_PromptStudio` repository, which owns shared local-LLM
+  settings and Llama.cpp server management.
 - A current ComfyUI build containing the native MiniMax H3 and video nodes.
 - MiniMax H3 model, text encoder, and VAE files.
 - KJNodes is recommended for the optimized workflow path. It is not imported by
@@ -93,7 +95,7 @@ The current vertical slice contains:
 - dependency-free native H3 audiovisual motion-context continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
-- context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp or Ollama, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
+- context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp, Ollama, or Llama.cpp, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
 - a versioned capability and document API for Prompt Studio integration.
 
 ## Director document
@@ -162,9 +164,11 @@ neighbors, and its proposals can update descriptive fields, sound, camera, and
 append newly requested dialogue on that selected shot.
 
 Both buttons open the local LLM consultation panel with separate conversation
-histories. Connection settings default to the companion
-image Prompt Studio settings when available, but Video owns its KoboldCpp and
-Ollama clients and works without importing the image plugin.
+histories. Prompt Studio is the source of truth for local-provider endpoints,
+selected Ollama/Llama.cpp models, Llama.cpp reasoning caps, fixed-folder config-profile
+selection, and managed-server configuration. Video Studio reuses those saved settings and the primary
+Prompt Studio status/model-management APIs while keeping only its Director
+message/context assembly and a thin adapter to those shared services here.
 
 Advice-only turns keep the normal conversational sampling temperature. Edit
 requests that require a structured proposal cap temperature at `0.2` so camera
@@ -184,24 +188,28 @@ large production does not fit. KoboldCpp's reported token count and context
 length further cap the response when available. Chat history is retained
 locally but approved document state is the authoritative long-term memory.
 
-The response-token setting defaults to `0` (automatic). KoboldCpp uses all
-context tokens remaining after the prompt and safety margin; Ollama uses its
-fill-context generation mode. A positive value remains available when a hard
-output ceiling is desired. The former stored `700`-token default migrates to
-automatic mode.
+The response-token setting defaults to `0` (automatic). KoboldCpp uses the
+remaining context up to its Director safety cap, Ollama uses fill-context
+generation, and Llama.cpp uses the available server context while keeping
+private reasoning separate from the final answer. A positive value remains
+available when a hard final-answer allowance is desired. Llama.cpp also reuses
+the reasoning cap configured in Prompt Studio's active LLM profile.
 
 Director requests run as background jobs so the browser does not mistake a
-long generation for a failed HTTP request. While KoboldCpp is active, Video
-Studio polls its supported generation-check endpoint and reports whether it is
-processing the prompt or how many response characters are available. The
-request timeout defaults to 600 seconds and can be adjusted in Director
+long generation for a failed HTTP request. Through Prompt Studio's shared
+provider service, Video Studio reports live token progress when the selected
+provider exposes it: KoboldCpp output is counted through its token endpoint,
+while Llama.cpp reads active decoded-token counts from `/slots` and
+distinguishes thinking from final generation when possible.
+The request timeout defaults to 600 seconds and can be adjusted in Director
 settings.
 
-The compact toolbar status icon covers the selected local LLM (KoboldCpp or
-Ollama) and ComfyUI. Green means all services are ready, orange means work is
-being processed, and red means a service needs attention. Its panel retains
-KoboldCpp's supported abort action when KoboldCpp is selected and includes a
-ComfyUI restart action when ComfyUI Manager is available.
+The compact toolbar status icon covers the selected local LLM and ComfyUI.
+Green means all services are ready, orange means work is being processed, and
+red means a service needs attention. KoboldCpp generations can be aborted via
+its API; Llama.cpp cancellation closes Video Studio's active streams without
+stopping the server. Start/stop/restart, file browsing, config building, and
+model selection remain in the primary Prompt Studio UI.
 
 Existing dialogue, visible text, and references remain protected in both
 scopes. The Director may append newly requested dialogue but cannot rewrite or
@@ -238,8 +246,9 @@ Grounded attributes remain private unless the user explicitly requests an
 appearance detail or change; they are never pasted automatically into the
 compiled prompt. Older turns retain compact metadata and the Director's
 textual answer, avoiding repeated vision tokens. KoboldCpp requires an active
-vision model with MMProj and Jinja; Ollama must report the `vision` capability
-for the selected model.
+vision model with MMProj and Jinja; Ollama must report the `vision` capability;
+Llama.cpp must advertise `modalities.vision` from `/props` for the selected
+model and be started with the matching MMProj file.
 
 The compiler follows MiniMax's official guides:
 

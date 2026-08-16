@@ -87,6 +87,25 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("container.append(row, turboIndicator)", self.source)
         self.assertIn(".psvstudio-turbo-profile {", self.styles)
 
+    def test_llamacpp_piggybacks_primary_settings_and_management(self):
+        self.assertIn('const LLM_STATUS_ENDPOINT = "/promptstudio/prompt-studio/llm/status"', self.source)
+        self.assertIn('const IMAGE_LLM_PROFILES_KEY = "promptstudio.promptStudio.llmProfiles.v1"', self.source)
+        self.assertIn("studio.llamacpp_url", self.source)
+        self.assertIn("studio.llamacpp_model", self.source)
+        self.assertIn("studio.llamacpp_config_profile", self.source)
+        self.assertIn("profile.llamacpp_reasoning_budget_tokens", self.source)
+        self.assertIn("Shared Prompt Studio LLM", self.source)
+        self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)
+        self.assertNotIn("/promptstudio-video/llamacpp/config-builder", self.routes)
+
+    def test_director_progress_prefers_live_token_counts(self):
+        start = self.source.index("function directorJobStatusText")
+        end = self.source.index("async function pollDirectorJob", start)
+        progress = self.source[start:end]
+        self.assertIn("llmGeneratedTokenCount(provider)", progress)
+        self.assertIn("tokens received", progress)
+        self.assertIn("llmActivityLabel", progress)
+
 
 if __name__ == "__main__":
     unittest.main()

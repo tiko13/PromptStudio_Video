@@ -1,161 +1,77 @@
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from video.llm_provider import abort_generation, generate_chat, generation_status
+import video.llm_provider as llm_provider
+from video.llm_provider import _primary_routes, abort_generation, generate_chat, generation_status
 
 
 class LlmProviderTests(unittest.TestCase):
-    def test_kobold_abort_uses_extra_abort_endpoint(self):
-        with patch("video.llm_provider._post_json", return_value={"success": True}) as post:
-            result = abort_generation({"kobold_url": "http://localhost:5001"})
+    def test_generate_chat_delegates_complete_director_request_to_primary_prompt_studio(self):
+        shared = SimpleNamespace(
+            shared_llm_generate=Mock(return_value="Complete response"),
+            shared_llm_status=Mock(),
+            shared_llm_abort=Mock(),
+        )
+        settings = {
+            "llm_provider": "llamacpp",
+            "llamacpp_url": "http://127.0.0.1:8080",
+            "llamacpp_model": "test.gguf",
+            "thinking_mode": "Medium",
+            "llamacpp_reasoning_budget_tokens": 1000,
+        }
+        messages = [{"role": "user", "content": "Compose the full prompt."}]
+        images = [{"data_uri": "data:image/png;base64,AAAA", "base64": "AAAA"}]
 
-        self.assertTrue(result["success"])
-        self.assertTrue(post.call_args.args[0].endswith("/api/extra/abort"))
-        self.assertEqual(post.call_args.args[1], {})
-        self.assertEqual(post.call_args.args[2], 10)
-
-    def test_kobold_abort_preserves_negative_confirmation(self):
-        with patch("video.llm_provider._post_json", return_value={"success": False}):
-            result = abort_generation({"kobold_url": "http://localhost:5001"})
-
-        self.assertFalse(result["success"])
-
-    def test_kobold_generation_status_reports_live_partial_output_size(self):
-        with (
-            patch("video.llm_provider._get_json", return_value={"idle": 0, "queue": 1}),
-            patch(
-                "video.llm_provider._post_json",
-                return_value={"results": [{"text": "partial answer"}]},
-            ),
-        ):
-            status = generation_status({"llm_provider": "koboldcpp"})
-
-        self.assertTrue(status["reachable"])
-        self.assertTrue(status["busy"])
-        self.assertEqual(status["queue"], 1)
-        self.assertEqual(status["generated_characters"], len("partial answer"))
-
-    def test_kobold_generation_status_does_not_return_stale_idle_output(self):
-        with (
-            patch("video.llm_provider._get_json", return_value={"idle": 1, "queue": 0}),
-            patch("video.llm_provider._post_json") as post,
-        ):
-            status = generation_status({"llm_provider": "koboldcpp"})
-
-        self.assertFalse(status["busy"])
-        self.assertNotIn("generated_characters", status)
-        post.assert_not_called()
-
-    def test_kobold_generation_status_tolerates_malformed_partial_output(self):
-        with (
-            patch("video.llm_provider._get_json", return_value={"idle": 0, "queue": 0}),
-            patch(
-                "video.llm_provider._post_json",
-                return_value={"results": {"unexpected": "shape"}},
-            ),
-        ):
-            status = generation_status({"llm_provider": "koboldcpp"})
-
-        self.assertTrue(status["reachable"])
-        self.assertTrue(status["busy"])
-        self.assertIsNone(status["generated_characters"])
-
-    def test_kobold_generation_status_reports_loaded_model_and_vision(self):
-        def get_json(url, _timeout):
-            if url.endswith("/api/extra/perf"):
-                return {"idle": 1, "queue": 0}
-            if url.endswith("/api/v1/model"):
-                return {"result": "koboldcpp/Qwen2.5-VL-7B-Q4_K_M"}
-            if url.endswith("/api/extra/version"):
-                return {"vision": True}
-            return None
-
-        with patch("video.llm_provider._get_json", side_effect=get_json):
-            status = generation_status({"llm_provider": "koboldcpp"})
-
-        self.assertEqual(status["model"], "koboldcpp/Qwen2.5-VL-7B-Q4_K_M")
-        self.assertIs(status["vision"], True)
-
-    def test_ollama_generation_status_uses_selected_model(self):
-        with patch("video.llm_provider._get_json", return_value={
-            "models": [{"name": "gemma3:4b"}, {"model": "qwen3:8b"}],
-        }):
-            status = generation_status({
-                "llm_provider": "ollama",
-                "ollama_url": "http://localhost:11434",
-                "ollama_model": "gemma3:4b",
-            })
-
-        self.assertEqual(status["provider"], "ollama")
-        self.assertIs(status["reachable"], True)
-        self.assertEqual(status["model"], "gemma3:4b")
-        self.assertIs(status["model_installed"], True)
-
-    def test_kobold_auto_response_budget_uses_remaining_context(self):
-        posted = []
-
-        def post_json(_url, payload, _timeout, _service_name):
-            posted.append(payload)
-            if "special" in payload:
-                return {"value": 2_000}
-            return {
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {"content": "Complete response"},
-                }],
-            }
-
-        with (
-            patch("video.llm_provider._get_json", side_effect=[{"jinja": True}, {"value": 8_192}]),
-            patch("video.llm_provider._post_json", side_effect=post_json),
-        ):
-            result = generate_chat(
-                {"llm_provider": "koboldcpp", "max_response_tokens": 0},
-                [{"role": "user", "content": "Compose the full prompt."}],
-            )
+        with patch("video.llm_provider._primary_routes", return_value=shared):
+            result = generate_chat(settings, messages, images)
 
         self.assertEqual(result, "Complete response")
-        self.assertEqual(posted[-1]["max_tokens"], 8_192 - 2_000 - 32)
+        shared.shared_llm_generate.assert_called_once_with(settings, messages, images)
 
-    def test_kobold_auto_response_budget_caps_runaway_generation(self):
-        posted = []
+    def test_generation_status_uses_primary_live_token_service(self):
+        expected = {
+            "provider": "llamacpp",
+            "reachable": True,
+            "busy": True,
+            "generated_tokens": 37,
+            "generation_phase": "thinking_or_generating",
+        }
+        shared = SimpleNamespace(
+            shared_llm_generate=Mock(),
+            shared_llm_status=Mock(return_value=expected),
+            shared_llm_abort=Mock(),
+        )
+        settings = {"llm_provider": "llamacpp"}
 
-        def post_json(_url, payload, _timeout, _service_name):
-            posted.append(payload)
-            if "special" in payload:
-                return {"value": 1_000}
-            return {
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {"content": "Compact response"},
-                }],
-            }
+        with patch("video.llm_provider._primary_routes", return_value=shared):
+            result = generation_status(settings)
 
+        self.assertIs(result, expected)
+        shared.shared_llm_status.assert_called_once_with(settings)
+
+    def test_abort_generation_uses_primary_provider_abort(self):
+        expected = {"provider": "llamacpp", "success": True, "closed_streams": 1}
+        shared = SimpleNamespace(
+            shared_llm_generate=Mock(),
+            shared_llm_status=Mock(),
+            shared_llm_abort=Mock(return_value=expected),
+        )
+        settings = {"llm_provider": "llamacpp", "llamacpp_url": "http://127.0.0.1:8080"}
+
+        with patch("video.llm_provider._primary_routes", return_value=shared):
+            result = abort_generation(settings)
+
+        self.assertIs(result, expected)
+        shared.shared_llm_abort.assert_called_once_with(settings)
+
+    def test_missing_primary_prompt_studio_has_actionable_error(self):
         with (
-            patch("video.llm_provider._get_json", side_effect=[{"jinja": True}, {"value": 32_768}]),
-            patch("video.llm_provider._post_json", side_effect=post_json),
+            patch.object(llm_provider.sys, "modules", {}),
+            patch.object(llm_provider.importlib, "import_module", side_effect=ModuleNotFoundError),
         ):
-            result = generate_chat(
-                {"llm_provider": "koboldcpp", "max_response_tokens": 0},
-                [{"role": "user", "content": "Compose the full prompt."}],
-            )
-
-        self.assertEqual(result, "Compact response")
-        self.assertEqual(posted[-1]["max_tokens"], 12_288)
-
-    def test_ollama_auto_response_budget_fills_context(self):
-        with patch("video.llm_provider._post_json") as post:
-            post.return_value = {
-                "message": {"content": "Complete response"},
-                "done_reason": "stop",
-            }
-            result = generate_chat(
-                {"llm_provider": "ollama", "ollama_model": "local-model", "max_response_tokens": 0},
-                [{"role": "user", "content": "Compose the full prompt."}],
-            )
-
-        self.assertEqual(result, "Complete response")
-        self.assertEqual(post.call_args.args[1]["options"]["num_predict"], -2)
+            with self.assertRaisesRegex(RuntimeError, "requires the companion ComfyUI_PromptStudio"):
+                _primary_routes()
 
 
 if __name__ == "__main__":

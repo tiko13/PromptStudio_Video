@@ -5,12 +5,13 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
 from video.director_vision import load_vision_images, normalize_attachments
-from video.llm_provider import _messages_with_kobold_images, _messages_with_ollama_images
+from video.llm_provider import generate_chat
 
 
 class DirectorVisionTests(unittest.TestCase):
@@ -64,7 +65,7 @@ class DirectorVisionTests(unittest.TestCase):
             self.assertEqual(images[0]["mime_type"], "image/png")
             self.assertTrue(images[0]["data_uri"].startswith("data:image/png;base64,"))
 
-    def test_provider_payload_attaches_images_only_to_latest_user_turn(self):
+    def test_provider_payload_is_delegated_to_primary_prompt_studio(self):
         messages = [
             {"role": "system", "content": "System"},
             {"role": "user", "content": "Earlier"},
@@ -72,12 +73,15 @@ class DirectorVisionTests(unittest.TestCase):
             {"role": "user", "content": "Inspect this"},
         ]
         images = [{"data_uri": "data:image/png;base64,AAAA", "base64": "AAAA"}]
-        kobold = _messages_with_kobold_images(messages, images)
-        self.assertEqual(kobold[1]["content"], "Earlier")
-        self.assertEqual(kobold[-1]["content"][1]["type"], "image_url")
-        ollama = _messages_with_ollama_images(messages, images)
-        self.assertNotIn("images", ollama[1])
-        self.assertEqual(ollama[-1]["images"], ["AAAA"])
+        shared = SimpleNamespace(shared_llm_generate=Mock(return_value="response"))
+
+        with patch("video.llm_provider._primary_routes", return_value=shared):
+            result = generate_chat({"llm_provider": "llamacpp"}, messages, images)
+
+        self.assertEqual(result, "response")
+        shared.shared_llm_generate.assert_called_once_with(
+            {"llm_provider": "llamacpp"}, messages, images
+        )
 
 
 if __name__ == "__main__":

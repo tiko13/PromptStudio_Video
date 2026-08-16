@@ -533,6 +533,8 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-director-settings { padding: 9px 14px 12px; background: rgba(9, 10, 15, .65); border-top: 1px solid var(--psv-border); }
 .psvstudio-director-settings summary { color: var(--psv-muted); cursor: pointer; font-size: 10px; font-weight: 700; }
 .psvstudio-director-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding: 9px 0; }
+.psvstudio-director-shared-llm { grid-column: 1 / -1; display: grid; gap: 3px; padding: 9px 10px; color: var(--psv-muted); background: rgba(255, 255, 255, .035); border: 1px solid var(--psv-border); border-radius: 8px; font-size: 9px; }
+.psvstudio-director-shared-llm strong { color: var(--psv-text); font-size: 11px; }
 .psvstudio-director-settings-grid label { display: grid; gap: 3px; color: var(--psv-muted); font-size: 9px; }
 .psvstudio-director-settings-grid input, .psvstudio-director-settings-grid select { width: 100%; min-height: 34px; padding: 0 9px; color: var(--psv-text); background: #0b0d13; border: 1px solid var(--psv-border); border-radius: 8px; }
 

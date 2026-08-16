@@ -524,6 +524,11 @@ def _start_director_job(data):
         "provider_settings": {
             "llm_provider": data.get("llm_provider"),
             "kobold_url": data.get("kobold_url"),
+            "ollama_url": data.get("ollama_url"),
+            "ollama_model": data.get("ollama_model"),
+            "llamacpp_url": data.get("llamacpp_url"),
+            "llamacpp_model": data.get("llamacpp_model"),
+            "thinking_mode": data.get("thinking_mode"),
         },
     }
     task = asyncio.create_task(_run_director_job(job_id, data))
@@ -544,7 +549,9 @@ async def _cancel_director_job(job_id):
     task = job.get("task")
     if previous_status == "queued" and task and not task.done():
         task.cancel()
-    if previous_status == "running" and str(job.get("provider_settings", {}).get("llm_provider") or "koboldcpp").casefold() == "koboldcpp":
+    if previous_status == "running" and str(
+        job.get("provider_settings", {}).get("llm_provider") or "koboldcpp"
+    ).casefold() in {"koboldcpp", "llamacpp"}:
         try:
             await asyncio.to_thread(abort_generation, job["provider_settings"])
         except Exception:
@@ -640,6 +647,16 @@ async def promptstudio_video_kobold_abort(request):
         return web.json_response({"error": str(exc)}, status=502)
 
 
+async def promptstudio_video_llm_abort(request):
+    try:
+        data = await _director_body(request)
+        return web.json_response(await asyncio.to_thread(abort_generation, data))
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+
+
 def register_routes():
     """Register after ComfyUI has created its PromptServer singleton."""
     server = getattr(PromptServer, "instance", None)
@@ -667,6 +684,7 @@ def register_routes():
     routes.post("/promptstudio-video/director/chat/{job_id}/cancel")(promptstudio_video_director_cancel)
     routes.post("/promptstudio-video/director/preview")(promptstudio_video_director_preview)
     routes.post("/promptstudio-video/llm/status")(promptstudio_video_llm_status)
+    routes.post("/promptstudio-video/llm/abort")(promptstudio_video_llm_abort)
     routes.post("/promptstudio-video/kobold/status")(promptstudio_video_kobold_status)
     routes.post("/promptstudio-video/kobold/abort")(promptstudio_video_kobold_abort)
     return True
