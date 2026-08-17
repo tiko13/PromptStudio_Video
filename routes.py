@@ -11,6 +11,7 @@ from aiohttp import web
 from server import PromptServer
 
 from .video.compiler import compile_prompt
+from .video.audio_mix import assemble_exact_audio, probe_input_audio
 from .video.continuation import (
     CONTINUATION_CONTEXT_FRAMES,
     CONTINUATION_CONTEXT_SECONDS,
@@ -32,6 +33,7 @@ from .video.contracts import (
     MAX_CANVAS_MEGAPIXELS,
     MIN_CANVAS_MEGAPIXELS,
     MODES,
+    POSTPROCESS_ROLES,
     REFERENCE_ROLES,
     TASK_TYPES,
     VISUAL_RETENTION,
@@ -77,6 +79,7 @@ PROJECT_LOCK = asyncio.Lock()
 WORKFLOW_LOCK = asyncio.Lock()
 DIRECTOR_LLM_LOCK = asyncio.Lock()
 CONTINUATION_ASSEMBLY_LOCK = asyncio.Lock()
+EXACT_AUDIO_ASSEMBLY_LOCK = asyncio.Lock()
 DIRECTOR_JOBS = {}
 DIRECTOR_TASKS = set()
 MAX_DIRECTOR_JOBS = 32
@@ -103,6 +106,8 @@ CAPABILITY = {
         "native_h3_motion_context",
         "unified_studio_shell",
         "default_workflow_setup",
+        "shot_detail_timeline",
+        "exact_audio_mix",
     ],
     "standalone_page": "/extensions/PromptStudio_Video/prompt_studio_video.html",
 }
@@ -269,10 +274,14 @@ async def promptstudio_video_config(_request):
             "maximum": MAX_REFERENCE_SECONDS,
             "maximum_total": MAX_REFERENCE_TOTAL_SECONDS,
         },
-        "reference_limits": {"images": 9, "videos": 3, "audio_tracks": 3, "active_items": 12},
+        "reference_limits": {
+            "images": 9, "videos": 3, "audio_tracks": 3, "active_items": 12,
+            "exact_audio_assets": 32,
+        },
         "modes": sorted(MODES),
         "anchor_roles": sorted(ANCHOR_ROLES),
         "reference_roles": sorted(REFERENCE_ROLES),
+        "postprocess_roles": sorted(POSTPROCESS_ROLES),
         "camera_types": sorted(CAMERA_TYPES),
         "task_types": sorted(TASK_TYPES),
         "visual_retention": sorted(VISUAL_RETENTION),
@@ -410,6 +419,42 @@ async def promptstudio_video_continuation_assemble(request):
         return web.json_response({"ok": False, "error": str(exc), "code": "invalid_assembly"}, status=400)
     except Exception as exc:
         return web.json_response({"ok": False, "error": str(exc), "code": "assembly_failed"}, status=500)
+
+
+async def promptstudio_video_audio_mix(request):
+    try:
+        if request.content_length is not None and request.content_length > MAX_DOCUMENT_REQUEST_BYTES:
+            raise ValueError("Exact audio request exceeds the 2 MB limit")
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        document = normalize_document(data.get("document"))
+        async with EXACT_AUDIO_ASSEMBLY_LOCK:
+            output = await asyncio.to_thread(
+                assemble_exact_audio,
+                data.get("source"),
+                document,
+                data.get("project_id"),
+                data.get("generation_id"),
+            )
+        return web.json_response({"ok": True, "output": output})
+    except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "invalid_audio_mix"}, status=400)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "audio_mix_failed"}, status=500)
+
+
+async def promptstudio_video_audio_probe(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        result = await asyncio.to_thread(probe_input_audio, data.get("path"))
+        return web.json_response({"ok": True, **result})
+    except (ValueError, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "invalid_audio"}, status=400)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc), "code": "audio_probe_failed"}, status=500)
 
 
 async def promptstudio_video_projects_get(_request):
@@ -702,6 +747,8 @@ def register_routes():
     routes.post("/promptstudio-video/document/compile")(promptstudio_video_compile)
     routes.post("/promptstudio-video/continuations/prepare")(promptstudio_video_continuation_prepare)
     routes.post("/promptstudio-video/continuations/assemble")(promptstudio_video_continuation_assemble)
+    routes.post("/promptstudio-video/audio-mix")(promptstudio_video_audio_mix)
+    routes.post("/promptstudio-video/media/audio-probe")(promptstudio_video_audio_probe)
     routes.get("/promptstudio-video/projects")(promptstudio_video_projects_get)
     routes.put("/promptstudio-video/projects")(promptstudio_video_projects_put)
     routes.get("/promptstudio-video/workflows")(promptstudio_video_workflows_get)

@@ -17,6 +17,7 @@ from .contracts import (
     TASK_TYPES,
     PromptDocumentError,
     effective_duration,
+    model_references,
     normalize_retention_relationship,
     normalize_document,
 )
@@ -295,7 +296,7 @@ The six REF2VA sections are compiled output, not writable project fields. Never 
 
 If the user's request only assigns or repairs a reference role, preserve the existing main description, shot count, timing, actions, environments, lighting, camera moves, sounds, dialogue, and visible text. Add only the required reference and subject bindings without replacing the established story or action. Existing action, environment, lighting, and composition prose must be retained verbatim unless the user explicitly asks to change it; do not reinterpret the production as a different scene.
 
-Do not change references, existing dialogue, lyrics, existing speaker IDs, or visible text. Preserve every existing dialogue and visible-text string verbatim; new dialogue is allowed only when the user requests it. Never invent a reference token: when the supplied reference and subject token lists are empty, write plain descriptive prose without angle-bracket tokens. Maintain subject identity, screen direction, props, wardrobe, environment, and action state across cuts. When the user asks for an attribute to remain consistent, repeat the same concrete state across the affected shots; never substitute drifting numeric values or ambiguous alternatives. Every sounds item must describe something audible, never a visual state or silence. Dialogue and diegetic music stay within shot action; overall_soundscape summarizes only ambience, action sounds, and non-verbal human sound already established in shot sounds or action, never inventing a new door, vehicle, impact, voice, or other event merely to add texture. It must not mention the presence or absence of non-diegetic music; non_diegetic_music describes only audience-heard instrumentation, tempo, rhythm, and dynamics."""
+Do not change references, existing dialogue, lyrics, existing speaker IDs, or visible text. Preserve every existing dialogue and visible-text string verbatim; new dialogue is allowed only when the user requests it. Never invent a reference token: when the supplied reference and subject token lists are empty, write plain descriptive prose without angle-bracket tokens. Maintain subject identity, screen direction, props, wardrobe, environment, and action state across cuts. When the user asks for an attribute to remain consistent, repeat the same concrete state across the affected shots; never substitute drifting numeric values or ambiguous alternatives. Every sounds item must describe something audible, never a visual state or silence. Dialogue and diegetic music stay within shot action; overall_soundscape summarizes only ambience, action sounds, and non-verbal human sound already established in shot sounds or action, never inventing a new door, vehicle, impact, voice, or other event merely to add texture. Never leave overall_soundscape blank; use a concrete grounded summary, or explicitly state that no additional ambience or physical sounds are specified. It must not mention the presence or absence of non-diegetic music; non_diegetic_music describes only audience-heard instrumentation, tempo, rhythm, and dynamics."""
 
 
 VISION_GROUNDING_SYSTEM_MESSAGE = """You are Prompt Studio Video's visual grounding pass.
@@ -409,8 +410,9 @@ def _repair_json_structure(value):
 
 
 def _reference_tokens(document):
-    tokens = {item["label"].casefold(): item["label"] for item in document["references"]}
-    if document["references"] and document.get("resolved_mode") == "ref2va":
+    references = model_references(document)
+    tokens = {item["label"].casefold(): item["label"] for item in references}
+    if references and document.get("resolved_mode") == "ref2va":
         for item in document["subject_definitions"]:
             token = f"<{item['label'].strip('<>')}>"
             tokens[token.casefold()] = token
@@ -723,7 +725,7 @@ def _base_context(data, document, attachments, duration):
                 ),
             } if not set(item.get("roles") or []) & {"subject", "first_frame", "last_frame"} else {}),
         }
-        for item in document["references"]
+        for item in model_references(document)
     ]
     grounding = data.get("_vision_observations")
     grounding = grounding if isinstance(grounding, list) else []
@@ -731,7 +733,7 @@ def _base_context(data, document, attachments, duration):
     for index, attachment in enumerate(attachments):
         reference = None if attachment["usage"] == "describe" else next(
             (
-                item for item in document["references"]
+                item for item in model_references(document)
                 if item["id"] == attachment["reference_id"]
                 or (attachment["reference_id"] == "" and item["path"] == attachment["path"])
             ),
@@ -791,7 +793,7 @@ def _base_context(data, document, attachments, duration):
         },
         "minimax_tokens": {
             "shots": [f"[Shot {index + 1}]" for index in range(len(document["shots"]))],
-            "references": [item["label"] for item in document["references"]],
+            "references": [item["label"] for item in model_references(document)],
             "subjects": (
                 [f"<{item['label'].strip('<>')}>" for item in document["subject_definitions"]]
                 if document.get("resolved_mode") == "ref2va"
@@ -911,15 +913,14 @@ def build_provider_messages(data):
         system_message += "\n\n" + VIDEO_EDIT_DIRECTOR_POLICY
     prompt_guide_chars = 0
     prompt_guides = []
-    if data.get("optimize_prompt_generation", True) is False:
-        for guide_name, prompt_guide in _prompt_writing_guides(document["resolved_mode"]):
-            prompt_guide_chars += len(prompt_guide)
-            prompt_guides.append(guide_name)
-            system_message += (
-                f"\n\nBEGIN AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE\n\n"
-                + prompt_guide
-                + f"\nEND AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE"
-            )
+    for guide_name, prompt_guide in _prompt_writing_guides(document["resolved_mode"]):
+        prompt_guide_chars += len(prompt_guide)
+        prompt_guides.append(guide_name)
+        system_message += (
+            f"\n\nBEGIN AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE\n\n"
+            + prompt_guide
+            + f"\nEND AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE"
+        )
     messages = [{
         "role": "system",
         "content": system_message + "\n\nCurrent production context (reference data):\n" + context_json,
@@ -2418,7 +2419,7 @@ def _complete_grounded_reference_semantics(document, proposal, data):
     }
     required_tokens = []
     forbidden_anchor_subject_labels = set()
-    for reference in document["references"]:
+    for reference in model_references(document):
         source_token = _text(reference.get("label"), 80)
         roles = set(reference.get("roles") or [])
         existing_anchor_subject = any(

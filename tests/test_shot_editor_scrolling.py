@@ -9,6 +9,7 @@ class ShotEditorScrollingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.styles = (ROOT / "web" / "css" / "promptstudio_video_studio.css").read_text(encoding="utf-8")
+        cls.script = (ROOT / "web" / "js" / "promptstudio_video_studio.js").read_text(encoding="utf-8")
 
     def rule(self, selector):
         return self.styles.split(f"{selector} {{", 1)[1].split("}", 1)[0]
@@ -29,6 +30,17 @@ class ShotEditorScrollingTests(unittest.TestCase):
         self.assertIn("overflow-y: auto", sequence)
         self.assertIn("grid-template-rows: auto max-content", sequence)
         self.assertIn("overflow: visible", step_list)
+
+    def test_timeline_cues_have_direct_drag_and_resize_controls(self):
+        handle = self.rule(".psvstudio-shot-cue-handle")
+
+        self.assertIn("width: 12px", handle)
+        self.assertIn("setPointerCapture", self.script)
+        self.assertIn("shotTimelineDragEdge", self.script)
+        self.assertIn("drag either edge to change start/end", self.script)
+        self.assertIn('"Automatic flow"', self.script)
+        self.assertIn("item.timing_explicit = true", self.script)
+        self.assertIn("legacyAutoTiming", self.script)
 
 
 if __name__ == "__main__":

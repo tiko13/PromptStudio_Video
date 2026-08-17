@@ -1,0 +1,6 @@
+# Repository control files
+.gitignore
+.comfyignore
+
+# Development and regression tests
+tests/

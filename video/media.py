@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from .contracts import PromptDocumentError
+from .contracts import PromptDocumentError, model_references
 
 
 TARGET_FPS = 24
@@ -91,7 +91,7 @@ def _load_audio(path):
 
 def anchor_images(document):
     first = last = None
-    for reference in document["references"]:
+    for reference in model_references(document):
         if reference["kind"] != "image":
             continue
         roles = set(reference["roles"])
@@ -115,7 +115,7 @@ def reference_inputs(document):
     video_total = 0.0
     audio_total = 0.0
 
-    for reference in document["references"]:
+    for reference in model_references(document):
         kind = reference["kind"]
         if kind == "image":
             images[f"ref_image_{len(images) + 1}"] = _load_image(reference["path"])

@@ -217,6 +217,54 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([step["id"] for step in first], ["same", "dialogue-2", "step-3"])
         self.assertEqual([step["id"] for step in first], [step["id"] for step in second])
 
+    def test_exact_audio_is_postprocess_media_and_preserves_timed_shot_items(self):
+        value = document(
+            references=[{
+                "id": "exact-1", "kind": "audio", "path": "sting.wav",
+                "roles": ["exact_audio"],
+            }],
+            shots=[{
+                "start": 0,
+                "steps": [{
+                    "id": "step-1", "type": "action", "text": "She turns.",
+                    "start": 0.25, "end": 1.5, "timing_explicit": True,
+                }],
+                "sounds": ["A latch clicks."],
+                "sound_cues": [{
+                    "id": "sound-1", "text": "A latch clicks.", "start": 1.0, "end": 1.25,
+                }],
+                "audio_clips": [{
+                    "id": "clip-1", "reference_id": "exact-1", "start": 1.5, "end": 2.5,
+                    "source_start": 0.1, "gain_db": -3, "mix_mode": "overlay",
+                }],
+            }],
+        )
+        normalized = normalize_document(value)
+        shot = normalized["shots"][0]
+
+        self.assertEqual(normalized["resolved_mode"], "t2va")
+        self.assertEqual(normalized["references"][0]["label"], "")
+        self.assertEqual((shot["steps"][0]["start"], shot["steps"][0]["end"]), (0.25, 1.5))
+        self.assertTrue(shot["steps"][0]["timing_explicit"])
+        self.assertEqual(shot["sound_cues"][0]["id"], "sound-1")
+        self.assertEqual(shot["audio_clips"][0]["reference_id"], "exact-1")
+
+    def test_exact_audio_clip_must_fit_its_shot(self):
+        with self.assertRaisesRegex(PromptDocumentError, "exact audio clip exceeds"):
+            normalize_document(document(
+                duration_seconds=5,
+                references=[{
+                    "id": "exact-1", "kind": "audio", "path": "sting.wav",
+                    "roles": ["exact_audio"],
+                }],
+                shots=[{
+                    "start": 0,
+                    "audio_clips": [{
+                        "reference_id": "exact-1", "start": 4, "end": 6,
+                    }],
+                }],
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

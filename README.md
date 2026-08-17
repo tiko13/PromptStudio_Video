@@ -8,6 +8,17 @@ Build MiniMax H3 videos in a visual, shot-based studio that keeps timing, refere
 
 Plan multiple shots on a proportional, frame-snapped timeline. Reorder and trim them visually, then edit each shot's setup, camera, sound, visible text, and chronological action or dialogue steps.
 
+Each Shot Editor also contains a nested, shot-local timeline for overlapping
+actions, dialogue, generated sound cues, and exact imported audio. Semantic
+items use the timeline to compile guide-native chronological phrases such as
+"immediately," "then," and "while"; MiniMax receives numeric timestamps only
+for shot cuts. Exact audio is mixed after generation, so its waveform, gain,
+fades, source trim, and placement remain
+deterministic without forcing the project into REF2VA mode. The backend probes
+the actual audio stream duration through PyAV and supports its common audio
+containers and codecs, including WAV, MP3, FLAC, OGG/Opus, M4A/AAC, AIFF, and
+WMA where the installed FFmpeg build provides the decoder.
+
 <!-- Hero screenshot slot: full Video Studio with preview, timeline, and shot navigator.
 Suggested file: docs/images/video-studio-timeline.png
 ![Video Studio timeline and shot editor](docs/images/video-studio-timeline.png)
@@ -92,6 +103,8 @@ The current vertical slice contains:
 - native ComfyUI MiniMax conditioning and latent creation;
 - lazy FL2VA/REF2VA model selection;
 - first-frame, last-frame, image, video, and audio reference loading;
+- nested per-shot action, dialogue, generated-sound, and exact-audio timelines with overlapping ranges;
+- post-render exact-audio overlay/replacement with source trimming, gain, fades, and authoritative duration probing;
 - dependency-free native H3 audiovisual motion-context continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
@@ -196,17 +209,17 @@ available when a hard final-answer allowance is desired. Llama.cpp also reuses
 the reasoning cap configured in Prompt Studio's active LLM profile.
 
 Director requests run as background jobs so the browser does not mistake a
-long generation for a failed HTTP request. Through Prompt Studio's shared
+long processing operation for a failed HTTP request. Through Prompt Studio's shared
 provider service, Video Studio reports live token progress when the selected
 provider exposes it: KoboldCpp output is counted through its token endpoint,
 while Llama.cpp reads active decoded-token counts from `/slots` and
-distinguishes thinking from final generation when possible.
+distinguishes thinking from final response output when possible.
 The request timeout defaults to 600 seconds and can be adjusted in Director
 settings.
 
 The compact toolbar status icon covers the selected local LLM and ComfyUI.
 Green means all services are ready, orange means work is being processed, and
-red means a service needs attention. KoboldCpp generations can be aborted via
+red means a service needs attention. KoboldCpp processing can be aborted via
 its API; Llama.cpp cancellation closes Video Studio's active streams without
 stopping the server. Start/stop/restart, file browsing, config building, and
 model selection remain in the primary Prompt Studio UI.

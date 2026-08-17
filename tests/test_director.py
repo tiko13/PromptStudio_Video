@@ -1341,22 +1341,15 @@ class DirectorTests(unittest.TestCase):
         self.assertLessEqual(usage["context_chars"] + usage["history_chars"], 8000)
         self.assertEqual(provider_messages[-1]["role"], "user")
 
-    def test_prompt_generation_optimization_controls_full_guide_context(self):
+    def test_prompt_generation_always_receives_full_guide_context(self):
         request = {
             "document": director_document(),
             "selected_shot_id": "shot-2",
             "messages": [{"role": "user", "content": "Improve the camera move."}],
         }
 
-        optimized_messages, optimized_usage = build_provider_messages(request)
         guide = _base_prompt_writing_guide_for_mode("t2va")
-        self.assertNotIn(guide, optimized_messages[0]["content"])
-        self.assertEqual(optimized_usage["prompt_guide_chars"], 0)
-
-        full_messages, full_usage = build_provider_messages({
-            **request,
-            "optimize_prompt_generation": False,
-        })
+        full_messages, full_usage = build_provider_messages(request)
         self.assertIn(guide, full_messages[0]["content"])
         self.assertIn(
             "BEGIN AUTHORITATIVE MINIMAX H3 BASE-T2VA VIDEO PROMPT WRITING GUIDE",
@@ -1392,7 +1385,6 @@ class DirectorTests(unittest.TestCase):
             "document": document,
             "scope": "project",
             "messages": [{"role": "user", "content": "Use the referenced subject."}],
-            "optimize_prompt_generation": False,
         })
         base_guide = _shared_base_prompt_writing_guide()
         reference_guide = _reference_prompt_writing_guide()

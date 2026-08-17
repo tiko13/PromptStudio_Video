@@ -1,18 +1,51 @@
+# Local agent guidance
+AGENTS.md
+
+# Python caches, environments, and build outputs
 __pycache__/
 *.py[cod]
+*.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 coverage.xml
 htmlcov/
-
-# Local environments and dependency caches
 .venv/
 venv/
 env/
 .python-version
-node_modules/
+build/
+dist/
+*.egg-info/
 
-# Local configuration and credentials
+# Node dependencies and build outputs
+node_modules/
+coverage/
+.cache/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
 .env
 .env.*
 !.env.example
@@ -26,26 +59,9 @@ node_modules/
 *.sqlite
 *.sqlite3
 
-# Runtime project, media, and workflow state
+# Prompt Studio Video runtime state
 promptstudio_video_projects.json
-promptstudio_video_projects.json.bak
+promptstudio_video_projects.json.tmp
 promptstudio_video_projects/
 promptstudio_video_workflows.json
-promptstudio_video_workflows.json.bak
-
-# Build and editor state
-build/
-dist/
-*.egg-info/
-.idea/
-.vscode/
-.agents/
-.codex/
-.ruff_cache/
-.mypy_cache/
-
-# Temporary files and operating-system metadata
-*.tmp
-*.log
-.DS_Store
-Thumbs.db
+promptstudio_video_workflows.json.tmp

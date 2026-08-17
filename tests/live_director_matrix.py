@@ -115,10 +115,7 @@ def document(mode="auto", references=None, shots=None, duration=9):
     }
 
 
-def request(
-    document_value, prompt, attachments=None, scope="project", selected_shot_id="",
-    optimize_prompt_generation=False,
-):
+def request(document_value, prompt, attachments=None, scope="project", selected_shot_id=""):
     return {
         "llm_provider": "koboldcpp",
         "kobold_url": "http://localhost:5001",
@@ -141,7 +138,6 @@ def request(
         "attachments": attachments or [],
         "messages": [{"role": "user", "content": prompt}],
         "require_proposal": True,
-        "optimize_prompt_generation": optimize_prompt_generation,
     }
 
 
@@ -977,11 +973,6 @@ def main():
     parser.add_argument("--case", action="append", dest="selected")
     parser.add_argument("--show-prompt", action="store_true")
     parser.add_argument("--show-document", action="store_true")
-    parser.add_argument(
-        "--optimize-prompt-generation",
-        action="store_true",
-        help="Use compact built-in instructions instead of injecting the relevant guide sections.",
-    )
     args = parser.parse_args()
     matrix = cases()
     selected = args.selected or list(matrix)
@@ -998,7 +989,6 @@ def main():
             data = request(
                 case["document"], case["prompt"], case.get("attachments"),
                 case.get("scope", "project"), case.get("selected_shot_id", ""),
-                args.optimize_prompt_generation,
             )
             result = director_chat(data)
             preview = (

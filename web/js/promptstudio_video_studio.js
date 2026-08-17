@@ -14,6 +14,8 @@ const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
 const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
 const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
+const EXACT_AUDIO_MIX_ENDPOINT = "/promptstudio-video/audio-mix";
+const AUDIO_PROBE_ENDPOINT = "/promptstudio-video/media/audio-probe";
 const LLM_STATUS_ENDPOINT = "/promptstudio/prompt-studio/llm/status";
 const LLM_ABORT_ENDPOINT = "/promptstudio-video/llm/abort";
 const COMFY_RESTART_ENDPOINTS = ["/v2/manager/reboot", "/manager/reboot"];
@@ -22,7 +24,6 @@ const DIRECTOR_STATUS_RETRY_LIMIT = 3;
 const KOBOLD_STATUS_POLL_MS = 3000;
 const DIRECTOR_SETTINGS_KEY = "promptstudio.video.director.settings.v1";
 const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
-const VIDEO_STUDIO_SETTINGS_KEY = "promptstudio.video.studio.settings.v1";
 const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
 const IMAGE_CONSULT_SETTINGS_KEY = "promptstudio.promptStudio.consult.settings.v1";
 const IMAGE_LLM_PROFILES_KEY = "promptstudio.promptStudio.llmProfiles.v1";
@@ -119,10 +120,12 @@ const state = {
   shotEditorShotId: "",
   shotEditorExpandedStepIds: new Set(),
   shotEditorRevealStepId: "",
+  shotTimelineSelectionId: "",
   mediaDragId: "",
   mediaDropDocuments: new WeakSet(),
   mediaDropDepth: new WeakMap(),
   mediaDimensionLoads: new Set(),
+  mediaDurationLoads: new Set(),
   drawer: "",
   directorDialog: null,
   directorBusy: false,
@@ -130,7 +133,6 @@ const state = {
   directorSessions: null,
   directorJobs: new Map(),
   directorScope: "shot",
-  optimizePromptGeneration: true,
   koboldStatusRequest: null,
   koboldStatusTimer: null,
   llmStatusSnapshot: null,
@@ -232,33 +234,6 @@ function primaryLlmProfile(studioSettings) {
   return profiles.find(profile => String(profile?.id || "") === selected) || {};
 }
 
-function videoStudioSettings() {
-  const stored = storedObject(VIDEO_STUDIO_SETTINGS_KEY);
-  return {
-    optimize_prompt_generation: stored.optimize_prompt_generation !== false,
-  };
-}
-
-function saveVideoStudioSettings(optimizePromptGeneration) {
-  state.optimizePromptGeneration = optimizePromptGeneration !== false;
-  try {
-    localStorage.setItem(VIDEO_STUDIO_SETTINGS_KEY, JSON.stringify({
-      optimize_prompt_generation: state.optimizePromptGeneration,
-    }));
-  } catch (_) {
-    // The selected behavior remains active for this session when storage is unavailable.
-  }
-}
-
-function toggleVideoStudioSettings(force) {
-  const settings = state.panel?.querySelector("#psvstudio-studio-settings");
-  const toggle = state.panel?.querySelector("#psvstudio-toggle-studio-settings");
-  if (!settings || !toggle) return;
-  const show = force ?? settings.hidden;
-  settings.hidden = !show;
-  toggle.setAttribute("aria-expanded", show ? "true" : "false");
-}
-
 function directorSettings() {
   const studio = storedObject(IMAGE_STUDIO_SETTINGS_KEY);
   const consult = storedObject(IMAGE_CONSULT_SETTINGS_KEY);
@@ -329,9 +304,9 @@ function thinkingModeEnablesReasoning(mode) {
 
 function llmActivityLabel(status = {}, thinkingEnabled = false) {
   if (status.generation_phase === "thinking") return "Thinking";
-  if (status.generation_phase === "generating") return "Generating";
-  if (status.generation_phase === "thinking_or_generating" || thinkingEnabled) return "Thinking / generating";
-  return "Generating";
+  if (status.generation_phase === "generating") return "Processing";
+  if (status.generation_phase === "thinking_or_generating" || thinkingEnabled) return "Thinking / processing";
+  return "Processing";
 }
 
 function llmGeneratedTokenCount(status = {}) {
@@ -459,10 +434,10 @@ function renderLlmStatus(status = {}) {
   stop.hidden = isOllama;
   stopHelp.hidden = isOllama;
   stop.disabled = !busy || state.koboldAbortBusy;
-  stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Force stop generation";
+  stop.textContent = state.koboldAbortBusy ? "Stopping…" : "Force stop processing";
   stopHelp.textContent = isLlamacpp
     ? "Stops Video Studio text streams only. Manage the Llama.cpp server in Prompt Studio settings."
-    : "Stops text generation only. KoboldCpp stays loaded.";
+    : "Stops LLM processing only. KoboldCpp stays loaded.";
   renderSystemStatusSummary();
 }
 
@@ -514,7 +489,7 @@ async function stopLlmGeneration() {
       busy: data.success !== true,
       message: data.success
         ? "Stop signal accepted."
-        : `${llmProviderDisplayName(provider)} reported no Video Studio generation to stop.`,
+        : `${llmProviderDisplayName(provider)} reported no Video Studio processing to stop.`,
     });
   } catch (error) {
     renderLlmStatus({ provider, reachable: false, message: error.message || String(error) });
@@ -858,7 +833,8 @@ function renderDirectorReferenceGuide() {
   const container = dialog?.querySelector("#psvstudio-director-reference-list");
   const guidance = dialog?.querySelector("#psvstudio-director-reference-guidance");
   if (!dialog || !project || !container || !guidance) return;
-  const references = project.document.references || [];
+  const references = (project.document.references || []).filter(reference => !(reference.kind === "audio"
+    && (reference.roles || []).length === 1 && reference.roles[0] === "exact_audio"));
   const draftAttachments = directorSession(project.id).draft_attachments || [];
   const items = references.map(reference => {
     const draft = draftAttachments.find(attachment =>
@@ -1308,7 +1284,6 @@ function directorRequestPayload(project, shot, scope, attachments, messages, job
   const normalizedScope = scope === "project" ? "project" : "shot";
   return {
     ...saveDirectorSettings(state.directorDialog),
-    optimize_prompt_generation: state.optimizePromptGeneration !== false,
     async: true,
     job_id: jobId,
     project_name: project.name,
@@ -1374,7 +1349,7 @@ function directorJobStatusText(job) {
   if (progress.phase === "proposal_correction") {
     const attempt = Math.max(1, Number(progress.attempt) || 1);
     const maximum = Math.max(attempt, Number(progress.maximum_attempts) || attempt);
-    const activity = job.provider_status?.busy ? "generating" : "queued";
+    const activity = job.provider_status?.busy ? "processing" : "queued";
     return `Proposal omitted or invalid · automatic correction ${attempt} of ${maximum} is ${activity}…`;
   }
   if (progress.phase === "vision_grounding") {
@@ -1400,7 +1375,7 @@ function directorJobStatusText(job) {
     if (provider.busy && Number.isFinite(characters) && characters > 0) {
       return `${prefix}${activity} · ${characters.toLocaleString()} characters received…`;
     }
-    return `${prefix}Director is generating the response…`;
+    return `${prefix}Director is processing the response…`;
   }
   const providerName = llmProviderDisplayName(provider.provider || directorSettings().llm_provider);
   if (provider.provider === "ollama") return "The local Director is still working…";
@@ -1411,7 +1386,7 @@ function directorJobStatusText(job) {
     if (tokens != null) return `${providerName} · ${activity.toLowerCase()} · ${tokens.toLocaleString()} tokens received…`;
     const characters = Number(provider.generated_characters);
     return Number.isFinite(characters) && characters > 0
-      ? `${providerName} is still generating · ${characters.toLocaleString()} characters received…`
+      ? `${providerName} is still processing · ${characters.toLocaleString()} characters received…`
       : `${providerName} is still processing the prompt…`;
   }
   return `Director is validating ${providerName}'s response…`;
@@ -1663,7 +1638,7 @@ function regenerateDirectorResponse(messageId) {
   session.pending_job = {
     job_id: jobId, kind: "regenerate", message_id: message.id,
     project_id: project.id, scope, attachments: clone(attachments),
-    progress: "Regenerating the Director answer...", created_at: Date.now(),
+    progress: "Processing the Director answer again...", created_at: Date.now(),
   };
   session.pending_job.request = directorRequestPayload(
     project, shot, scope, attachments, requestMessages, jobId,
@@ -1732,7 +1707,7 @@ function mediaKind(file) {
   const extension = file.name?.split(".").pop()?.toLowerCase();
   if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].includes(extension)) return "image";
   if (["mp4", "webm", "mov", "mkv", "avi", "m4v"].includes(extension)) return "video";
-  if (["wav", "mp3", "flac", "ogg", "m4a", "aac"].includes(extension)) return "audio";
+  if (["wav", "wave", "mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "aif", "aiff", "wma", "caf", "au"].includes(extension)) return "audio";
   return "";
 }
 
@@ -1864,6 +1839,36 @@ async function uploadMediaFile(file) {
   return result.subfolder ? `${result.subfolder}/${result.name}` : result.name;
 }
 
+async function probeAudioPath(path) {
+  const response = await api.fetchApi(AUDIO_PROBE_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !Number(data.duration_seconds)) {
+    throw new Error(data.error || "The audio duration could not be read.");
+  }
+  return data;
+}
+
+async function ensureAudioReferenceDuration(project, reference) {
+  if (reference?.kind !== "audio" || Number(reference.duration_seconds) > 0
+      || state.mediaDurationLoads.has(reference.id)) return;
+  state.mediaDurationLoads.add(reference.id);
+  try {
+    const metadata = await probeAudioPath(reference.path);
+    reference.duration_seconds = Number(metadata.duration_seconds) || 0;
+    reference.audio_codec = metadata.codec || "";
+    reference.audio_sample_rate = Number(metadata.sample_rate) || 0;
+    markProjectChanged({ project, render: project.id === state.activeProjectId });
+    if (state.shotEditorDialog?.open) renderShotEditorDialog();
+  } catch (_) {
+    // Unsupported or temporarily unavailable media remains placeable; the
+    // final mixer reports a precise decode error if generation is requested.
+  }
+}
+
 function mediaInputUrl(reference) {
   const parts = String(reference?.path || "").replaceAll("\\", "/").split("/").filter(Boolean);
   const filename = parts.pop();
@@ -1903,11 +1908,25 @@ function referenceRoleOptions(kind) {
   return [
     { value: "audio_reference", label: "Audio reference" },
     { value: "audio_copy", label: "Copy audio" },
+    { value: "exact_audio", label: "Exact timeline audio" },
   ];
 }
 
 function setReferenceRole(project, reference, role) {
   const roleChanged = reference.roles?.length !== 1 || reference.roles[0] !== role;
+  const leavingExactAudio = (reference.roles || []).length === 1
+    && reference.roles[0] === "exact_audio" && role !== "exact_audio";
+  const placedCount = (project.document.shots || []).reduce(
+    (count, shot) => count + (shot.audio_clips || []).filter(clip => clip.reference_id === reference.id).length,
+    0,
+  );
+  if (leavingExactAudio && placedCount) {
+    state.panel.ownerDocument.defaultView?.alert(
+      `This audio has ${placedCount} exact timeline placement${placedCount === 1 ? "" : "s"}. Remove those clips before changing its media role.`,
+    );
+    markProjectChanged({ render: true });
+    return;
+  }
   if (["first_frame", "last_frame"].includes(role)) {
     for (const item of project.document.references) {
       if (item.id === reference.id || !(item.roles || []).includes(role)) continue;
@@ -1929,8 +1948,14 @@ function setReferenceRole(project, reference, role) {
 }
 
 function referenceDisplayLabel(references, reference) {
+  const isExact = item => item.kind === "audio"
+    && (item.roles || []).length === 1 && item.roles[0] === "exact_audio";
+  if (isExact(reference)) {
+    const ordinal = references.filter(isExact).findIndex(item => item.id === reference.id) + 1;
+    return `Exact audio ${Math.max(1, ordinal)}`;
+  }
   const typeName = reference.kind === "image" ? "Picture" : reference.kind === "video" ? "Video" : "Audio";
-  const ordinal = references.filter(item => item.kind === reference.kind).findIndex(item => item.id === reference.id) + 1;
+  const ordinal = references.filter(item => item.kind === reference.kind && !isExact(item)).findIndex(item => item.id === reference.id) + 1;
   return `${typeName} ${Math.max(1, ordinal)}`;
 }
 
@@ -1987,6 +2012,9 @@ function mediaDropDestination(lane, clientY) {
 
 function removeProjectReference(project, reference, displayLabel = "Media") {
   project.document.references = (project.document.references || []).filter(item => item.id !== reference.id);
+  for (const shot of project.document.shots || []) {
+    shot.audio_clips = (shot.audio_clips || []).filter(clip => clip.reference_id !== reference.id);
+  }
   project.document.references.forEach(item => { item.label = ""; });
   invalidateReferenceSemantics(project);
   if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
@@ -1997,8 +2025,9 @@ function removeProjectReference(project, reference, displayLabel = "Media") {
 function mediaLimit(project, kind) {
   const limits = state.config?.reference_limits || {};
   const key = kind === "image" ? "images" : kind === "video" ? "videos" : "audio_tracks";
-  const references = project.document.references || [];
-  if (references.length >= Number(limits.active_items || 12)) return "The project already has the maximum number of active references.";
+  const references = (project.document.references || []).filter(reference => !(reference.kind === "audio"
+    && (reference.roles || []).length === 1 && reference.roles[0] === "exact_audio"));
+  if (references.length >= Number(limits.active_items || 12)) return "The project already has the maximum number of active model references.";
   if (references.filter(reference => reference.kind === kind).length >= Number(limits[key] || 12)) {
     return `The project already has the maximum number of ${kind} references.`;
   }
@@ -2034,8 +2063,19 @@ async function addMediaFiles(fileList) {
         roles: defaultReferenceRoles(project, kind), prompt: "", label: "",
         trim_start: 0, trim_end: null, use_embedded_audio: false,
         source_width: dimensions?.width || 0, source_height: dimensions?.height || 0,
+        duration_seconds: 0,
       };
       project.document.references.push(reference);
+      if (kind === "audio") {
+        try {
+          const metadata = await probeAudioPath(path);
+          reference.duration_seconds = Number(metadata.duration_seconds) || 0;
+          reference.audio_codec = metadata.codec || "";
+          reference.audio_sample_rate = Number(metadata.sample_rate) || 0;
+        } catch (_) {
+          // Model references can still be loaded by ComfyUI at queue time.
+        }
+      }
       if ((reference.roles || []).some(role => CANVAS_MEDIA_ROLES.has(role))) {
         synchronizeGeometryCanvas(project);
       }
@@ -2287,6 +2327,87 @@ function ensureShotSteps(shot) {
   return shot.steps;
 }
 
+function syncShotSoundCues(shot, sounds = shot?.sounds || []) {
+  if (!shot) return [];
+  const pool = Array.isArray(shot.sound_cues) ? shot.sound_cues : [];
+  const used = new Set();
+  shot.sounds = Array.from(sounds || []).map(value => String(value || "").trim()).filter(Boolean);
+  shot.sound_cues = shot.sounds.map((text, index) => {
+    const match = pool.find((cue, cueIndex) => !used.has(cueIndex) && String(cue?.text || "").trim() === text);
+    if (match) used.add(pool.indexOf(match));
+    return { ...(match || {}), id: match?.id || makeId("sound"), text };
+  });
+  return shot.sound_cues;
+}
+
+function shotLocalDuration(project, shotId) {
+  const index = project?.document?.shots?.findIndex(shot => shot.id === shotId) ?? -1;
+  if (index < 0) return 0;
+  return Math.max(1 / 24, Number(
+    project.document.shots[index + 1]?.start ?? project.document.duration_seconds,
+  ) - Number(project.document.shots[index].start || 0));
+}
+
+function ensureShotTimeline(shot, duration) {
+  const steps = ensureShotSteps(shot);
+  const cues = syncShotSoundCues(shot);
+  shot.audio_clips = Array.isArray(shot.audio_clips) ? shot.audio_clips : [];
+  const semantic = [...steps, ...cues];
+  const legacyOrdered = [...semantic].sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+  const legacyFirstStart = Number(legacyOrdered[0]?.start || 0);
+  const legacyCoverage = Number(legacyOrdered.at(-1)?.end || 0) - legacyFirstStart;
+  const legacySlot = legacyCoverage / Math.max(legacyOrdered.length, 1);
+  const legacyTolerance = Math.max(.002, Math.min(.02, legacySlot / 20));
+  const legacyAutoTiming = legacyOrdered.length >= 2
+    && Math.abs(legacyFirstStart) <= .02
+    && legacyCoverage >= duration * .8
+    && legacyOrdered.every(item => !item.timing_explicit
+      && Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end)))
+    && legacyOrdered.every((item, index) => (
+      Math.abs(Number(item.start) - (legacyFirstStart + index * legacySlot)) <= legacyTolerance
+      && Math.abs(Number(item.end) - (legacyFirstStart + (index + 1) * legacySlot)) <= legacyTolerance
+    ));
+  if (legacyAutoTiming) {
+    for (const item of semantic) {
+      delete item.start;
+      delete item.end;
+      delete item.timing_explicit;
+    }
+  }
+  semantic.forEach(item => {
+    if (Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end)) && Number(item.end) > Number(item.start)) {
+      item.start = Math.max(0, Math.min(duration - 1 / 24, Number(item.start)));
+      item.end = Math.max(item.start + 1 / 24, Math.min(duration, Number(item.end)));
+      return;
+    }
+    delete item.start;
+    delete item.end;
+    delete item.timing_explicit;
+  });
+  for (const clip of shot.audio_clips) {
+    clip.start = Math.max(0, Math.min(duration - 1 / 1000, Number(clip.start) || 0));
+    clip.end = Math.max(clip.start + 1 / 1000, Math.min(duration, Number(clip.end) || Math.min(duration, clip.start + 1)));
+    clip.source_start = Math.max(0, Number(clip.source_start) || 0);
+    clip.source_end = clip.source_end == null || clip.source_end === "" ? null : Math.max(clip.source_start, Number(clip.source_end));
+    clip.gain_db = Math.max(-60, Math.min(24, Number(clip.gain_db) || 0));
+    clip.fade_in = Math.max(0, Number(clip.fade_in) || 0);
+    clip.fade_out = Math.max(0, Number(clip.fade_out) || 0);
+    clip.mix_mode = clip.mix_mode === "replace" ? "replace" : "overlay";
+  }
+  return { steps, cues, clips: shot.audio_clips };
+}
+
+function clampExistingShotTimeline(shot, duration) {
+  const clamp = (item, minimum) => {
+    if (!Number.isFinite(Number(item?.start)) || !Number.isFinite(Number(item?.end))) return;
+    item.start = Math.max(0, Math.min(duration - minimum, Number(item.start)));
+    item.end = Math.max(item.start + minimum, Math.min(duration, Number(item.end)));
+  };
+  ensureShotSteps(shot).forEach(item => clamp(item, 1 / 24));
+  (shot.sound_cues || []).forEach(item => clamp(item, 1 / 24));
+  (shot.audio_clips || []).forEach(item => clamp(item, .001));
+}
+
 function shotStepSummary(shot) {
   const steps = ensureShotSteps(shot);
   const first = steps.find(step => String(step.text || "").trim());
@@ -2298,7 +2419,8 @@ function shotStepSummary(shot) {
 
 function localResolvedMode(document) {
   if (document?.mode && document.mode !== "auto") return document.mode;
-  const references = document?.references || [];
+  const references = (document?.references || []).filter(reference => !(reference.kind === "audio"
+    && (reference.roles || []).length === 1 && reference.roles[0] === "exact_audio"));
   const roles = new Set(references.flatMap(reference => reference.roles || []));
   if (references.some(reference => ["video", "audio"].includes(reference.kind))) return "ref2va";
   if ([...roles].some(role => !["first_frame", "last_frame"].includes(role))) return "ref2va";
@@ -2604,6 +2726,9 @@ function resetProjectReference(project, reference) {
     use_embedded_audio: false,
     source_width: Number(reference.source_width) || 0,
     source_height: Number(reference.source_height) || 0,
+    duration_seconds: Number(reference.duration_seconds) || 0,
+    audio_codec: reference.audio_codec || "",
+    audio_sample_rate: Number(reference.audio_sample_rate) || 0,
     observed_visual_facts: "",
     subject_candidates: [],
   };
@@ -2625,7 +2750,10 @@ function resetProject() {
   if (state.directorDialog?.open) state.directorDialog.close();
 
   const references = clone(project.document?.references || []);
-  for (const reference of references) state.mediaDimensionLoads.delete(reference.id);
+  for (const reference of references) {
+    state.mediaDimensionLoads.delete(reference.id);
+    state.mediaDurationLoads.delete(reference.id);
+  }
   for (const generation of project.generations || []) {
     stopGenerationPolling(generation.prompt_id);
     state.generationFailures.delete(String(generation.prompt_id || ""));
@@ -2668,7 +2796,7 @@ function addShot() {
   const shot = {
     id: makeId("shot"), start, transition: "the camera cuts to", composition: "", subjects: "",
     environment: "", lighting: "", camera: { type: "Static Shot", amplitude: "default", speed: "default", target: "" },
-    steps: [], visible_text: [], sounds: [], notes: "",
+    steps: [], visible_text: [], sounds: [], sound_cues: [], audio_clips: [], notes: "",
   };
   shots.push(shot);
   state.selectedShotId = shot.id;
@@ -3328,6 +3456,37 @@ async function assembleContinuation(record, segmentOutputs) {
   });
 }
 
+function documentHasExactAudio(document) {
+  return (document?.shots || []).some(shot => (shot.audio_clips || []).length);
+}
+
+async function assembleExactAudio(record, rawOutputs) {
+  const { project, generation } = record;
+  const source = outputDescriptor(rawOutputs?.[0]);
+  if (!source) throw new Error("Exact audio mixing is missing the rendered video output.");
+  state.generationProgress.set(String(generation.prompt_id), { phase: "assembling" });
+  updateGeneration(generation.prompt_id, { raw_outputs: clone(rawOutputs) });
+  const response = await api.fetchApi(EXACT_AUDIO_MIX_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project_id: project.id,
+      generation_id: generation.id,
+      source,
+      document: generation.document,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.output) throw new Error(data.error || "Exact audio could not be mixed into the render.");
+  updateGeneration(generation.prompt_id, {
+    status: "complete",
+    outputs: [data.output],
+    raw_outputs: clone(rawOutputs),
+    exact_audio_mixed: true,
+    error: "",
+  });
+}
+
 function pollGeneration(promptId) {
   const id = String(promptId || "");
   if (!id || state.generationPollers.has(id)) return;
@@ -3360,6 +3519,17 @@ function pollGeneration(promptId) {
                   outputs,
                   segment_outputs: outputs,
                   error: `The extension rendered, but cumulative assembly failed: ${error.message || error}`,
+                });
+              }
+            } else if (outputs.length && documentHasExactAudio(record.generation.document)) {
+              try {
+                await assembleExactAudio(record, outputs);
+              } catch (error) {
+                updateGeneration(id, {
+                  status: "error",
+                  outputs,
+                  raw_outputs: outputs,
+                  error: `The video rendered, but exact audio mixing failed: ${error.message || error}`,
                 });
               }
             } else {
@@ -3860,9 +4030,15 @@ function derivedReferenceTaskTypes(document) {
 
 function renderReferenceSemantics(project, refresh) {
   const section = inspectorDetails("Reference prompt semantics", localResolvedMode(project.document) === "ref2va");
-  const references = project.document.references || [];
+  const references = (project.document.references || []).filter(reference => !(reference.kind === "audio"
+    && (reference.roles || []).length === 1 && reference.roles[0] === "exact_audio"));
   if (!references.length) {
-    section.body.append(el("small", "psvstudio-help", "Add media references to configure REF2VA source semantics here."));
+    section.body.append(el(
+      "small", "psvstudio-help",
+      exactAudioReferences(project).length
+        ? "Exact audio is controlled inside each Shot Editor timeline and does not require REF2VA prompt semantics."
+        : "Add media references to configure REF2VA source semantics here.",
+    ));
     return section.details;
   }
 
@@ -4328,6 +4504,10 @@ function refreshTimelineGeometry(track, project, scale) {
 }
 
 function finishBoundaryResize(project) {
+  project.document.shots.forEach((shot, index) => clampExistingShotTimeline(
+    shot,
+    Math.max(1 / 24, Number(project.document.shots[index + 1]?.start ?? documentDuration(project)) - Number(shot.start || 0)),
+  ));
   markProjectChanged();
   renderTimeline();
   renderInspector();
@@ -4920,6 +5100,398 @@ function renderShotSteps(container, shot) {
   });
 }
 
+function exactAudioReferences(project = activeProject()) {
+  return (project?.document?.references || []).filter(reference => reference.kind === "audio"
+    && (reference.roles || []).length === 1 && reference.roles[0] === "exact_audio");
+}
+
+function fileAudioDuration(file) {
+  return new Promise(resolve => {
+    const audio = document.createElement("audio");
+    const url = URL.createObjectURL(file);
+    const finish = value => {
+      URL.revokeObjectURL(url);
+      resolve(Number.isFinite(value) && value > 0 ? value : 1);
+    };
+    audio.preload = "metadata";
+    audio.onloadedmetadata = () => finish(audio.duration);
+    audio.onerror = () => finish(1);
+    audio.src = url;
+  });
+}
+
+function addExactAudioClip(shot, reference, duration, sourceDuration = 1) {
+  const length = Math.max(1 / 1000, Math.min(duration, Number(sourceDuration) || 1));
+  const clip = {
+    id: makeId("audio-clip"), reference_id: reference.id, start: 0, end: length,
+    source_start: 0, source_end: null, gain_db: 0, fade_in: 0, fade_out: 0,
+    mix_mode: "overlay",
+  };
+  (shot.audio_clips ||= []).push(clip);
+  state.shotTimelineSelectionId = clip.id;
+  return clip;
+}
+
+async function importExactAudioFile(file, shot, duration) {
+  const project = activeProject();
+  if (!project || mediaKind(file) !== "audio") throw new Error("Choose a supported audio file.");
+  const exactLimit = Number(state.config?.reference_limits?.exact_audio_assets || 32);
+  if (exactAudioReferences(project).length >= exactLimit) {
+    throw new Error(`The project already has the maximum of ${exactLimit} exact audio assets.`);
+  }
+  setStatus(`Uploading ${file.name}…`, "working");
+  const browserDuration = await fileAudioDuration(file);
+  const path = await uploadMediaFile(file);
+  let metadata = {};
+  try {
+    metadata = await probeAudioPath(path);
+  } catch (_) {
+    metadata = { duration_seconds: browserDuration };
+  }
+  const sourceDuration = Number(metadata.duration_seconds) || browserDuration;
+  const reference = {
+    id: makeId("reference"), kind: "audio", path, name: file.name || path.split("/").pop(),
+    roles: ["exact_audio"], prompt: "", label: "", trim_start: 0, trim_end: null,
+    use_embedded_audio: false, source_width: 0, source_height: 0,
+    duration_seconds: sourceDuration, audio_codec: metadata.codec || "",
+    audio_sample_rate: Number(metadata.sample_rate) || 0,
+  };
+  (project.document.references ||= []).push(reference);
+  addExactAudioClip(shot, reference, duration, sourceDuration);
+  markProjectChanged();
+  setStatus(`${reference.name} added as exact timeline audio.`, "ready");
+}
+
+function snapShotTime(value, exact = false, fine = false) {
+  const step = exact && fine ? 0.001 : 1 / 24;
+  return Math.round(Number(value || 0) / step) * step;
+}
+
+function sortTimedShotItems(shot) {
+  ensureShotSteps(shot);
+  syncShotSoundCues(shot);
+  shot.sounds = shot.sound_cues.map(cue => cue.text);
+}
+
+function beginShotTimelineDrag(event, item, duration, block, {
+  exact = false, edge = "move", displayStart = 0, displayEnd = 1 / 24,
+} = {}) {
+  if (event.button != null && event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const track = block.parentElement;
+  const bounds = track.getBoundingClientRect();
+  const pointerStart = event.clientX;
+  const pointerId = event.pointerId;
+  const scheduled = Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end))
+    && Number(item.end) > Number(item.start);
+  const initialStart = scheduled ? Number(item.start) : Number(displayStart);
+  const initialEnd = scheduled ? Number(item.end) : Number(displayEnd);
+  const minimum = exact ? 0.001 : 1 / 24;
+  let moved = false;
+  block.classList.add("is-dragging", `is-dragging-${edge}`);
+  block.setAttribute("aria-grabbed", "true");
+  try {
+    if (pointerId != null && block.setPointerCapture) block.setPointerCapture(pointerId);
+  } catch (_) {
+    // Document-level listeners below remain a safe fallback in embedded browsers.
+  }
+  const updateBlock = () => {
+    block.style.left = `${item.start / duration * 100}%`;
+    block.style.width = `${Math.max(.25, (item.end - item.start) / duration * 100)}%`;
+    block.querySelector("small").textContent = `${item.start.toFixed(exact ? 3 : 2)}–${item.end.toFixed(exact ? 3 : 2)}s`;
+    block.setAttribute("aria-label", `${block.dataset.cueLabel}. Start ${item.start.toFixed(exact ? 3 : 2)} seconds, end ${item.end.toFixed(exact ? 3 : 2)} seconds.`);
+  };
+  const ownerDocument = block.ownerDocument;
+  const move = moveEvent => {
+    if (pointerId != null && moveEvent.pointerId != null && moveEvent.pointerId !== pointerId) return;
+    if (Math.abs(moveEvent.clientX - pointerStart) < 1) return;
+    moved = true;
+    const delta = (moveEvent.clientX - pointerStart) / Math.max(1, bounds.width) * duration;
+    if (edge === "left") {
+      item.start = Math.max(0, Math.min(initialEnd - minimum, snapShotTime(initialStart + delta, exact, moveEvent.altKey)));
+    } else if (edge === "right") {
+      item.end = Math.min(duration, Math.max(initialStart + minimum, snapShotTime(initialEnd + delta, exact, moveEvent.altKey)));
+    } else {
+      const length = initialEnd - initialStart;
+      item.start = Math.max(0, Math.min(duration - length, snapShotTime(initialStart + delta, exact, moveEvent.altKey)));
+      item.end = item.start + length;
+    }
+    if (!exact) item.timing_explicit = true;
+    block.classList.remove("is-auto");
+    updateBlock();
+  };
+  const finish = finishEvent => {
+    if (pointerId != null && finishEvent?.pointerId != null && finishEvent.pointerId !== pointerId) return;
+    ownerDocument.removeEventListener("pointermove", move, true);
+    ownerDocument.removeEventListener("pointerup", finish, true);
+    ownerDocument.removeEventListener("pointercancel", finish, true);
+    try {
+      if (pointerId != null && block.hasPointerCapture?.(pointerId)) block.releasePointerCapture(pointerId);
+    } catch (_) {
+      // The browser may already have released capture on pointerup.
+    }
+    block.classList.remove("is-dragging", `is-dragging-${edge}`);
+    block.setAttribute("aria-grabbed", "false");
+    if (moved) sortTimedShotItems(state.shotEditorDraft);
+    state.shotTimelineSelectionId = item.id;
+    renderShotEditorDialog();
+  };
+  ownerDocument.addEventListener("pointermove", move, true);
+  ownerDocument.addEventListener("pointerup", finish, true);
+  ownerDocument.addEventListener("pointercancel", finish, true);
+}
+
+function shotTimelineDragEdge(event, block) {
+  if (event.target.closest?.(".psvstudio-shot-cue-handle.is-left")) return "left";
+  if (event.target.closest?.(".psvstudio-shot-cue-handle.is-right")) return "right";
+  const bounds = block.getBoundingClientRect();
+  const edgeWidth = Math.min(14, Math.max(7, bounds.width / 3));
+  if (event.clientX - bounds.left <= edgeWidth) return "left";
+  if (bounds.right - event.clientX <= edgeWidth) return "right";
+  return "move";
+}
+
+function renderShotTimelineBlock(track, item, duration, kind, label, exact = false, displayRange = null) {
+  const scheduled = Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end))
+    && Number(item.end) > Number(item.start);
+  const start = scheduled ? Number(item.start) : Number(displayRange?.start || 0);
+  const end = scheduled ? Number(item.end) : Number(displayRange?.end || Math.min(duration, start + 1 / 24));
+  const block = el("button", `psvstudio-shot-cue is-${kind}${scheduled ? "" : " is-auto"}${state.shotTimelineSelectionId === item.id ? " is-selected" : ""}`);
+  block.type = "button";
+  block.dataset.cueLabel = label;
+  block.style.left = `${start / duration * 100}%`;
+  block.style.width = `${Math.max(.25, (end - start) / duration * 100)}%`;
+  block.title = scheduled
+    ? `${label} · drag to move · drag either edge to change start/end`
+    : `${label} · automatic chronological flow · drag to author timing`;
+  block.setAttribute("aria-label", scheduled
+    ? `${label}. Start ${start.toFixed(exact ? 3 : 2)} seconds, end ${end.toFixed(exact ? 3 : 2)} seconds. Drag to move or resize.`
+    : `${label}. Automatic chronological flow. Drag to assign timing.`);
+  block.setAttribute("aria-grabbed", "false");
+  block.append(
+    el("span", "psvstudio-shot-cue-handle is-left"),
+    el("strong", "", label),
+    el("small", "", scheduled ? `${start.toFixed(exact ? 3 : 2)}–${end.toFixed(exact ? 3 : 2)}s` : "Automatic flow"),
+    el("span", "psvstudio-shot-cue-handle is-right"),
+  );
+  block.addEventListener("click", () => {
+    state.shotTimelineSelectionId = item.id;
+    renderShotEditorDialog();
+  });
+  block.addEventListener("pointerdown", event => {
+    const edge = shotTimelineDragEdge(event, block);
+    beginShotTimelineDrag(event, item, duration, block, {
+      exact, edge, displayStart: start, displayEnd: end,
+    });
+  });
+  track.append(block);
+}
+
+function renderShotTimelineLane(timeline, label, kind, items, duration, name, exact = false) {
+  const lane = el("div", `psvstudio-shot-timeline-lane is-${kind}`);
+  lane.append(el("div", "psvstudio-shot-timeline-lane-label", label));
+  const track = el("div", "psvstudio-shot-timeline-track");
+  const slot = duration / Math.max(items.length, 1);
+  items.forEach((item, index) => {
+    const start = index * slot;
+    const visualLength = Math.min(slot * .82, Math.max(.5, duration * .25));
+    const end = Math.min(duration, Math.max(start + 1 / 24, start + visualLength));
+    renderShotTimelineBlock(track, item, duration, kind, name(item), exact, { start, end });
+  });
+  lane.append(track);
+  timeline.append(lane);
+}
+
+function timingNumberField(label, item, name, duration, render, { exact = false, nullable = false } = {}) {
+  const input = textInput(item[name] ?? "", (value, control) => {
+    if (nullable && control.value === "") item[name] = null;
+    else item[name] = Math.max(0, Number(value) || 0);
+    if (["start", "end"].includes(name)) {
+      const minimum = exact ? .001 : 1 / 24;
+      item.start = Math.min(duration - minimum, Number(item.start || 0));
+      item.end = Math.min(duration, Math.max(item.start + minimum, Number(item.end || 0)));
+      if (!exact) item.timing_explicit = true;
+    }
+  }, "number");
+  input.min = "0";
+  input.max = String(duration);
+  input.step = String(exact ? .001 : 1 / 24);
+  input.addEventListener("change", render);
+  return field(label, input);
+}
+
+function renderShotTimelineInspector(container, shot, duration) {
+  const steps = ensureShotSteps(shot);
+  const cues = syncShotSoundCues(shot);
+  const clips = shot.audio_clips || [];
+  const item = [...steps, ...cues, ...clips].find(value => value.id === state.shotTimelineSelectionId);
+  if (!item) {
+    container.append(el("div", "psvstudio-shot-timeline-hint", "Select a timeline item to edit precise timing. Hold Alt while dragging exact audio for 1 ms positioning."));
+    return;
+  }
+  const exact = clips.includes(item);
+  const automatic = !exact && (item.start == null || item.end == null);
+  const row = el("div", "psvstudio-shot-timeline-inspector-row");
+  row.append(
+    timingNumberField("Start in shot (s)", item, "start", duration, renderShotEditorDialog, { exact }),
+    timingNumberField("End in shot (s)", item, "end", duration, renderShotEditorDialog, { exact }),
+  );
+  if (steps.includes(item)) {
+    const badge = el("span", "psvstudio-shot-timeline-guarantee is-generated", "Generated timing guidance");
+    const open = button("Open event details", () => {
+      state.shotEditorExpandedStepIds.add(item.id);
+      state.shotEditorRevealStepId = item.id;
+      renderShotEditorDialog();
+    });
+    const automaticFlow = button("Use automatic flow", () => {
+      delete item.start;
+      delete item.end;
+      delete item.timing_explicit;
+      renderShotEditorDialog();
+    });
+    automaticFlow.disabled = automatic;
+    container.append(badge, row, automaticFlow, open);
+    return;
+  }
+  if (cues.includes(item)) {
+    const automaticFlow = button("Use automatic flow", () => {
+      delete item.start;
+      delete item.end;
+      delete item.timing_explicit;
+      renderShotEditorDialog();
+    });
+    automaticFlow.disabled = automatic;
+    container.append(
+      el("span", "psvstudio-shot-timeline-guarantee is-generated", "Generated timing guidance"),
+      row,
+      automaticFlow,
+      field("Sound description", textInput(item.text, value => {
+        item.text = value;
+        shot.sounds = cues.map(cue => cue.text).filter(Boolean);
+      }, "text")),
+      button("Remove sound", () => {
+        shot.sound_cues = cues.filter(cue => cue.id !== item.id);
+        shot.sounds = shot.sound_cues.map(cue => cue.text);
+        state.shotTimelineSelectionId = "";
+        renderShotEditorDialog();
+      }, "psvstudio-button psvstudio-button-danger"),
+    );
+    return;
+  }
+  const project = activeProject();
+  const references = exactAudioReferences(project);
+  const activeReference = references.find(reference => reference.id === item.reference_id);
+  const sourceEnd = timingNumberField("Source out (s)", item, "source_end", 86400, renderShotEditorDialog, { exact: true, nullable: true });
+  row.append(
+    timingNumberField("Source in (s)", item, "source_start", 86400, renderShotEditorDialog, { exact: true }),
+    sourceEnd,
+  );
+  const gain = textInput(item.gain_db ?? 0, value => { item.gain_db = Math.max(-60, Math.min(24, Number(value) || 0)); }, "number");
+  gain.min = "-60"; gain.max = "24"; gain.step = ".1";
+  const fades = el("div", "psvstudio-field-row");
+  fades.append(
+    timingNumberField("Fade in (s)", item, "fade_in", duration, renderShotEditorDialog, { exact: true }),
+    timingNumberField("Fade out (s)", item, "fade_out", duration, renderShotEditorDialog, { exact: true }),
+  );
+  container.append(
+    el("span", "psvstudio-shot-timeline-guarantee is-exact", "Exact post-render media"),
+    el(
+      "div", "psvstudio-shot-timeline-source-duration",
+      `${activeReference?.name || "Audio source"} · source duration ${Number(activeReference?.duration_seconds || 0).toFixed(3)}s · placed duration ${(Number(item.end) - Number(item.start)).toFixed(3)}s`,
+    ),
+    row,
+    field("Audio asset", selectInput(references.map(reference => ({
+      value: reference.id, label: reference.name || reference.path,
+    })), item.reference_id, value => { item.reference_id = value; })),
+    field("Mix mode", selectInput([
+      { value: "overlay", label: "Overlay generated audio" },
+      { value: "replace", label: "Replace generated audio in range" },
+    ], item.mix_mode, value => { item.mix_mode = value; })),
+    field("Gain (dB)", gain),
+    fades,
+    button("Remove audio clip", () => {
+      shot.audio_clips = clips.filter(clip => clip.id !== item.id);
+      state.shotTimelineSelectionId = "";
+      renderShotEditorDialog();
+    }, "psvstudio-button psvstudio-button-danger"),
+  );
+}
+
+function renderShotDetailTimeline(shot, duration) {
+  const project = activeProject();
+  const { steps, cues, clips } = ensureShotTimeline(shot, duration);
+  const wrapper = el("section", "psvstudio-shot-detail-timeline");
+  const header = el("div", "psvstudio-shot-detail-timeline-header");
+  const heading = el("div", "");
+  heading.append(
+    el("h3", "", "Inside this shot"),
+    el("small", "", `Shot-local timing · ${duration.toFixed(3)}s · drag blocks to move · drag edges to change start/end · overlaps allowed`),
+  );
+  const controls = el("div", "psvstudio-inline");
+  const exactReferences = exactAudioReferences(project);
+  exactReferences.forEach(reference => ensureAudioReferenceDuration(project, reference));
+  const audioSelect = selectInput(exactReferences.map(reference => ({
+    value: reference.id, label: reference.name || reference.path,
+  })), exactReferences[0]?.id || "", () => {});
+  audioSelect.disabled = !exactReferences.length;
+  const fileInput = el("input", "psvstudio-sr-only");
+  fileInput.type = "file";
+  fileInput.accept = "audio/*,.wav,.wave,.mp3,.flac,.ogg,.oga,.opus,.m4a,.aac,.aif,.aiff,.wma,.caf,.au";
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    try {
+      await importExactAudioFile(file, shot, duration);
+      renderShotEditorDialog();
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    }
+  });
+  controls.append(
+    button("Add sound", () => {
+      const cue = { id: makeId("sound"), text: "New synchronized sound" };
+      (shot.sound_cues ||= []).push(cue);
+      shot.sounds = shot.sound_cues.map(item => item.text);
+      state.shotTimelineSelectionId = cue.id;
+      renderShotEditorDialog();
+    }),
+    audioSelect,
+    button("Place audio", () => {
+      const reference = exactReferences.find(item => item.id === audioSelect.value);
+      if (!reference) return;
+      addExactAudioClip(shot, reference, duration, reference.duration_seconds || 1);
+      renderShotEditorDialog();
+    }),
+    button("Import audio", () => fileInput.click(), "psvstudio-button psvstudio-button-primary"),
+    fileInput,
+  );
+  header.append(heading, controls);
+  const ruler = el("div", "psvstudio-shot-timeline-ruler");
+  ruler.append(el("span", "psvstudio-shot-timeline-ruler-label", ""));
+  const rulerTrack = el("div", "psvstudio-shot-timeline-ruler-track");
+  const ticks = Math.max(2, Math.min(12, Math.ceil(duration * 2)));
+  for (let index = 0; index <= ticks; index += 1) {
+    const tick = el("span", index % 2 ? "" : "is-major", `${(duration * index / ticks).toFixed(2)}s`);
+    tick.style.left = `${index / ticks * 100}%`;
+    rulerTrack.append(tick);
+  }
+  ruler.append(rulerTrack);
+  const timeline = el("div", "psvstudio-shot-timeline-lanes");
+  renderShotTimelineLane(timeline, "ACTION", "action", steps.filter(step => step.type === "action"), duration, item => item.text || "Action");
+  renderShotTimelineLane(timeline, "DIALOGUE", "dialogue", steps.filter(step => step.type === "dialogue"), duration, item => item.text || "Dialogue");
+  renderShotTimelineLane(timeline, "SOUND", "sound", cues, duration, item => item.text || "Sound");
+  renderShotTimelineLane(timeline, "EXACT AUDIO", "audio", clips, duration, item => {
+    const reference = exactReferences.find(value => value.id === item.reference_id);
+    const sourceDuration = Number(reference?.duration_seconds || 0);
+    return `${reference?.name || "Audio clip"}${sourceDuration ? ` · ${sourceDuration.toFixed(3)}s source` : ""}`;
+  }, true);
+  const inspector = el("div", "psvstudio-shot-timeline-inspector");
+  renderShotTimelineInspector(inspector, shot, duration);
+  wrapper.append(header, ruler, timeline, inspector);
+  return wrapper;
+}
+
 function shotEditorChanged() {
   return Boolean(state.shotEditorDraft && state.shotEditorOriginal
     && JSON.stringify(state.shotEditorDraft) !== JSON.stringify(state.shotEditorOriginal));
@@ -4941,6 +5513,7 @@ function closeShotEditor({ force = false } = {}) {
   state.shotStepDragId = "";
   state.shotEditorExpandedStepIds = new Set();
   state.shotEditorRevealStepId = "";
+  state.shotTimelineSelectionId = "";
   return true;
 }
 
@@ -5008,6 +5581,11 @@ function renderShotEditorDialog() {
       draft.start = Math.max(previous, Math.min(next, Math.round(value * 24) / 24));
     }, "number", PLACEHOLDERS.cutTime);
     start.step = String(1 / 24);
+    start.addEventListener("change", () => {
+      const shotEnd = Number(project.document.shots[index + 1]?.start ?? project.document.duration_seconds);
+      ensureShotTimeline(draft, Math.max(1 / 24, shotEnd - Number(draft.start || 0)));
+      renderShotEditorDialog();
+    });
     essentials.body.append(field("Cut time", start));
   }
   const firstFrameLocked = index === 0 && (project.document.references || []).some(reference =>
@@ -5051,7 +5629,7 @@ function renderShotEditorDialog() {
       draft.visible_text = value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
     }, 3, PLACEHOLDERS.visibleText), "One exact item per line."),
     field("Synchronized sounds", textArea((draft.sounds || []).join("\n"), value => {
-      draft.sounds = value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+      syncShotSoundCues(draft, value.split(/\r?\n/).map(item => item.trim()).filter(Boolean));
     }, 3, PLACEHOLDERS.sounds), "One sound event per line."),
     field("Notes", textArea(draft.notes || "", value => { draft.notes = value; }, 3, "Production notes for this shot.")),
   );
@@ -5091,7 +5669,8 @@ function renderShotEditorDialog() {
   stepList.tabIndex = 0;
   stepList.ariaLabel = "Chronological shot steps";
   renderShotSteps(stepList, draft);
-  sequence.append(sequenceHeader, stepList);
+  const detailTimeline = renderShotDetailTimeline(draft, Math.max(1 / 24, end - Number(draft.start || 0)));
+  sequence.append(detailTimeline, sequenceHeader, stepList);
   workspace.append(setup, sequence);
 
   const footer = el("footer", "psvstudio-shot-editor-footer");
@@ -5129,8 +5708,10 @@ function openShotEditor(shotId = state.selectedShotId) {
   state.shotEditorShotId = shot.id;
   state.shotEditorDraft = clone(shot);
   state.shotEditorOriginal = clone(shot);
+  ensureShotTimeline(state.shotEditorDraft, shotLocalDuration(project, shot.id));
   state.shotEditorExpandedStepIds = new Set();
   state.shotEditorRevealStepId = "";
+  state.shotTimelineSelectionId = "";
   const dialog = el("dialog", "psvstudio-shot-editor-dialog");
   dialog.addEventListener("cancel", event => {
     event.preventDefault();
@@ -5271,7 +5852,12 @@ function renderGenerations() {
       bar.append(fill);
       body.append(bar);
       if (progress.phase === "finalizing") body.append(el("small", "psvstudio-help", "Finalizing…"));
-      if (progress.phase === "assembling") body.append(el("small", "psvstudio-help", "Extension rendered · assembling the cumulative version…"));
+      if (progress.phase === "assembling") body.append(el(
+        "small", "psvstudio-help",
+        documentHasExactAudio(generation.document)
+          ? "Video rendered · mixing exact timeline audio…"
+          : "Extension rendered · assembling the cumulative version…",
+      ));
     }
     if (generation.error) body.append(el("div", "psvstudio-help", generation.error));
     const actions = el("div", "psvstudio-inline");
@@ -5465,8 +6051,6 @@ function renderAll() {
 
 function buildPanel() {
   if (state.panel) return state.panel;
-  const settings = videoStudioSettings();
-  state.optimizePromptGeneration = settings.optimize_prompt_generation;
   const panel = el("section", "psvstudio-app");
   panel.hidden = true;
   panel.innerHTML = `
@@ -5489,7 +6073,6 @@ function buildPanel() {
         <span class="psvstudio-topbar-spacer"></span>
         <select id="psvstudio-workflow" class="psvstudio-workflow-select" aria-label="Video workflow"></select>
         <button id="psvstudio-refresh-workflows" class="psvstudio-button psvstudio-icon-button" type="button" title="Refresh [PSV] workflows" aria-label="Refresh [PSV] workflows">↻</button>
-        <button id="psvstudio-toggle-studio-settings" class="psvstudio-button psvstudio-icon-button" type="button" title="Video Studio settings" aria-label="Video Studio settings" aria-expanded="false">&#9881;</button>
         <details id="psvstudio-kobold-control" class="psvstudio-kobold-control" data-state="checking">
           <summary title="System status"><span class="psvstudio-kobold-dot" aria-hidden="true"></span><span id="psvstudio-kobold-status-label">Status: checking</span></summary>
           <div class="psvstudio-kobold-popover">
@@ -5501,8 +6084,8 @@ function buildPanel() {
                 <div><dt>Model</dt><dd id="psvstudio-kobold-model">Checking…</dd></div>
                 <div><dt>Vision</dt><dd id="psvstudio-kobold-vision" data-state="unknown">Checking…</dd></div>
               </dl>
-              <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Stop generation</button>
-              <small id="psvstudio-kobold-stop-help">Stops text generation only. KoboldCpp stays loaded.</small>
+              <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Force stop processing</button>
+              <small id="psvstudio-kobold-stop-help">Stops LLM processing only. KoboldCpp stays loaded.</small>
             </section>
             <section class="psvstudio-system-status-section">
               <div class="psvstudio-system-status-row"><strong>ComfyUI</strong><span id="psvstudio-comfy-status-detail" data-state="busy" role="status" aria-live="polite">Checking…</span></div>
@@ -5569,32 +6152,7 @@ function buildPanel() {
       </div>
       <div class="psvstudio-inspector-header"><h2 id="psvstudio-inspector-title">Shots</h2><button id="psvstudio-close-inspector" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close shots">×</button></div>
       <div id="psvstudio-inspector-content" class="psvstudio-inspector-content"></div>
-    </aside>
-    <div id="psvstudio-studio-settings" class="psvstudio-studio-settings" hidden>
-      <header class="psvstudio-studio-settings-header">
-        <div><strong>Settings</strong><span>Configure how Video Studio prepares Director requests.</span></div>
-        <span class="psvstudio-studio-settings-context">Video Studio</span>
-      </header>
-      <div class="psvstudio-studio-settings-layout">
-        <section class="psvstudio-studio-settings-card" aria-labelledby="psvstudio-prompt-generation-settings-title">
-          <header class="psvstudio-studio-settings-card-header">
-            <strong id="psvstudio-prompt-generation-settings-title">Prompt generation</strong>
-          </header>
-          <label class="psvstudio-studio-setting psvstudio-studio-setting-toggle">
-            <span class="psvstudio-studio-setting-copy">
-              <span class="psvstudio-studio-setting-title">
-                <strong>Optimize prompt generation</strong>
-                <span class="psvstudio-setting-tooltip" tabindex="0" aria-describedby="psvstudio-optimize-prompt-tooltip">?
-                  <span id="psvstudio-optimize-prompt-tooltip" class="psvstudio-setting-tooltip-content" role="tooltip">On uses Video Studio's compact, task-specific Director instructions. Turn it off to send the entire bundled MiniMax prompting guide with every Director request; this uses more LLM context.</span>
-                </span>
-              </span>
-              <small>Use the current compact Director prompt.</small>
-            </span>
-            <input id="psvstudio-optimize-prompt-generation" type="checkbox" role="switch" aria-label="Optimize prompt generation" ${settings.optimize_prompt_generation ? "checked" : ""} />
-          </label>
-        </section>
-      </div>
-    </div>`;
+    </aside>`;
 
   panel.querySelector("#psvstudio-new-project").addEventListener("click", newProject);
   panel.querySelector("#psvstudio-add-shot").addEventListener("click", addShot);
@@ -5615,10 +6173,6 @@ function buildPanel() {
   panel.querySelector("#psvstudio-reset").addEventListener("click", resetProject);
   panel.querySelector("#psvstudio-compile-preview").addEventListener("click", compilePreview);
   panel.querySelector("#psvstudio-refresh-workflows").addEventListener("click", () => refreshWorkflows());
-  panel.querySelector("#psvstudio-toggle-studio-settings").addEventListener("click", () => toggleVideoStudioSettings());
-  panel.querySelector("#psvstudio-optimize-prompt-generation").addEventListener("change", event => {
-    saveVideoStudioSettings(event.target.checked);
-  });
   panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopLlmGeneration);
   panel.querySelector("#psvstudio-comfy-restart").addEventListener("click", restartComfyUIFromStatus);
   panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
@@ -5646,21 +6200,6 @@ function buildPanel() {
   panel.querySelector("#psvstudio-close-inspector").addEventListener("click", () => {
     state.drawer = "";
     panel.dataset.drawer = "";
-  });
-  panel.addEventListener("click", event => {
-    const settingsPanel = panel.querySelector("#psvstudio-studio-settings");
-    const settingsToggle = panel.querySelector("#psvstudio-toggle-studio-settings");
-    if (
-      settingsPanel && !settingsPanel.hidden
-      && !settingsPanel.contains(event.target)
-      && !settingsToggle?.contains(event.target)
-    ) toggleVideoStudioSettings(false);
-  });
-  panel.addEventListener("keydown", event => {
-    if (event.key === "Escape" && !panel.querySelector("#psvstudio-studio-settings")?.hidden) {
-      toggleVideoStudioSettings(false);
-      panel.querySelector("#psvstudio-toggle-studio-settings")?.focus();
-    }
   });
   state.panel = panel;
   document.body.append(panel);

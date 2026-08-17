@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .contracts import PromptDocumentError, effective_duration, normalize_document
+from .contracts import PromptDocumentError, effective_duration, model_references, normalize_document
 
 
 def _canonical_tokens(value):
@@ -349,6 +349,125 @@ def _step_text(step, *, speaker_anchor=""):
     return ""
 
 
+def _event_text(text, prefix=""):
+    if not text:
+        return ""
+    content = str(text).strip()
+    if content and content[-1] in ".!?":
+        content = content[:-1]
+    return _sentence(" ".join(part for part in (prefix, content) if part), capitalize=False)
+
+
+def _legacy_auto_distributed_timing(events, shot_duration):
+    """Recognize ranges synthesized by the first Shot Editor timeline release.
+
+    Those equal contiguous slots were visual placeholders, but were persisted as
+    if the user had authored them.  Treat the exact legacy pattern as ordinary
+    chronological flow unless an item is explicitly marked as user-timed.
+    """
+    if len(events) < 2 or shot_duration <= 0:
+        return False
+    if any(event["item"].get("timing_explicit") for event in events):
+        return False
+    if any(
+        event["item"].get("start") is None or event["item"].get("end") is None
+        for event in events
+    ):
+        return False
+    ordered = sorted(events, key=lambda event: (
+        float(event["item"]["start"]), event["order"]
+    ))
+    first_start = float(ordered[0]["item"]["start"])
+    coverage = float(ordered[-1]["item"]["end"]) - first_start
+    if abs(first_start) > 0.02 or coverage < shot_duration * 0.8:
+        return False
+    slot = coverage / len(ordered)
+    tolerance = max(0.002, min(0.02, slot / 20))
+    return all(
+        abs(float(event["item"]["start"]) - (first_start + index * slot)) <= tolerance
+        and abs(float(event["item"]["end"]) - (first_start + (index + 1) * slot)) <= tolerance
+        for index, event in enumerate(ordered)
+    )
+
+
+def _event_end_sentence(kind, end, shot_duration):
+    if shot_duration <= 0:
+        return ""
+    noun = {"dialogue": "line", "sound": "sound", "action": "action"}.get(kind, "event")
+    if end >= shot_duration - 1 / 24:
+        return _sentence(f"The {noun} continues through the final frame")
+    position = end / shot_duration
+    phase = (
+        "early in the shot"
+        if position <= 0.4
+        else "around the middle of the shot"
+        if position <= 0.72
+        else "late in the shot"
+    )
+    verb = "finishes" if kind in {"dialogue", "action"} else "ends"
+    return _sentence(f"The {noun} {verb} {phase}")
+
+
+def _sequence_event_texts(events, shot_duration):
+    """Compile shot-local ranges into MiniMax's guide-native natural timeline.
+
+    The official H3 grammar timestamps cuts, not individual events.  Numeric
+    ranges therefore control ordering, overlap language, and relative phases
+    without being emitted as unsupported START/END labels.
+    """
+    events = [event for event in events if event.get("text")]
+    if not events:
+        return []
+    ignore_timing = _legacy_auto_distributed_timing(events, shot_duration)
+    if ignore_timing or not any(event["item"].get("start") is not None for event in events):
+        return [_event_text(event["text"]) for event in events]
+
+    count = len(events)
+    for event in events:
+        item = event["item"]
+        event["timed"] = item.get("start") is not None and item.get("end") is not None
+        event["effective_start"] = (
+            float(item["start"])
+            if event["timed"]
+            else (event["order"] + 0.5) / count * shot_duration
+        )
+    ordered = sorted(events, key=lambda event: (event["effective_start"], event["order"]))
+    result = []
+    prior_timed = []
+    for event in ordered:
+        if not event["timed"]:
+            result.append(_event_text(event["text"]))
+            continue
+        item = event["item"]
+        start = float(item["start"])
+        end = float(item["end"])
+        simultaneous = any(abs(float(previous["item"]["start"]) - start) <= 1 / 48 for previous in prior_timed)
+        overlapping = any(float(previous["item"]["end"]) > start + 1 / 48 for previous in prior_timed)
+        if simultaneous:
+            prefix = "At the same time,"
+        elif overlapping:
+            prefix = "While the preceding event continues,"
+        elif not prior_timed and start <= 1 / 48:
+            prefix = "Immediately at the start of the shot,"
+        elif prior_timed:
+            prefix = "Then,"
+        else:
+            position = start / shot_duration if shot_duration > 0 else 0
+            prefix = (
+                "Early in the shot,"
+                if position <= 0.4
+                else "Around the middle of the shot,"
+                if position <= 0.72
+                else "Late in the shot,"
+            )
+        result.append(" ".join(filter(None, (
+            _event_text(event["text"], prefix),
+            _event_end_sentence(event["kind"], end, shot_duration),
+        ))))
+        prior_timed.append(event)
+    return result
+
+
 def _shot_text(
     shot,
     index,
@@ -362,6 +481,7 @@ def _shot_text(
     speaker_anchor="",
     subject_continuity="",
     sound_texts=None,
+    shot_duration=0.0,
 ):
     if index == 0:
         prefix = "[Shot 1]"
@@ -395,18 +515,32 @@ def _shot_text(
     camera = _camera_sentence(shot.get("camera") or {})
     if camera:
         parts.append(camera)
-    parts.extend(
-        _step_text(step, speaker_anchor=speaker_anchor) for step in shot.get("steps") or []
-        if not suppress_audio or step.get("type") != "dialogue"
-    )
+    timed_events = []
+    event_order = 0
+    for step in shot.get("steps") or []:
+        if suppress_audio and step.get("type") == "dialogue":
+            continue
+        text = _step_text(step, speaker_anchor=speaker_anchor)
+        timed_events.append({
+            "item": step, "order": event_order, "text": text, "kind": step.get("type") or "event",
+        })
+        event_order += 1
     for visible in shot.get("visible_text") or []:
         escaped = visible.replace('"', '\\"')
         parts.append(_sentence(f'A visible text element reads "{escaped}"'))
     if not suppress_audio:
-        parts.extend(
-            _sentence(_canonical_tokens(sound))
-            for sound in (shot.get("sounds") or [] if sound_texts is None else sound_texts)
-        )
+        sounds = shot.get("sounds") or [] if sound_texts is None else sound_texts
+        cues = shot.get("sound_cues") or []
+        for sound_index, sound in enumerate(sounds):
+            cue = cues[sound_index] if sound_index < len(cues) else {}
+            timed_events.append({
+                "item": cue,
+                "order": event_order,
+                "text": _sentence(_canonical_tokens(sound)),
+                "kind": "sound",
+            })
+            event_order += 1
+    parts.extend(_sequence_event_texts(timed_events, shot_duration))
     body = " ".join(part for part in parts if part)
     return f"{prefix} {body}".strip()
 
@@ -426,6 +560,31 @@ def _base_alignment(mode, final_shot, duration):
         "How the reference pictures align with the target video — <Picture 1> "
         f"(from [Shot {final_shot}]) aligns with the {duration:.2f}-second mark of the target video."
     )
+
+
+def _document_shot_duration(document, index):
+    shot = document["shots"][index]
+    end = (
+        document["shots"][index + 1]["start"]
+        if index + 1 < len(document["shots"])
+        else effective_duration(document)
+    )
+    return max(1 / 24, float(end) - float(shot["start"]))
+
+
+def _soundscape_value(document):
+    if document["complete_silence"]:
+        return "N/A"
+    value = _canonical_tokens(document.get("overall_soundscape") or "").strip()
+    if value:
+        return value
+    has_synchronized_sound = any(shot.get("sounds") for shot in document.get("shots") or [])
+    if has_synchronized_sound:
+        return (
+            "The soundtrack contains only the dialogue and synchronized diegetic events described "
+            "in the shots, with no additional ambient layer specified."
+        )
+    return "No additional ambience, physical action sounds, or non-verbal human sounds are specified."
 
 
 def _compile_base(document):
@@ -450,12 +609,13 @@ def _compile_base(document):
                 if mode == "i2va"
                 else None
             ),
+            shot_duration=_document_shot_duration(document, index),
         )
         for index, shot in enumerate(document["shots"])
     )
     fields = [
         f"integrated_multimodal_description: {shots}",
-        f"overall_soundscape: {_canonical_tokens('N/A' if document['complete_silence'] else document['overall_soundscape'])}",
+        f"overall_soundscape: {_soundscape_value(document)}",
         f"non_diegetic_music: {_canonical_tokens('N/A' if document['complete_silence'] else (document['non_diegetic_music'] or 'N/A'))}",
     ]
     alignment = _base_alignment(mode, len(document["shots"]), duration)
@@ -670,6 +830,7 @@ def _compile_reference(document):
             first_frame_preserve_style=not external_style_tokens,
             suppress_audio=document["complete_silence"],
             subject_continuity=subject_continuity,
+            shot_duration=_document_shot_duration(document, index),
         ))
     shots = " ".join(shot_parts)
     has_first_frame = any(
@@ -685,7 +846,7 @@ def _compile_reference(document):
         f"summary:\n{summary}".rstrip(),
         f"retention_analysis:\n{retention}".rstrip(),
         f"detailed_description:\n{detailed}".rstrip(),
-        f"overall_soundscape:\n{_canonical_tokens('N/A' if document['complete_silence'] else document['overall_soundscape'])}".rstrip(),
+        f"overall_soundscape:\n{_soundscape_value(document)}".rstrip(),
         f"non_diegetic_music:\n{_canonical_tokens('N/A' if document['complete_silence'] else (document['non_diegetic_music'] or 'N/A'))}",
     ])
 
@@ -705,7 +866,7 @@ def _reference_semantic_issues(document):
         return issues
 
     roles = {
-        role for reference in document["references"] for role in reference.get("roles", [])
+        role for reference in model_references(document) for role in reference.get("roles", [])
     }
     expected_tasks = []
     if roles & {"first_frame", "last_frame"}:
@@ -750,7 +911,7 @@ def _reference_semantic_issues(document):
         issues.append("duplicate definitions: " + ", ".join(duplicate_definitions))
 
     definition_blob = " ".join(definition_blob_parts).casefold()
-    for reference in document["references"]:
+    for reference in model_references(document):
         token = _canonical_tokens(reference["label"])
         if token.casefold() not in definition_blob:
             issues.append(f"{token} is not represented in subject_definitions")

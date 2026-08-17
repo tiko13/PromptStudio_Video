@@ -604,6 +604,101 @@ class CompilerTests(unittest.TestCase):
         positions = [prompt.index(item) for item in ordered]
         self.assertEqual(positions, sorted(positions))
 
+    def test_timed_steps_and_sounds_compile_as_natural_relative_overlap(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [
+            {"id": "step-1", "type": "action", "text": "She reaches for the latch.", "start": 0.5, "end": 2.0},
+            {"id": "line-1", "type": "dialogue", "speaker_id": "S1", "text": "Wait.", "start": 1.0, "end": 1.75},
+        ]
+        value["shots"][0]["sounds"] = ["The latch clicks."]
+        value["shots"][0]["sound_cues"] = [{
+            "id": "sound-1", "text": "The latch clicks.", "start": 1.5, "end": 1.7,
+        }]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("Early in the shot, She reaches for the latch", prompt)
+        self.assertIn("While the preceding event continues, The speaker (S1) says", prompt)
+        self.assertIn("While the preceding event continues, The latch clicks", prompt)
+        self.assertNotIn("START=", prompt)
+        self.assertNotIn("DURATION=", prompt)
+
+    def test_zero_start_is_compiled_as_immediate_not_as_the_end_timestamp(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [{
+            "id": "line-1", "type": "dialogue", "speaker_id": "S1",
+            "text": "The first line.", "start": 0.0, "end": 1.67,
+        }]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("Immediately at the start of the shot, The speaker (S1) says", prompt)
+        self.assertIn("The line finishes early in the shot", prompt)
+        self.assertNotIn("1.67s", prompt)
+
+    def test_same_start_events_compile_as_simultaneous(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [{
+            "id": "line-1", "type": "dialogue", "speaker_id": "S1",
+            "text": "Now.", "start": 0.0, "end": 1.0,
+        }]
+        value["shots"][0]["sounds"] = ["A bell rings."]
+        value["shots"][0]["sound_cues"] = [{
+            "id": "sound-1", "text": "A bell rings.", "start": 0.0, "end": 0.5,
+        }]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("Immediately at the start of the shot", prompt)
+        self.assertIn("At the same time, A bell rings", prompt)
+
+    def test_legacy_equal_placeholder_slots_are_not_compiled_as_authored_timing(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [
+            {"id": "step-1", "type": "action", "text": "She looks up.", "start": 0.0, "end": 2.5},
+            {"id": "step-2", "type": "action", "text": "She closes the book.", "start": 2.5, "end": 5.0},
+        ]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("She looks up. She closes the book.", prompt)
+        self.assertNotIn("Immediately at the start of the shot", prompt)
+        self.assertNotIn("Then,", prompt)
+
+    def test_explicit_equal_slots_remain_user_authored(self):
+        value = base_document()
+        value["shots"][0].pop("dialogue")
+        value["shots"][0]["steps"] = [
+            {
+                "id": "step-1", "type": "action", "text": "She looks up.",
+                "start": 0.0, "end": 2.5, "timing_explicit": True,
+            },
+            {
+                "id": "step-2", "type": "action", "text": "She closes the book.",
+                "start": 2.5, "end": 5.0, "timing_explicit": True,
+            },
+        ]
+
+        prompt = compile_prompt(value)
+
+        self.assertIn("Immediately at the start of the shot", prompt)
+        self.assertIn("Then, She closes the book", prompt)
+
+    def test_blank_soundscape_gets_a_guide_complete_fallback(self):
+        value = base_document(overall_soundscape="")
+
+        prompt = compile_prompt(value)
+
+        self.assertIn(
+            "overall_soundscape: No additional ambience, physical action sounds, "
+            "or non-verbal human sounds are specified.",
+            prompt,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

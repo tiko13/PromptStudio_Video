@@ -36,6 +36,7 @@ REFERENCE_ROLES = {
     "audio_copy",
     "audio_reference",
 }
+POSTPROCESS_ROLES = {"exact_audio"}
 REFERENCE_KINDS = {"image", "video", "audio"}
 TASK_TYPES = {
     "keyframe completion",
@@ -211,13 +212,15 @@ def _normalize_reference(reference, index):
     if isinstance(roles, str):
         roles = [roles]
     roles = [_text(role).lower() for role in (roles or []) if _text(role)]
-    unknown = set(roles) - ANCHOR_ROLES - REFERENCE_ROLES
+    unknown = set(roles) - ANCHOR_ROLES - REFERENCE_ROLES - POSTPROCESS_ROLES
     if unknown:
         raise PromptDocumentError(
             f"Reference {index + 1} has unsupported role '{sorted(unknown)[0]}'"
         )
     if kind != "image" and set(roles) & ANCHOR_ROLES:
         raise PromptDocumentError("Only images can be first-frame or last-frame anchors")
+    if "exact_audio" in roles and (kind != "audio" or len(roles) != 1):
+        raise PromptDocumentError("Exact timeline audio must be a standalone audio media role")
     return {
         "id": _identifier(reference.get("id"), "reference"),
         "kind": kind,
@@ -235,6 +238,9 @@ def _normalize_reference(reference, index):
         "use_embedded_audio": bool(reference.get("use_embedded_audio", False)),
         "source_width": max(0, int(_number(reference.get("source_width"), 0))),
         "source_height": max(0, int(_number(reference.get("source_height"), 0))),
+        "duration_seconds": max(0.0, _number(reference.get("duration_seconds"), 0.0)),
+        "audio_codec": _text(reference.get("audio_codec")),
+        "audio_sample_rate": max(0, int(_number(reference.get("audio_sample_rate"), 0))),
         # Cached Director grounding is descriptive metadata, not prompt prose.
         # It lets later conversational turns keep stable subject bindings without
         # requiring the user to attach the same project reference again.
@@ -259,6 +265,21 @@ def _normalize_reference(reference, index):
             if isinstance(item, dict) and _text(item.get("name"))
         ][:16],
     }
+
+
+def is_exact_audio_reference(reference):
+    return (
+        reference.get("kind") == "audio"
+        and set(reference.get("roles") or []) == {"exact_audio"}
+    )
+
+
+def model_references(document):
+    """References sent to MiniMax rather than applied after generation."""
+    return [
+        reference for reference in document.get("references") or []
+        if not is_exact_audio_reference(reference)
+    ]
 
 
 def _normalize_dialogue(event, index):
@@ -300,15 +321,96 @@ def _normalize_step(step, index):
         raise PromptDocumentError(f"Shot step {index + 1} must be an object")
     step_type = _text(step.get("type")).lower()
     if step_type == "action":
-        return {
+        result = {
             "id": _identifier(step.get("id") or f"step-{index + 1}", "step"),
             "type": "action",
             "text": _text(step.get("text")),
         }
+        return {**result, **_optional_timing(step, f"Shot step {index + 1}")}
     if step_type == "dialogue":
         dialogue = _normalize_dialogue(step, index)
-        return {**dialogue, "type": "dialogue"}
+        return {
+            **dialogue,
+            "type": "dialogue",
+            **_optional_timing(step, f"Dialogue step {index + 1}"),
+        }
     raise PromptDocumentError(f"Shot step {index + 1} has unsupported type '{step_type}'")
+
+
+def _optional_timing(value, label):
+    if value.get("start") is None and value.get("end") is None:
+        return {}
+    start = max(0.0, _number(value.get("start"), 0.0))
+    end = _number(value.get("end"), start)
+    if end <= start:
+        raise PromptDocumentError(f"{label} end time must be after its start time")
+    timing = {"start": start, "end": end}
+    if value.get("timing_explicit") is True:
+        timing["timing_explicit"] = True
+    return timing
+
+
+def _normalize_sound_cues(shot):
+    raw_cues = shot.get("sound_cues") or []
+    if not isinstance(raw_cues, list):
+        raise PromptDocumentError("Shot sound_cues must be a list")
+    cue_pool = [item for item in raw_cues if isinstance(item, dict)]
+    raw_sounds = shot.get("sounds")
+    if raw_sounds is None and cue_pool:
+        raw_sounds = [item.get("text") for item in cue_pool]
+    sounds = [str(value).strip() for value in (raw_sounds or []) if str(value).strip()]
+    used = set()
+    cues = []
+    for index, text in enumerate(sounds):
+        match_index = next((
+            cue_index for cue_index, cue in enumerate(cue_pool)
+            if cue_index not in used and _text(cue.get("text")) == text
+        ), None)
+        cue = cue_pool[match_index] if match_index is not None else {}
+        if match_index is not None:
+            used.add(match_index)
+        cues.append({
+            "id": _identifier(cue.get("id") or f"sound-{index + 1}", "sound"),
+            "text": text,
+            **_optional_timing(cue, f"Sound cue {index + 1}"),
+        })
+    return sounds, cues
+
+
+def _normalize_audio_clip(value, index):
+    if not isinstance(value, dict):
+        raise PromptDocumentError(f"Exact audio clip {index + 1} must be an object")
+    start = max(0.0, _number(value.get("start"), 0.0))
+    end = _number(value.get("end"), start + 1.0)
+    if end <= start:
+        raise PromptDocumentError(f"Exact audio clip {index + 1} end time must be after its start time")
+    source_start = max(0.0, _number(value.get("source_start"), 0.0))
+    source_end = (
+        max(0.0, _number(value.get("source_end")))
+        if value.get("source_end") is not None
+        else None
+    )
+    if source_end is not None and source_end <= source_start:
+        raise PromptDocumentError(f"Exact audio clip {index + 1} source range is empty")
+    mix_mode = _text(value.get("mix_mode"), "overlay").lower()
+    if mix_mode not in {"overlay", "replace"}:
+        raise PromptDocumentError(f"Exact audio clip {index + 1} has unsupported mix mode")
+    duration = end - start
+    reference_id = _text(value.get("reference_id"))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", reference_id):
+        raise PromptDocumentError(f"Exact audio clip {index + 1} has an invalid media reference")
+    return {
+        "id": _identifier(value.get("id") or f"audio-clip-{index + 1}", "audio-clip"),
+        "reference_id": reference_id,
+        "start": start,
+        "end": end,
+        "source_start": source_start,
+        "source_end": source_end,
+        "gain_db": min(24.0, max(-60.0, _number(value.get("gain_db"), 0.0))),
+        "fade_in": min(duration, max(0.0, _number(value.get("fade_in"), 0.0))),
+        "fade_out": min(duration, max(0.0, _number(value.get("fade_out"), 0.0))),
+        "mix_mode": mix_mode,
+    }
 
 
 def _normalize_shot(shot, index):
@@ -354,6 +456,11 @@ def _normalize_shot(shot, index):
                 candidate = f"{prefix}-{suffix}"
             step["id"] = candidate
         used_step_ids.add(candidate)
+    sounds, sound_cues = _normalize_sound_cues(shot)
+    audio_clips = [
+        _normalize_audio_clip(value, clip_index)
+        for clip_index, value in enumerate(shot.get("audio_clips") or [])
+    ]
     return {
         "id": _identifier(shot.get("id"), "shot"),
         "start": max(0.0, _number(shot.get("start"), 0.0 if index == 0 else index * 2.0)),
@@ -370,7 +477,9 @@ def _normalize_shot(shot, index):
         },
         "steps": steps,
         "visible_text": [str(value).strip() for value in (shot.get("visible_text") or []) if str(value).strip()],
-        "sounds": [str(value).strip() for value in (shot.get("sounds") or []) if str(value).strip()],
+        "sounds": sounds,
+        "sound_cues": sound_cues,
+        "audio_clips": audio_clips,
         "notes": _text(shot.get("notes")),
     }
 
@@ -381,7 +490,7 @@ def resolve_mode(document):
         raise PromptDocumentError(f"Unsupported MiniMax mode '{explicit}'")
     if explicit != "auto":
         return explicit
-    references = document.get("references") or []
+    references = model_references(document)
     roles = {role for reference in references for role in reference.get("roles", [])}
     if any(reference.get("kind") in {"video", "audio"} for reference in references):
         return "ref2va"
@@ -455,6 +564,9 @@ def normalize_document(value):
     label_counts = {"image": 0, "video": 0, "audio": 0}
     label_names = {"image": "Picture", "video": "Video", "audio": "Audio"}
     for reference in references:
+        if is_exact_audio_reference(reference):
+            reference["label"] = ""
+            continue
         label_counts[reference["kind"]] += 1
         reference["label"] = f"<{label_names[reference['kind']]} {label_counts[reference['kind']]}>"
     shots = [
@@ -472,6 +584,33 @@ def normalize_document(value):
         if index and shot["start"] >= final_time:
             raise PromptDocumentError("Shot cut times must fall inside the effective duration")
         previous = shot["start"]
+    exact_reference_ids = {
+        reference["id"] for reference in references
+        if is_exact_audio_reference(reference)
+    }
+    for index, shot in enumerate(shots):
+        shot_duration = (
+            shots[index + 1]["start"] if index + 1 < len(shots) else final_time
+        ) - shot["start"]
+        for step in shot["steps"]:
+            if step.get("end") is not None and step["end"] > shot_duration + 1e-9:
+                raise PromptDocumentError(
+                    f"Shot {index + 1} step timing exceeds its {shot_duration:.3f}s duration"
+                )
+        for cue in shot["sound_cues"]:
+            if cue.get("end") is not None and cue["end"] > shot_duration + 1e-9:
+                raise PromptDocumentError(
+                    f"Shot {index + 1} sound timing exceeds its {shot_duration:.3f}s duration"
+                )
+        for clip in shot["audio_clips"]:
+            if clip["reference_id"] not in exact_reference_ids:
+                raise PromptDocumentError(
+                    f"Shot {index + 1} exact audio clip does not reference exact-audio media"
+                )
+            if clip["end"] > shot_duration + 1e-9:
+                raise PromptDocumentError(
+                    f"Shot {index + 1} exact audio clip exceeds its {shot_duration:.3f}s duration"
+                )
     document = {
         "version": DOCUMENT_VERSION,
         "mode": _text(value.get("mode"), "auto").lower(),
@@ -526,10 +665,11 @@ def normalize_document(value):
                 document["target_megapixels"],
             )
     document["resolved_mode"] = resolve_mode(document)
-    roles = {role for reference in references for role in reference["roles"]}
-    first_count = sum("first_frame" in reference["roles"] for reference in references)
-    last_count = sum("last_frame" in reference["roles"] for reference in references)
-    if document["resolved_mode"] == "t2va" and references:
+    generation_references = model_references(document)
+    roles = {role for reference in generation_references for role in reference["roles"]}
+    first_count = sum("first_frame" in reference["roles"] for reference in generation_references)
+    last_count = sum("last_frame" in reference["roles"] for reference in generation_references)
+    if document["resolved_mode"] == "t2va" and generation_references:
         raise PromptDocumentError("T2VA mode does not accept media references")
     if document["resolved_mode"] == "i2va" and (first_count != 1 or last_count):
         raise PromptDocumentError("I2VA mode requires exactly one first-frame image")
@@ -537,7 +677,7 @@ def normalize_document(value):
         raise PromptDocumentError("FL2VA mode requires one first-frame and one last-frame image")
     if document["resolved_mode"] == "l2va" and (last_count != 1 or first_count):
         raise PromptDocumentError("L2VA mode requires exactly one last-frame image")
-    if document["resolved_mode"] == "ref2va" and not references:
+    if document["resolved_mode"] == "ref2va" and not generation_references:
         raise PromptDocumentError("REF2VA mode requires at least one reference asset")
     if document["resolved_mode"] == "ref2va" and not document["task_types"]:
         derived = []

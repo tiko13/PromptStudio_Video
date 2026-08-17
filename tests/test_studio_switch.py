@@ -138,12 +138,18 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("void pollDefaultSetup(job.id)", self.source)
 
     def test_director_progress_prefers_live_token_counts(self):
+        activity_start = self.source.index("function llmActivityLabel")
+        activity_end = self.source.index("function llmGeneratedTokenCount", activity_start)
+        activity = self.source[activity_start:activity_end]
         start = self.source.index("function directorJobStatusText")
         end = self.source.index("async function pollDirectorJob", start)
         progress = self.source[start:end]
+        self.assertIn('return "Processing"', activity)
+        self.assertIn('return "Thinking / processing"', activity)
         self.assertIn("llmGeneratedTokenCount(provider)", progress)
         self.assertIn("tokens received", progress)
         self.assertIn("llmActivityLabel", progress)
+        self.assertNotIn("Director is generating", progress)
 
 
 if __name__ == "__main__":
