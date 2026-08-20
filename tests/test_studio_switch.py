@@ -121,6 +121,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("studio.llamacpp_url", self.source)
         self.assertIn("studio.llamacpp_model", self.source)
         self.assertIn("studio.llamacpp_config_profile", self.source)
+        self.assertIn("studio.llamacpp_autostart", self.source)
         self.assertIn("profile.llamacpp_reasoning_budget_tokens", self.source)
         self.assertIn("Shared Prompt Studio LLM", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)

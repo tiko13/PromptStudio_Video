@@ -267,6 +267,7 @@ function directorSettings() {
     llamacpp_model: studio.llamacpp_model || "",
     llamacpp_executable: studio.llamacpp_executable || "",
     llamacpp_config_profile: studio.llamacpp_config_profile || "",
+    llamacpp_autostart: studio.llamacpp_autostart === true,
     llamacpp_reasoning_budget_tokens: Math.max(0, Math.min(
       262144,
       Number(profile.llamacpp_reasoning_budget_tokens ?? studio.llamacpp_reasoning_budget_tokens ?? 0),

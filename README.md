@@ -97,7 +97,8 @@ This repository is under active development. The sections below cover requiremen
 ## Requirements
 
 - The companion `ComfyUI_PromptStudio` repository, which owns shared local-LLM
-  settings and Llama.cpp server management.
+  settings and Llama.cpp server management, including optional startup with
+  ComfyUI and its delayed shutdown watchdog when ComfyUI exits.
 - A current ComfyUI build containing the native MiniMax H3 and video nodes.
 - MiniMax H3 model, text encoder, and VAE files.
 - KJNodes is recommended for the optimized workflow path. It is not imported by
