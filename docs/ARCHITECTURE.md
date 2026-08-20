@@ -78,6 +78,15 @@ chronological `steps` replacements on that selected shot, plus reference-semanti
 fields when an attached reference must be activated for that shot. Neither scope receives
 the compiled queue prompt or unlimited conversation history.
 
+Each turn first passes through a constrained, zero-temperature local-LLM router
+using Prompt Studio's shared provider dispatch. The router classifies semantic
+intent as proposal, discussion, or clarification from bounded conversation and
+can resolve context-dependent follow-ups. It also marks strictly reference-only
+assignments so their preservation policy does not accidentally capture an
+attached-reference motion request. A failed router falls back to automatic mode:
+the main Director may answer conversationally, while any proposal it emits is
+still validated instead of being silently discarded.
+
 Conversational answers do not mutate project state. Requested edits use a
 video-specific change set whose base-document hash, scope, target IDs, field
 allowlists, camera vocabulary, timing, reference coverage, and normalized
@@ -119,9 +128,10 @@ compact toolbar control polls without acquiring the Director LLM lock, so it
 can report both LLM and ComfyUI health or stop a runaway KoboldCpp generation
 while the Director job is still blocked.
 
-Sampling is intent-sensitive. Conversational advice uses the configured
-temperature, structured proposal requests cap it at `0.2`, and the single
-contract-correction retry uses `0.0` to favor exact document enums.
+Sampling is intent-sensitive. The intent-router request uses disabled thinking,
+zero temperature, and a small structured response budget. Conversational advice
+uses the configured temperature, structured proposal requests cap it at `0.2`,
+and contract-correction retries use `0.0` to favor exact document enums.
 
 Director image attachments are uploaded to normal ComfyUI input storage and
 loaded only through validated paths beneath that directory. A per-image usage

@@ -206,10 +206,14 @@ selection, and managed-server configuration. Video Studio reuses those saved set
 Prompt Studio status/model-management APIs while keeping only its Director
 message/context assembly and a thin adapter to those shared services here.
 
-Advice-only turns keep the normal conversational sampling temperature. Edit
-requests that require a structured proposal cap temperature at `0.2` so camera
-types and the document's other enums remain stable; an automatic contract-
-correction attempt uses `0.0`.
+Before the main answer, a small zero-temperature structured LLM router classifies
+the newest turn as a concrete proposal request, discussion, or clarification.
+It reads bounded recent conversation, so declarative motion descriptions,
+screenplay-like fragments, polite commands, corrections, and follow-ups are not
+limited to a hard-coded verb list. Advice-only turns keep the normal
+conversational sampling temperature. Edit requests that require a structured
+proposal cap temperature at `0.2` so camera types and the document's other enums
+remain stable; automatic contract correction uses `0.0`.
 
 Exploratory questions and requests for explanation remain conversational and
 do not create an Apply action. Direct edit commands, including politely worded
@@ -263,11 +267,13 @@ containing protected dialogue or visible text. Every proposal is previewed
 against a document hash, normalized, compiled, and applied only after
 confirmation.
 
-Explicit requests to create, compose, generate, or apply the full prompt require
-a structured proposal. If a local model returns only prose, Video Studio makes
-one automatic correction attempt with a larger response allowance; if that also
-omits the change set, the response reports the omission instead of implying it
-can be applied.
+Concrete requests to create, compose, generate, revise, or apply video content
+require a structured proposal. If a local model returns only prose or an invalid
+change set, Video Studio makes up to three automatic correction attempts with a
+larger response allowance; if those omit a valid change set, the response
+reports the omission instead of implying it can be applied. If intent routing
+itself fails, automatic fallback mode preserves and validates any proposal the
+main Director returns rather than silently deleting it.
 
 Up to four images may be dragged into a Director turn or selected with **Add
 image**. Each attachment has an explicit usage:

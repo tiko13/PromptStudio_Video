@@ -672,6 +672,8 @@ function ensureDirectorVariants(message) {
       clarification: variant.clarification || null,
       pending_plan: variant.pending_plan || null,
       context_usage: variant.context_usage || null,
+      intent_route: String(variant.intent_route || ""),
+      intent_warning: String(variant.intent_warning || ""),
       created_at: Number(variant.created_at || message.created_at || Date.now()),
     }));
   if (!message.variants.length) {
@@ -685,6 +687,8 @@ function ensureDirectorVariants(message) {
       clarification: message.clarification || null,
       pending_plan: message.pending_plan || null,
       context_usage: message.context_usage || null,
+      intent_route: String(message.intent_route || ""),
+      intent_warning: String(message.intent_warning || ""),
       created_at: Number(message.created_at || Date.now()),
     });
   }
@@ -708,6 +712,8 @@ function syncDirectorVariant(message, index) {
   message.clarification = variant.clarification || null;
   message.pending_plan = variant.pending_plan || null;
   message.context_usage = variant.context_usage || null;
+  message.intent_route = variant.intent_route || "";
+  message.intent_warning = variant.intent_warning || "";
   return variant;
 }
 
@@ -1106,6 +1112,9 @@ function renderDirectorDialog() {
     } else if (message.proposal_error) {
       card.append(el("small", "psvstudio-director-error", `Proposal not applied: ${message.proposal_error}`));
     }
+    if (message.intent_warning) {
+      card.append(el("small", "psvstudio-director-error", `Intent routing fell back to automatic mode: ${message.intent_warning}`));
+    }
     const canNavigateResponses = message.role === "assistant"
       && messageIndex === session.messages.length - 1
       && session.messages[messageIndex - 1]?.role === "user";
@@ -1365,6 +1374,9 @@ async function requestDirectorResponse(pending, sessionId) {
 function directorJobStatusText(job) {
   if (job.status === "queued") return "Director request is queued…";
   const progress = job.director_progress || {};
+  if (progress.phase === "intent_classification") {
+    return "Classifying this turn as a concrete edit or discussion…";
+  }
   if (progress.phase === "proposal_correction") {
     const attempt = Math.max(1, Number(progress.attempt) || 1);
     const maximum = Math.max(attempt, Number(progress.maximum_attempts) || attempt);
@@ -1489,7 +1501,8 @@ function applyDirectorJobResult(session, pending, data) {
       proposal: data.proposal || null, proposal_error: String(data.proposal_error || ""),
       proposal_state: "", status: String(data.status || "ready"),
       clarification: data.clarification || null, pending_plan: data.pending_plan || null,
-      context_usage: data.context_usage || null, created_at: Date.now(),
+      context_usage: data.context_usage || null, intent_route: String(data.intent_route || ""),
+      intent_warning: String(data.intent_warning || ""), created_at: Date.now(),
     });
     syncDirectorVariant(message, variants.length - 1);
   } else {
@@ -1497,7 +1510,9 @@ function applyDirectorJobResult(session, pending, data) {
       id: makeId("director-message"), role: "assistant", text: String(data.message || "").trim() || "No response.",
       proposal: data.proposal || null, proposal_error: String(data.proposal_error || ""),
       status: String(data.status || "ready"), clarification: data.clarification || null,
-      pending_plan: data.pending_plan || null, context_usage: data.context_usage || null, created_at: Date.now(),
+      pending_plan: data.pending_plan || null, context_usage: data.context_usage || null,
+      intent_route: String(data.intent_route || ""), intent_warning: String(data.intent_warning || ""),
+      created_at: Date.now(),
     };
     ensureDirectorVariants(assistant);
     session.messages.push(assistant);

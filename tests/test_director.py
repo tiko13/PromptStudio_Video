@@ -9,6 +9,8 @@ from video.director import (
     CHANGESET_END,
     PROJECT_SYSTEM_MESSAGE,
     SHOT_SYSTEM_MESSAGE,
+    DIRECTOR_TURN_RESPONSE_SCHEMA,
+    DIRECTOR_TURN_ROUTER_SYSTEM_MESSAGE,
     VISION_GROUNDING_SYSTEM_MESSAGE,
     build_provider_messages,
     compact_project_context,
@@ -48,7 +50,8 @@ from video.director import (
     _parse_vision_grounding,
     _preserve_reference_only_request,
     _proposal_retry_messages,
-    _proposal_requested,
+    _classify_director_turn,
+    _parse_director_turn_route,
     _bounded_history,
     _restrict_first_frame_proposal,
     _restrict_reference_only_proposal,
@@ -105,6 +108,18 @@ def provider_context(messages):
 
 
 class DirectorTests(unittest.TestCase):
+    def setUp(self):
+        self.turn_intent = {
+            "route": "mutate", "confidence": 1.0, "resolved_instruction": "",
+            "reference_only": False, "reason": "Test route.",
+        }
+        router = patch(
+            "video.director._classify_director_turn",
+            side_effect=lambda _data: copy.deepcopy(self.turn_intent),
+        )
+        self.turn_router = router.start()
+        self.addCleanup(router.stop)
+
     @staticmethod
     def i2va_document():
         value = director_document()
@@ -1030,6 +1045,7 @@ class DirectorTests(unittest.TestCase):
         request = {
             "attachments": [{"path": "woman.png", "usage": "subject"}],
             "messages": [{"role": "user", "content": "Make this the identity reference."}],
+            "_turn_intent": {"route": "mutate", "reference_only": True},
         }
         with self.assertRaisesRegex(ValueError, "preserve shot-1 action steps verbatim"):
             _validate_reference_only_preservation(original, changed, request)
@@ -1069,6 +1085,7 @@ class DirectorTests(unittest.TestCase):
         request = {
             "attachments": [{"path": "action.png", "usage": "action"}],
             "messages": [{"role": "user", "content": "Use this as the action reference."}],
+            "_turn_intent": {"route": "mutate", "reference_only": True},
         }
         proposal = {
             "operations": [{
@@ -1461,41 +1478,75 @@ class DirectorTests(unittest.TestCase):
         preview = preview_changeset(document, parsed["proposal"])
         self.assertEqual(preview["document"]["shots"][1]["camera"]["type"], "POV")
 
-    def test_switch_and_convert_wording_requests_a_proposal(self):
-        for instruction in ("Switch this shot to POV.", "Convert this shot to first person."):
-            with self.subTest(instruction=instruction):
-                self.assertTrue(_proposal_requested({
-                    "messages": [{"role": "user", "content": instruction}],
-                }))
+    def test_turn_router_uses_constrained_llm_for_natural_motion_language(self):
+        routed = json.dumps({
+            "route": "mutate",
+            "confidence": 0.97,
+            "resolved_instruction": "Have the woman rise and exit frame left in one continuous take.",
+            "reference_only": False,
+            "reason": "The user describes the concrete desired motion.",
+        })
+        with patch("video.director.generate_chat", return_value=routed) as generate:
+            result = _classify_director_turn({
+                "scope": "shot",
+                "thinking_mode": "High",
+                "max_response_tokens": 0,
+                "messages": [
+                    {"role": "user", "content": "Keep it continuous."},
+                    {"role": "assistant", "content": "She could rise or remain seated."},
+                    {"role": "user", "content": "A slow rise, then out through the left door."},
+                ],
+            })
 
-    def test_exploratory_questions_do_not_force_a_document_proposal(self):
-        for instruction in (
-            "How could I improve the pacing?",
-            "Do you think she walks too fast?",
-            "Would a push-in work better here?",
-            "Can you explain how to improve the ending?",
-            "Why does the dialogue feel awkward?",
-            "Do you think the lyrics are too long?",
-            "Why not add dialogue?",
-            "What would improve the pacing?",
-            "Could a push-in improve it?",
-            "Which camera move would work better?",
-        ):
-            with self.subTest(instruction=instruction):
-                self.assertFalse(_proposal_requested({
-                    "messages": [{"role": "user", "content": instruction}],
-                }))
+        self.assertEqual(result["route"], "mutate")
+        self.assertIn("rise and exit frame left", result["resolved_instruction"])
+        request_data, messages, images = generate.call_args.args
+        self.assertEqual(request_data["thinking_mode"], "Disabled")
+        self.assertEqual(request_data["max_response_tokens"], 320)
+        self.assertEqual(request_data["temperature"], 0.0)
+        self.assertEqual(request_data["_response_schema"], DIRECTOR_TURN_RESPONSE_SCHEMA)
+        self.assertEqual(images, [])
+        self.assertEqual(messages[0]["content"], DIRECTOR_TURN_ROUTER_SYSTEM_MESSAGE)
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual(payload["recent_conversation"][-1]["content"], "A slow rise, then out through the left door.")
 
-    def test_polite_explicit_director_commands_still_request_a_proposal(self):
-        for instruction in (
-            "Could you improve the pacing?",
-            "Can you please change this shot to a push-in?",
-            "Would you add a reaction shot?",
+    def test_turn_router_retries_one_invalid_json_answer(self):
+        routed = json.dumps({
+            "route": "discuss", "confidence": 0.9, "resolved_instruction": "",
+            "reference_only": False, "reason": "The user asks for alternatives.",
+        })
+        with patch("video.director.generate_chat", side_effect=["not json", routed]) as generate:
+            result = _classify_director_turn({
+                "messages": [{"role": "user", "content": "Give me three ways she could leave."}],
+            })
+
+        self.assertEqual(result["route"], "discuss")
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("previous response was invalid", generate.call_args.args[1][0]["content"])
+
+    def test_turn_router_parser_normalizes_and_rejects_routes(self):
+        parsed = _parse_director_turn_route(json.dumps({
+            "route": "MUTATE", "confidence": 4, "resolved_instruction": "", "reference_only": True,
+            "reason": "Reference assignment.",
+        }))
+        self.assertEqual(parsed["route"], "mutate")
+        self.assertEqual(parsed["confidence"], 1.0)
+        self.assertTrue(parsed["reference_only"])
+        with self.assertRaisesRegex(ValueError, "route is invalid"):
+            _parse_director_turn_route(json.dumps({"route": "apply"}))
+
+    def test_turn_router_contract_covers_audited_everyday_phrasings(self):
+        for phrase in (
+            "She rises from the chair and exits frame left.",
+            "A slow rise, then out through the door.",
+            "Maybe have her leave through the other door.",
+            "Would it work better if she left slowly?",
+            "Can she stand and walk out in five seconds?",
+            "Give me three alternatives.",
+            "What should she say here?",
         ):
-            with self.subTest(instruction=instruction):
-                self.assertTrue(_proposal_requested({
-                    "messages": [{"role": "user", "content": instruction}],
-                }))
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, DIRECTOR_TURN_ROUTER_SYSTEM_MESSAGE)
 
     def test_current_director_command_is_rejected_instead_of_tail_truncated(self):
         current = "DO NOT ADD A DOG. " + "x" * 300
@@ -1523,24 +1574,14 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(omitted, 2)
 
     def test_dialogue_line_requests_require_an_applicable_proposal(self):
-        for instruction in (
-            "Create a line of dialogue for her.",
-            "Give the woman a good line here.",
-            "What should she say in this moment?",
-        ):
-            with self.subTest(instruction=instruction):
-                self.assertTrue(_proposal_requested({
-                    "messages": [{"role": "user", "content": instruction}],
-                }))
-        self.assertTrue(_proposal_requested({
-            "messages": [{"role": "user", "content": "Suggest a line and change the camera to a push-in."}],
-        }))
-        self.assertTrue(_proposal_requested({
-            "messages": [{
-                "role": "user",
-                "content": 'The girl from Picture 1 says "Come here dear". Then another girl enters.',
-            }],
-        }))
+        self.assertIn(
+            "Requests to author one exact spoken or sung line are mutate",
+            DIRECTOR_TURN_ROUTER_SYSTEM_MESSAGE,
+        )
+        self.assertIn(
+            "requests for several possible lines are discuss",
+            DIRECTOR_TURN_ROUTER_SYSTEM_MESSAGE,
+        )
 
     def test_dialogue_changeset_preserves_existing_sequence(self):
         document = normalize_document(director_document())
@@ -1936,6 +1977,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_args.args[0]["thinking_mode"], "High")
 
     def test_advice_turn_discards_a_model_emitted_valid_proposal(self):
+        self.turn_intent["route"] = "discuss"
         response = json.dumps({
             "message": "The slower pacing comes from the long hold.",
             "proposal": {
@@ -1957,6 +1999,56 @@ class DirectorTests(unittest.TestCase):
         self.assertIsNone(result["proposal"])
         self.assertEqual(result["message"], "The slower pacing comes from the long hold.")
         self.assertIn("_response_schema", generate.call_args.args[0])
+
+    def test_natural_motion_command_keeps_the_models_valid_proposal(self):
+        response = json.dumps({
+            "message": "Added a continuous standing-and-exit motion while preserving the first-frame appearance.",
+            "proposal": {
+                "summary": "Add one continuous standing-and-exit motion",
+                "operations": [{
+                    "op": "update_shot",
+                    "shot_id": "shot-2",
+                    "fields": {"steps": [{
+                        "type": "action",
+                        "text": "She rises from the seat, crosses the carriage, and exits frame left in one continuous motion.",
+                    }]},
+                }],
+            },
+        })
+        with patch("video.director.generate_chat", return_value=response):
+            result = director_chat({
+                "document": director_document(),
+                "selected_shot_id": "shot-2",
+                "messages": [{"role": "user", "content": "She rises and exits frame left."}],
+            })
+
+        self.assertEqual(result["intent_route"], "mutate")
+        self.assertIsNotNone(result["proposal"], result)
+        self.assertFalse(result["proposal_error"])
+        self.assertIn("rises from the seat", result["proposal"]["operations"][0]["fields"]["steps"][0]["text"])
+
+    def test_router_failure_uses_auto_mode_without_deleting_a_valid_proposal(self):
+        self.turn_router.side_effect = RuntimeError("router response was invalid")
+        response = json.dumps({
+            "message": "Prepared the exit motion.",
+            "proposal": {
+                "summary": "Add the exit motion",
+                "operations": [{
+                    "op": "update_shot", "shot_id": "shot-2",
+                    "fields": {"steps": [{"type": "action", "text": "She gets up and leaves the carriage."}]},
+                }],
+            },
+        })
+        with patch("video.director.generate_chat", return_value=response):
+            result = director_chat({
+                "document": director_document(),
+                "selected_shot_id": "shot-2",
+                "messages": [{"role": "user", "content": "Have her get up and leave."}],
+            })
+
+        self.assertEqual(result["intent_route"], "auto")
+        self.assertIn("router response was invalid", result["intent_warning"])
+        self.assertIsNotNone(result["proposal"], result)
 
     def test_production_context_is_a_delimited_user_message(self):
         messages, _usage = build_provider_messages({
@@ -2038,6 +2130,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(context["explicit_subject_attributes"], [])
 
     def test_director_grounds_images_before_structured_request(self):
+        self.turn_intent["route"] = "discuss"
         document = director_document()
         document["references"] = [{
             "id": "reference-1", "kind": "image", "path": "subject.webp",
@@ -2083,6 +2176,7 @@ class DirectorTests(unittest.TestCase):
         self.assertNotIn("visual_selectors", context["subject_registry"][0])
         self.assertEqual(result["vision_observations"][0]["usage"], "subject")
         self.assertEqual(progress, [
+            {"phase": "intent_classification"},
             {
                 "phase": "vision_grounding",
                 "attempt": 1,
@@ -2095,6 +2189,7 @@ class DirectorTests(unittest.TestCase):
         ])
 
     def test_director_grounds_each_image_in_an_isolated_call(self):
+        self.turn_intent["route"] = "discuss"
         document = director_document()
         document["references"] = [
             {"id": "reference-1", "kind": "image", "path": "one.png", "roles": ["subject"]},
@@ -2595,6 +2690,7 @@ class DirectorTests(unittest.TestCase):
             preview_changeset(document, proposal)
 
     def test_project_chat_uses_grand_director_contract(self):
+        self.turn_intent["route"] = "discuss"
         response = "The two-shot structure already reads clearly."
         with patch("video.director.generate_chat", return_value=response) as generate:
             result = director_chat({
@@ -3044,6 +3140,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
         self.assertIn("exactly one JSON object", retry_messages[-1]["content"])
         self.assertEqual(progress, [
+            {"phase": "intent_classification"},
             {
                 "phase": "director_generation",
                 "grounded_images": 0,
@@ -3142,6 +3239,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIsNone(result["pending_plan"])
 
     def test_legacy_validation_pending_plan_does_not_force_proposal_mode(self):
+        self.turn_intent["route"] = "discuss"
         with patch("video.director.generate_chat", return_value="The prior proposal had invalid step structure.") as generate:
             result = director_chat({
                 "scope": "project",

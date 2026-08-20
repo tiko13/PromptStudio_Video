@@ -170,6 +170,19 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("llmActivityLabel", progress)
         self.assertNotIn("Director is generating", progress)
 
+    def test_director_reports_intent_routing_and_preserves_router_diagnostics(self):
+        start = self.source.index("function directorJobStatusText")
+        end = self.source.index("async function pollDirectorJob", start)
+        progress = self.source[start:end]
+        variants_start = self.source.index("function ensureDirectorVariants")
+        variants_end = self.source.index("function directorAttachmentMetadata", variants_start)
+        variants = self.source[variants_start:variants_end]
+
+        self.assertIn('progress.phase === "intent_classification"', progress)
+        self.assertIn("Classifying this turn as a concrete edit or discussion", progress)
+        self.assertIn("intent_route", variants)
+        self.assertIn("intent_warning", variants)
+
     def test_status_popover_dismisses_and_live_queue_status_rerenders(self):
         transient_start = self.source.index("function installTransientUiDismissal")
         transient_end = self.source.index("function isVideoStudioControl", transient_start)
