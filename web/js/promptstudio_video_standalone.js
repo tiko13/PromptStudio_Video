@@ -74,7 +74,7 @@ failureTimer = window.setTimeout(() => {
   setStatus("Video Studio could not start its ComfyUI workflow host. Refresh after ComfyUI has finished loading.");
 }, 15000);
 
-window.addEventListener("beforeunload", () => {
+window.addEventListener("pagehide", () => {
   channel?.close();
   if (hostPoll) window.clearInterval(hostPoll);
   if (fallbackTimer) window.clearTimeout(fallbackTimer);

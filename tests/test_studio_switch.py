@@ -9,6 +9,9 @@ class UnifiedStudioContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = (ROOT / "web" / "js" / "promptstudio_video_studio.js").read_text(encoding="utf-8")
+        cls.standalone = (
+            ROOT / "web" / "js" / "promptstudio_video_standalone.js"
+        ).read_text(encoding="utf-8")
         cls.redirect = (ROOT / "web" / "js" / "promptstudio_video_redirect.js").read_text(encoding="utf-8")
         cls.page = (ROOT / "web" / "prompt_studio_video.html").read_text(encoding="utf-8")
         cls.routes = (ROOT / "routes.py").read_text(encoding="utf-8")
@@ -24,6 +27,11 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("state.standaloneAttached", status)
         self.assertNotIn("!state.panel.hidden", status)
         self.assertIn("setStandaloneVisibility", self.source)
+
+    def test_cancelled_refresh_does_not_detach_the_video_panel(self):
+        for source in (self.source, self.standalone):
+            self.assertNotIn('addEventListener("beforeunload"', source)
+            self.assertIn('addEventListener("pagehide"', source)
 
     def test_video_header_has_the_shared_switch_and_absolute_icon(self):
         self.assertGreaterEqual(self.source.count('data-promptstudio-studio-mode="image"'), 2)
@@ -121,9 +129,11 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("studio.llamacpp_url", self.source)
         self.assertIn("studio.llamacpp_model", self.source)
         self.assertIn("studio.llamacpp_config_profile", self.source)
+        self.assertIn("studio.llamacpp_generation_settings", self.source)
         self.assertIn("studio.llamacpp_autostart", self.source)
         self.assertIn("profile.llamacpp_reasoning_budget_tokens", self.source)
         self.assertIn("Shared Prompt Studio LLM", self.source)
+        self.assertIn("llamacpp_config_profile: shared.llamacpp_config_profile", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/config-builder", self.routes)
 
@@ -183,6 +193,17 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("Classifying this turn as a concrete edit or discussion", progress)
         self.assertIn("intent_route", variants)
         self.assertIn("intent_warning", variants)
+
+    def test_applying_director_proposal_closes_director_after_success(self):
+        start = self.source.index("async function applyDirectorProposal")
+        end = self.source.index("\nfunction discardDirectorProposal", start)
+        apply_proposal = self.source[start:end]
+        success = apply_proposal.split("} catch (error) {", 1)[0]
+        failure = apply_proposal.split("} catch (error) {", 1)[1]
+
+        self.assertIn("state.directorDialog?.open", success)
+        self.assertIn("state.directorDialog.close()", success)
+        self.assertNotIn("state.directorDialog.close()", failure)
 
     def test_status_popover_dismisses_and_live_queue_status_rerenders(self):
         transient_start = self.source.index("function installTransientUiDismissal")

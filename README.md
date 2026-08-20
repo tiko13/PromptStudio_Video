@@ -26,11 +26,11 @@ Suggested file: docs/images/video-studio-timeline.png
 
 ## Collaborate with two local AI Directors
 
-Ask the **Grand Director** to critique or compose the whole production, or use the shot-level **Director** for a focused change. Both return reviewable structured proposals; nothing changes until you explicitly apply it.
+Ask the **Video director** to critique or compose the whole production, or use the **Shot director** for a focused change. Both return reviewable structured proposals; nothing changes until you explicitly apply it.
 
-<!-- Screenshot slot: Grand Director proposal with apply/discard review.
+<!-- Screenshot slot: Video director proposal with apply/discard review.
 Suggested file: docs/images/grand-director.png
-![Grand Director reviewing a multi-shot video](docs/images/grand-director.png)
+![Video director reviewing a multi-shot video](docs/images/grand-director.png)
 -->
 
 ## Use every MiniMax H3 generation mode from one project
@@ -65,9 +65,9 @@ Editor, so it may contain multiple cuts, ordered action and verbatim dialogue
 steps, camera changes, visible text, generated sound cues, ambience, and music.
 Its authored timeline describes only the new 5–15 second tail; Video Studio
 injects the 22-frame handoff, offsets authored cuts and first-shot event timing,
-then removes the overlap automatically. **Save & ask Director** works on every
+then removes the overlap automatically. **Shot director** works on every
 extension shot and receives a read-only description of the source's final shot
-so Shot 1 continues rather than replaying the boundary. Grand Director and new
+so Shot 1 continues rather than replaying the boundary. Video director and new
 media references are intentionally disabled in structured extensions for now.
 
 Every completed, failed, interrupted, or cancelled continuation also exposes
@@ -132,7 +132,7 @@ The current vertical slice contains:
 - dependency-free native H3 Add Guide audiovisual continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
-- context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp, Ollama, or Llama.cpp, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
+- context-budgeted Video director and Shot director workflows for KoboldCpp, Ollama, or Llama.cpp, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
 - a versioned capability and document API for Prompt Studio integration.
 
 ## Director document
@@ -173,8 +173,8 @@ non-diegetic music keep their guide-defined roles. **Complete silence**
 suppresses dialogue, shot sounds, ambience, and music in the compiled prompt
 without deleting the editable document content.
 
-The editable **Production brief** is a planning synopsis for the user and Grand
-Director. It is not compiled into the MiniMax prompt. The Grand Director uses it
+The editable **Production brief** is a planning synopsis for the user and Video
+director. It is not compiled into the MiniMax prompt. The Video director uses it
 to infer the useful shot count and translates its visual beats into the
 timeline-specific shot fields. It is also available as **Production brief
 (planning only)** in the workflow node's Director Canvas.
@@ -186,16 +186,20 @@ verbatim.
 
 ## AI Directors
 
-Use **Ask Grand Director** in the production card for whole-video critique and
-on-demand multi-shot composition. The Grand Director receives every shot plus
+Use **Ask Video director** in the production card for whole-video critique and
+on-demand multi-shot composition. The Video director receives every shot plus
 the production brief, global audiovisual fields, references, and MiniMax
 constraints. Approved proposals may update project-level style and sound,
 reference definitions and retention analysis, revise any shot, change cut
-times, or add and remove unprotected shots. REF2VA proposals must represent
+times, or add and remove shots. Small changes are field patches that preserve
+everything not mentioned. Explicit full-production or full-scene rewrites use
+replacement operations: every omitted old prompt field is cleared, protected
+text may be replaced as part of that reviewed rewrite, and any stale raw-prompt
+override is discarded when the proposal is applied. REF2VA proposals must represent
 every source reference, use every defined label in the summary and applicable
 shots, and populate all six full-reference sections before generation.
 
-Use **Save & ask Director** in the shot popup editor for the
+Use **Shot director** in the shot popup editor for the
 tighter shot-focused workflow. It receives only the selected shot and immediate
 neighbors, and its proposals can update descriptive fields, sound, camera, and
 append newly requested dialogue on that selected shot.
@@ -229,7 +233,7 @@ regenerable.
 
 The default 8,000-character context budget contains compact production data,
 canonical reference labels, and at most ten recent conversation messages. The
-Grand Director never silently drops shots: increase the context budget if a
+Video director never silently drops shots: increase the context budget if a
 large production does not fit. Older chat turns are discarded first when that
 budget is tight; the current instruction is never tail-truncated, because doing
 so could discard a leading constraint such as "do not." If the complete current
@@ -263,7 +267,7 @@ model selection remain in the primary Prompt Studio UI.
 
 Existing dialogue, visible text, and references remain protected in both
 scopes. The Director may append newly requested dialogue but cannot rewrite or
-remove an existing line or speaker ID. The Grand Director cannot remove a shot
+remove an existing line or speaker ID. The Video director cannot remove a shot
 containing protected dialogue or visible text. Every proposal is previewed
 against a document hash, normalized, compiled, and applied only after
 confirmation.

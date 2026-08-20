@@ -27,7 +27,7 @@ document
 
 The canvas and future LLM patches edit this document. `video/compiler.py`
 produces the queue prompt deterministically. `main_description` remains visible
-as a planning synopsis and Grand Director input, but the compiler deliberately
+as a planning synopsis and Video director input, but the compiler deliberately
 omits it; all generated visual content begins in `[Shot 1]`. Alignment
 instructions, section ordering, reference labels, dialogue tags, and timestamps
 must not be delegated to unrestricted LLM prose.
@@ -64,12 +64,19 @@ fields.
 
 ## AI Directors
 
-The production card opens a project-scoped Grand Director. It receives every
+The production card opens a project-scoped Video director. It receives every
 shot, the production brief, global audiovisual fields, compact production
 constraints, canonical MiniMax reference tokens, and a bounded recent-message
 tail. Its validated change set supports project-field updates, edits across
-existing shots, cut-time changes, adding or removing unprotected shots, and the
+existing shots, cut-time changes, adding or removing shots during an explicit
+full rewrite, and the
 structured reference definitions and retention analysis required by REF2VA.
+
+Update operations are patches by default. An explicit full shot, scene, or
+production rewrite is promoted to replacement semantics before validation:
+omitted writable fields are reset, every surviving old shot must be replaced,
+and a stale manual `prompt_override` is cleared. This prevents deterministic
+field merging from carrying obsolete prompt clauses into a rewritten result.
 
 The shot popup editor opens a separate shot-scoped Director. It receives
 the selected shot, its immediate neighbors, and the same compact constraints.

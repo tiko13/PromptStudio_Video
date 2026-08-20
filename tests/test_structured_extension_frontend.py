@@ -21,10 +21,10 @@ class StructuredExtensionFrontendTests(unittest.TestCase):
         self.assertIn("source_document: clone(source.source_document)", self.source)
         self.assertIn("await generateStructuredExtension(project)", self.source)
 
-    def test_extension_uses_shot_director_context_and_hides_grand_director(self):
+    def test_extension_uses_shot_director_context_and_hides_video_director(self):
         self.assertIn("continuation_context: clone(project.extension_source?.director_context || null)", self.source)
-        self.assertIn("grandDirector.hidden = structuredExtension", self.source)
-        self.assertIn("Save & ask Director", self.source)
+        self.assertIn("videoDirector.hidden = structuredExtension", self.source)
+        self.assertIn("✦ Shot director", self.source)
 
     def test_extension_can_regenerate_only_its_tail_from_the_same_parent(self):
         self.assertIn('button("Regenerate extension", () => showRegenerateExtension(generation)', self.source)

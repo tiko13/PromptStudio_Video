@@ -953,7 +953,7 @@ def _reference_semantic_issues(document):
             )
 
     summary = _canonical_tokens(document["summary"]).casefold()
-    # main_description is a planning synopsis for the user and Grand Director,
+    # main_description is a planning synopsis for the user and Video director,
     # not part of the generated prompt. Reference tokens must be grounded in a
     # compiled shot or audio field to count as active.
     has_first_frame = any(

@@ -243,7 +243,15 @@ function directorSettings() {
   const studio = storedObject(IMAGE_STUDIO_SETTINGS_KEY);
   const consult = storedObject(IMAGE_CONSULT_SETTINGS_KEY);
   const video = storedObject(DIRECTOR_SETTINGS_KEY);
-  const profile = primaryLlmProfile(studio);
+  const provider = normalizeLlmProvider(studio.llm_provider || video.llm_provider || "koboldcpp");
+  const configuredLlamacpp = studio.llamacpp_generation_settings
+    && typeof studio.llamacpp_generation_settings === "object"
+    && !Array.isArray(studio.llamacpp_generation_settings)
+    ? studio.llamacpp_generation_settings
+    : null;
+  const profile = provider === "llamacpp" && configuredLlamacpp
+    ? configuredLlamacpp
+    : primaryLlmProfile(studio);
   const thinkingMode = profile.thinking_mode || studio.thinking_mode || video.thinking_mode || consult.thinking_mode || "Disabled";
   const thinkingEnabled = thinkingModeEnablesReasoning(thinkingMode);
   const profileValue = (standardKey, thinkingKey, fallback) => Number(
@@ -259,7 +267,7 @@ function directorSettings() {
     ? 0
     : Math.max(0, Math.min(131072, Number.isFinite(storedResponseTokens) ? storedResponseTokens : 0));
   return {
-    llm_provider: normalizeLlmProvider(studio.llm_provider || video.llm_provider || "koboldcpp"),
+    llm_provider: provider,
     kobold_url: studio.kobold_url || video.kobold_url || "http://localhost:5001",
     ollama_url: studio.ollama_url || video.ollama_url || "http://localhost:11434",
     ollama_model: studio.ollama_model || video.ollama_model || "",
@@ -331,6 +339,7 @@ function saveDirectorSettings(dialog = state.directorDialog) {
     ollama_model: shared.ollama_model,
     llamacpp_url: shared.llamacpp_url,
     llamacpp_model: shared.llamacpp_model,
+    llamacpp_config_profile: shared.llamacpp_config_profile,
     llamacpp_reasoning_budget_tokens: shared.llamacpp_reasoning_budget_tokens,
     thinking_mode: shared.thinking_mode,
     max_response_tokens: Math.max(0, Math.min(131072, Number(directorControlValue(dialog, "psvstudio-director-max-tokens") || 0))),
@@ -635,6 +644,14 @@ function directorShotLabel(project = activeProject(), shot = selectedShot(projec
 function directorProposalFields(proposal) {
   const rows = [];
   for (const operation of proposal?.operations || []) {
+    if (operation.replace === true) {
+      const target = operation.op === "update_project"
+        ? "Replace project prompt"
+        : operation.op === "remove_shot"
+          ? "Remove as part of full rewrite"
+          : `Replace ${operation.shot_id || "shot"}`;
+      rows.push({ name: target, value: "Old omitted fields will be cleared." });
+    }
     if (operation.op === "add_shot") {
       const shot = operation.shot || {};
       const steps = Array.isArray(shot.steps) ? shot.steps : [];
@@ -1029,8 +1046,8 @@ function renderDirectorDialog() {
   const projectScope = state.directorScope === "project";
   if (!dialog || !project || (!projectScope && !shot)) return;
   dialog.querySelector("#psvstudio-director-title").textContent = projectScope
-    ? "Grand Director · Entire video"
-    : `Shot Director · ${directorShotLabel(project, shot)}`;
+    ? "Video director · Entire video"
+    : `Shot director · ${directorShotLabel(project, shot)}`;
   dialog.querySelector("#psvstudio-director-subtitle").textContent = projectScope
     ? "Full-production consultation and multi-shot composition"
     : "Context-efficient selected-shot consultation";
@@ -1234,7 +1251,7 @@ function ensureDirectorDialog() {
     </div>
     </div>
     <details class="psvstudio-director-settings"><summary>Local LLM and context settings</summary><div class="psvstudio-director-settings-grid">
-      <div class="psvstudio-director-shared-llm"><span>Shared Prompt Studio LLM</span><strong id="psvstudio-director-shared-llm"></strong><small>Provider, endpoint, model, profile, thinking, and samplers are managed in the primary Prompt Studio settings.</small></div>
+      <div class="psvstudio-director-shared-llm"><span>Shared Prompt Studio LLM</span><strong id="psvstudio-director-shared-llm"></strong><small>Provider, endpoint, model, LLM configuration, thinking, and samplers are managed in the primary Prompt Studio settings.</small></div>
       <label><span>Response tokens · 0 = full available context</span><input id="psvstudio-director-max-tokens" type="number" min="0" max="131072" step="128" /></label>
       <label><span>Context characters</span><input id="psvstudio-director-context-budget" type="number" min="4000" max="32000" step="1000" /></label>
       <label><span>Request timeout seconds</span><input id="psvstudio-director-timeout" type="number" min="5" max="3600" step="30" /></label>
@@ -1245,6 +1262,7 @@ function ensureDirectorDialog() {
   dialog.querySelector("#psvstudio-director-shared-llm").textContent = [
     llmProviderDisplayName(settings.llm_provider),
     sharedModel,
+    settings.llm_provider === "llamacpp" ? settings.llamacpp_config_profile : "",
     settings.thinking_mode,
   ].filter(Boolean).join(" · ");
   dialog.querySelector("#psvstudio-director-max-tokens").value = String(settings.max_response_tokens);
@@ -1714,6 +1732,7 @@ async function applyDirectorProposal(messageId) {
     persistDirectorSessions();
     markProjectChanged({ render: true });
     setStatus(`${message.proposal.summary} Applied after document validation.`, "ready");
+    if (state.directorDialog?.open) state.directorDialog.close();
   } catch (error) {
     const variant = selectedDirectorVariant(message);
     message.proposal_error = error.message || String(error);
@@ -4933,14 +4952,14 @@ function appendProjectBrief(container, project) {
     structuredExtension ? "Extension overview" : "Video overview",
     brief,
     structuredExtension
-      ? "Planning synopsis for this extension. Author prompt-relevant details in its shots; use Save & ask Director for focused assistance."
-      : "Planning synopsis for you and the Grand Director. It is not sent to MiniMax; the Director translates it into the required shot timeline.",
+      ? "Planning synopsis for this extension. Author prompt-relevant details in its shots; use the Shot director for focused assistance."
+      : "Planning synopsis for you and the Video director. It is not sent to MiniMax; the director translates it into the required shot timeline.",
   ));
 
   if (structuredExtension) {
     section.body.append(el(
       "div", "psvstudio-extension-settings-note",
-      "Grand Director is intentionally disabled for extension projects. The per-shot Director receives the source-ending handoff and can revise each authored extension shot.",
+      "Video director is intentionally disabled for extension projects. The Shot director receives the source-ending handoff and can revise each authored extension shot.",
     ));
     container.append(section.details);
     return;
@@ -4948,14 +4967,14 @@ function appendProjectBrief(container, project) {
 
   const command = textArea("", () => {}, 2, PLACEHOLDERS.directorCommand);
   const ask = button(
-    "Ask Grand Director",
+    "Ask Video director",
     () => openDirector("project", command.value.trim()),
     "psvstudio-button psvstudio-button-primary psvstudio-director-launch-button",
   );
   ask.title = "Consult about the entire video and review any proposed multi-shot changes before applying them.";
   const directorActions = el("div", "psvstudio-director-launch");
   directorActions.append(
-    field("Grand Director instruction", command),
+    field("Video director instruction", command),
     ask,
     el("small", "psvstudio-help", `Full-video scope · ${project.document.shots.length} shot${project.document.shots.length === 1 ? "" : "s"} in context`),
   );
@@ -5207,7 +5226,7 @@ function renderTimeline() {
   const viewport = state.panel?.querySelector("#psvstudio-shot-list");
   const project = activeProject();
   const add = state.panel?.querySelector("#psvstudio-add-shot");
-  const director = state.panel?.querySelector("#psvstudio-grand-director");
+  const director = state.panel?.querySelector("#psvstudio-video-director");
   if (!viewport) return;
   const previousScroll = viewport.scrollLeft;
   viewport.replaceChildren();
@@ -6319,7 +6338,13 @@ function renderShotEditorDialog() {
   const left = el("div", "psvstudio-inline");
   const remove = button("Remove shot", removeShotFromEditor, "psvstudio-button psvstudio-button-danger");
   remove.disabled = project.document.shots.length < 2;
-  left.append(remove, button("Save & ask Director", () => saveShotEditor({ askDirector: true })));
+  const shotDirector = button(
+    "✦ Shot director",
+    () => saveShotEditor({ askDirector: true }),
+    "psvstudio-button psvstudio-button-primary psvstudio-shot-director-button",
+  );
+  shotDirector.title = "Save this shot and consult the Shot director";
+  left.append(remove, shotDirector);
   const right = el("div", "psvstudio-inline");
   right.append(
     button("Cancel", () => closeShotEditor({ force: true })),
@@ -6689,7 +6714,7 @@ function renderHeader() {
   const duplicate = state.panel?.querySelector("#psvstudio-duplicate");
   const reset = state.panel?.querySelector("#psvstudio-reset");
   const preview = state.panel?.querySelector("#psvstudio-compile-preview");
-  const grandDirector = state.panel?.querySelector("#psvstudio-grand-director");
+  const videoDirector = state.panel?.querySelector("#psvstudio-video-director");
   const addMedia = state.panel?.querySelector("#psvstudio-add-media");
   const viewMedia = state.panel?.querySelector("#psvstudio-view-all-media");
   const structuredExtension = isStructuredExtensionProject(project);
@@ -6703,7 +6728,7 @@ function renderHeader() {
   }
   if (duplicate) duplicate.disabled = !project;
   if (reset) reset.disabled = !project || structuredExtension || Boolean(projectPendingGenerationCount(project)) || projectHasPendingDirectorJob(project.id) || state.directorBusy;
-  if (grandDirector) grandDirector.hidden = structuredExtension;
+  if (videoDirector) videoDirector.hidden = structuredExtension;
   if (addMedia) {
     addMedia.disabled = structuredExtension;
     addMedia.title = structuredExtension ? "New media references are not yet supported inside native structured extensions." : "Add project media";
@@ -6811,7 +6836,7 @@ function buildPanel() {
               <label class="psvstudio-zoom-control" title="Timeline zoom"><span>−</span><input id="psvstudio-timeline-zoom" type="range" min="36" max="160" step="4" value="80" aria-label="Timeline zoom" /><span>+</span></label>
               <button id="psvstudio-fit-timeline" class="psvstudio-button" type="button">Fit</button>
               <button id="psvstudio-add-shot" class="psvstudio-button" type="button">Add shot</button>
-              <button id="psvstudio-grand-director" class="psvstudio-button psvstudio-button-primary psvstudio-timeline-director-button" type="button" title="Consult the Grand Director about the entire video">✦ Grand Director</button>
+              <button id="psvstudio-video-director" class="psvstudio-button psvstudio-button-primary psvstudio-timeline-director-button" type="button" title="Consult the Video director about the entire video">✦ Video director</button>
             </div>
           </div>
           <div class="psvstudio-timeline-content">
@@ -6853,7 +6878,7 @@ function buildPanel() {
     control.dataset.psvstudioAllowDisconnected = "true";
   });
   panel.querySelector("#psvstudio-add-shot").addEventListener("click", addShot);
-  panel.querySelector("#psvstudio-grand-director").addEventListener("click", () => openDirector("project"));
+  panel.querySelector("#psvstudio-video-director").addEventListener("click", () => openDirector("project"));
   panel.querySelector("#psvstudio-add-media").addEventListener("click", () => panel.querySelector("#psvstudio-media-input").click());
   panel.querySelector("#psvstudio-view-all-media").addEventListener("click", () => showMediaLibrary());
   panel.querySelector("#psvstudio-media-input").addEventListener("change", async event => {
@@ -7046,7 +7071,9 @@ async function attachStandalone(popup, { unified = false } = {}) {
   installTransientUiDismissal(popup.document);
   renderAll();
   postVideoStudioPresence();
-  popup.addEventListener("beforeunload", () => {
+  // Wait until navigation is committed. beforeunload can be cancelled after it
+  // fires, and detaching the panel at that point leaves the live popup empty.
+  popup.addEventListener("pagehide", () => {
     if (state.panel?.ownerDocument !== document) document.body.append(state.panel);
     state.panel.hidden = true;
     state.standaloneAttached = false;

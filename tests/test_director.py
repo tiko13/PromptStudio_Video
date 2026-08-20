@@ -59,6 +59,7 @@ from video.director import (
     _generate_with_context_fallback,
     _canonicalize_requested_dialogue_literals,
     _enforce_requested_reference_coverage,
+    _complete_rewrite_requested,
 )
 
 
@@ -180,6 +181,23 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("Every synchronized sounds item must identify its audible source", system_message)
             self.assertIn("Do not rely on the sounds array's position to imply timing", system_message)
             self.assertIn("Use relative synchronization cues rather than per-event timestamps", system_message)
+
+    def test_complete_rewrite_detection_does_not_expand_field_edits(self):
+        self.assertTrue(_complete_rewrite_requested({
+            "messages": [{"role": "user", "content": "Completely rewrite this as a new production."}],
+        }))
+        self.assertTrue(_complete_rewrite_requested({
+            "messages": [{"role": "user", "content": "Rewrite the full REF2VA production."}],
+        }))
+        self.assertTrue(_complete_rewrite_requested({
+            "messages": [{"role": "user", "content": "Start the selected shot over."}],
+        }))
+        self.assertFalse(_complete_rewrite_requested({
+            "messages": [{"role": "user", "content": "Replace this camera move with a slow push-in."}],
+        }))
+        self.assertFalse(_complete_rewrite_requested({
+            "messages": [{"role": "user", "content": "Completely rewrite the dialogue only."}],
+        }))
 
     def test_speaker_ids_are_rejected_outside_dialogue_steps(self):
         document = director_document()
@@ -760,6 +778,41 @@ class DirectorTests(unittest.TestCase):
         )
         shot_fields = restricted["operations"][1]["fields"]
         self.assertEqual(set(shot_fields), {"steps", "sounds"})
+
+    def test_first_frame_restriction_preserves_locked_fields_during_replacement(self):
+        document = self.i2va_document()
+        document["style"] = "Established photographic style"
+        document["shots"][0].update({
+            "composition": "Established waist-up framing",
+            "subjects": "The woman established by the first frame",
+            "environment": "The established train carriage",
+            "lighting": "The established window light",
+        })
+        proposal = {
+            "operations": [
+                {"op": "update_project", "replace": True, "fields": {
+                    "style": "Invented replacement style",
+                    "main_description": "A new action begins from the anchored frame.",
+                }},
+                {"op": "update_shot", "shot_id": "shot-1", "replace": True, "fields": {
+                    "composition": "Invented composition",
+                    "subjects": "Invented subject",
+                    "environment": "Invented setting",
+                    "lighting": "Invented light",
+                    "steps": [{"type": "action", "text": "She stands and turns."}],
+                }},
+            ],
+        }
+
+        restricted = _restrict_first_frame_proposal(document, proposal)
+
+        self.assertEqual(
+            restricted["operations"][0]["fields"]["style"],
+            "Established photographic style",
+        )
+        shot_fields = restricted["operations"][1]["fields"]
+        for name in ("composition", "subjects", "environment", "lighting"):
+            self.assertEqual(shot_fields[name], document["shots"][0][name])
 
     def test_provider_context_exposes_only_canonical_sequence(self):
         document = normalize_document(director_document())
@@ -2670,6 +2723,157 @@ class DirectorTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in preview["document"]["shots"]], ["replacement-shot"])
 
+    def test_patch_update_preserves_unmentioned_fields_but_clears_stale_prompt_override(self):
+        document = normalize_document(director_document())
+        document["prompt_override"] = "OLD OVERRIDE THAT MUST NOT WIN"
+        document["shots"][1].update({
+            "subjects": "A woman in a blue coat.",
+            "environment": "A rain-dark train carriage.",
+            "lighting": "Cold window light.",
+            "sounds": ["Train wheels click beneath the carriage."],
+            "notes": "Keep the original blocking.",
+        })
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Change one action",
+            "operations": [{
+                "op": "update_shot", "shot_id": "shot-2",
+                "fields": {"steps": [{"type": "action", "text": "She closes the letter."}]},
+            }],
+        }
+
+        preview = preview_changeset(document, proposal)
+        shot = preview["document"]["shots"][1]
+
+        self.assertEqual(shot["subjects"], "A woman in a blue coat.")
+        self.assertEqual(shot["environment"], "A rain-dark train carriage.")
+        self.assertEqual(shot["sounds"], ["Train wheels click beneath the carriage."])
+        self.assertEqual(shot["notes"], "Keep the original blocking.")
+        self.assertEqual(preview["document"]["prompt_override"], "")
+        self.assertNotIn("OLD OVERRIDE", preview["compiled_prompt"])
+
+    def test_replace_update_clears_every_omitted_old_prompt_field(self):
+        document = normalize_document(director_document())
+        document.update({
+            "style": "Old noir style.",
+            "overall_soundscape": "Old train ambience.",
+            "non_diegetic_music": "Old string score.",
+            "summary": "Old reference summary.",
+        })
+        document["shots"][1].update({
+            "transition": "an old dissolve reveals",
+            "composition": "Old close-up.",
+            "subjects": "The old passenger.",
+            "environment": "The old train.",
+            "lighting": "Old blue light.",
+            "camera": {"type": "Push In", "amplitude": "large", "speed": "fast", "target": "the old passenger"},
+            "visible_text": ["OLD DESTINATION"],
+            "sounds": ["Old train wheels."],
+            "notes": "Old blocking note.",
+        })
+        proposal = {
+            "base_document_hash": document_fingerprint(document),
+            "scope": {"type": "project"},
+            "summary": "Replace the production",
+            "operations": [
+                {
+                    "op": "update_project", "replace": True,
+                    "fields": {"main_description": "A baker opens her shop."},
+                },
+                {
+                    "op": "update_shot", "shot_id": "shot-2", "replace": True,
+                    "fields": {
+                        "composition": "A wide view of a bakery counter.",
+                        "subjects": "A baker stands behind the counter.",
+                        "environment": "A quiet bakery before sunrise.",
+                        "lighting": "Warm practical light.",
+                        "steps": [{"type": "action", "text": "The baker opens the shutters."}],
+                    },
+                },
+            ],
+        }
+
+        preview = preview_changeset(document, proposal)
+        shot = preview["document"]["shots"][1]
+
+        self.assertEqual(preview["document"]["style"], "Live-action, cinematic")
+        self.assertEqual(preview["document"]["overall_soundscape"], "")
+        self.assertEqual(preview["document"]["non_diegetic_music"], "N/A")
+        self.assertEqual(preview["document"]["summary"], "")
+        self.assertEqual(shot["transition"], "the camera cuts to")
+        self.assertEqual(shot["camera"]["type"], "")
+        self.assertEqual(shot["visible_text"], [])
+        self.assertEqual(shot["sounds"], [])
+        self.assertEqual(shot["notes"], "")
+        self.assertNotIn("Old train", preview["compiled_prompt"])
+        self.assertNotIn("OLD DESTINATION", preview["compiled_prompt"])
+        self.assertNotIn("The old passenger", preview["compiled_prompt"])
+        self.assertNotIn("Old blocking note", preview["compiled_prompt"])
+
+    def test_explicit_complete_project_rewrite_promotes_updates_to_replacements(self):
+        document = normalize_document(director_document())
+        document["shots"][0].update({
+            "subjects": "An obsolete passenger.",
+            "environment": "An obsolete train carriage.",
+            "lighting": "Obsolete blue light.",
+            "sounds": ["Obsolete train noise."],
+        })
+        document["shots"][1].update({
+            "subjects": "An obsolete passenger.",
+            "environment": "An obsolete train carriage.",
+            "lighting": "Obsolete blue light.",
+        })
+        response = {
+            "message": "I rebuilt the complete production.",
+            "proposal": {
+                "summary": "Replace the train story with a bakery opening",
+                "operations": [
+                    {"op": "update_project", "fields": {
+                        "main_description": "A baker opens her shop before sunrise.",
+                        "style": "Warm naturalistic cinema.",
+                        "overall_soundscape": "A quiet room with wooden shutters moving.",
+                        "non_diegetic_music": "N/A",
+                    }},
+                    {"op": "update_shot", "shot_id": "shot-1", "fields": {
+                        "composition": "A wide view across the bakery counter.",
+                        "subjects": "A baker waits beside closed wooden shutters.",
+                        "environment": "A small bakery before sunrise.",
+                        "lighting": "Warm practical light meets cool dawn light.",
+                        "steps": [{"type": "action", "text": "The baker unlatches the wooden shutters."}],
+                    }},
+                    {"op": "update_shot", "shot_id": "shot-2", "fields": {
+                        "composition": "A close view of the bakery window.",
+                        "subjects": "The same baker holds the opened shutters.",
+                        "environment": "The same small bakery at dawn.",
+                        "lighting": "Dawn light spreads across the counter.",
+                        "steps": [{"type": "action", "text": "She opens the shutters and watches daylight enter."}],
+                    }},
+                ],
+            },
+        }
+        with patch("video.director.generate_chat", return_value=json.dumps(response)) as generate:
+            result = director_chat({
+                "scope": "project",
+                "document": document,
+                "messages": [{
+                    "role": "user",
+                    "content": "Completely rewrite the full production as a bakery opening.",
+                }],
+            })
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertFalse(result["proposal_error"])
+        self.assertTrue(all(
+            operation.get("replace") is True
+            for operation in result["proposal"]["operations"]
+            if operation["op"] in {"update_project", "update_shot", "remove_shot"}
+        ))
+        preview = preview_changeset(document, result["proposal"])
+        self.assertNotIn("obsolete", preview["compiled_prompt"].casefold())
+        self.assertNotIn("Do not rewrite this.", preview["compiled_prompt"])
+        self.assertNotIn("Central Station", preview["compiled_prompt"])
+
     def test_project_proposal_rejects_an_empty_resulting_timeline(self):
         value = director_document()
         for item in value["shots"]:
@@ -2704,7 +2908,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIsNone(result["proposal"])
         self.assertEqual(result["scope"], "project")
         provider_messages = generate.call_args.args[1]
-        self.assertIn("Grand Director", provider_messages[0]["content"])
+        self.assertIn("Video director", provider_messages[0]["content"])
         self.assertIn("create multiple shots", provider_messages[0]["content"])
         context = provider_context(provider_messages)
         self.assertEqual(len(context["shots"]), 2)
