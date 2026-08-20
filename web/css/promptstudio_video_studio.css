@@ -71,6 +71,54 @@ button { color: inherit; }
   font: 13px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 .psvstudio-app[hidden] { display: none; }
+.psvstudio-api-connection {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 240;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 1px 8px;
+  width: max-content;
+  max-width: calc(100% - 32px);
+  padding: 9px 14px;
+  color: #ffe9eb;
+  background: rgba(71, 20, 28, .97);
+  border: 1px solid rgba(255, 133, 142, .62);
+  border-radius: 12px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, .48);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.psvstudio-api-connection[hidden] { display: none; }
+.psvstudio-api-connection > span {
+  grid-row: 1 / 3;
+  width: 9px;
+  height: 9px;
+  background: var(--psv-error);
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgba(255, 133, 142, .13);
+}
+.psvstudio-api-connection strong,
+.psvstudio-api-connection small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.psvstudio-api-connection strong { font-size: 12px; }
+.psvstudio-api-connection small { color: rgba(255, 233, 235, .72); font-size: 10px; }
+.psvstudio-app[data-api-connected="false"] { border-color: rgba(255, 133, 142, .42); }
+.psvstudio-app[data-api-connected="false"] :is(input, textarea, select, button):disabled,
+body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"] :is(input, textarea, select, button):disabled {
+  cursor: not-allowed;
+}
+.psvstudio-app[data-api-connected="false"] :is(input, textarea, select):disabled,
+body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"] :is(input, textarea, select):disabled {
+  opacity: .48;
+  filter: saturate(.35);
+}
 .psvstudio-sidebar, .psvstudio-inspector { min-width: 0; min-height: 0; overflow: auto; background: var(--psv-panel-soft); scrollbar-color: rgba(150, 134, 218, .45) transparent; scrollbar-width: thin; }
 .psvstudio-sidebar { border-right: 1px solid var(--psv-border); }
 .psvstudio-inspector { border-left: 1px solid var(--psv-border); }
@@ -106,11 +154,19 @@ button { color: inherit; }
 .psvstudio-button:hover:not(:disabled) { background: rgba(255, 255, 255, .1); border-color: rgba(255, 255, 255, .17); }
 .psvstudio-button:active:not(:disabled) { transform: translateY(1px); }
 .psvstudio-button:disabled { opacity: .42; cursor: not-allowed; }
+.psvstudio-button:focus-visible,
+.psvstudio-project:focus-visible,
+.psvstudio-project-delete:focus-visible,
+.psvstudio-kobold-control > summary:focus-visible {
+  outline: 2px solid var(--psv-accent-strong);
+  outline-offset: 2px;
+}
 .psvstudio-button-primary { color: #fff; background: var(--psv-accent); border-color: var(--psv-accent); }
 .psvstudio-button-primary:hover:not(:disabled) { background: var(--psv-accent-strong); border-color: var(--psv-accent-strong); }
 .psvstudio-button-danger:not(:disabled) { color: var(--psv-error); border-color: rgba(255, 133, 142, .3); }
 .psvstudio-icon-button { display: grid; place-items: center; width: 36px; padding: 0; font-size: 17px; }
-#psvstudio-mobile-projects, #psvstudio-mobile-inspector, #psvstudio-close-inspector { display: none; }
+#psvstudio-mobile-projects, #psvstudio-mobile-inspector, #psvstudio-close-inspector, #psvstudio-close-projects { display: none; }
+.psvstudio-drawer-scrim { display: none; position: absolute; z-index: 15; inset: 0; padding: 0; background: rgba(3, 4, 7, .56); border: 0; cursor: pointer; }
 
 .psvstudio-project-list { display: grid; gap: 5px; padding: 0 9px 14px; }
 .psvstudio-project-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: 1px solid transparent; border-radius: 11px; }
@@ -203,6 +259,10 @@ button { color: inherit; }
 .psvstudio-turbo-profile > small { max-width: 45%; }
 .psvstudio-global-settings-button { min-height: 30px; padding: 0 10px; color: #ddd6ff; border-color: rgba(151, 126, 255, .34); font-size: 10px; }
 .psvstudio-preview > .psvstudio-global-settings-button { position: absolute; z-index: 3; top: 12px; right: 12px; background: rgba(16, 18, 26, .86); backdrop-filter: blur(10px); }
+.psvstudio-extension-banner { position: absolute; z-index: 3; right: 12px; bottom: 12px; left: 12px; padding: 8px 11px; color: #e7e0ff; background: rgba(48, 37, 91, .9); border: 1px solid rgba(174, 153, 255, .4); border-radius: 10px; font-size: 10px; line-height: 1.4; text-align: center; backdrop-filter: blur(10px); }
+.psvstudio-extension-settings-note { display: grid; gap: 3px; padding: 11px 12px; color: #d9d1f8; background: rgba(128, 103, 216, .1); border: 1px solid rgba(170, 150, 255, .25); border-radius: 10px; font-size: 10px; line-height: 1.45; }
+.psvstudio-extension-settings-note strong { color: #f0ebff; font-size: 11px; }
+.psvstudio-extension-settings-note span, .psvstudio-extension-settings-note small { color: var(--psv-muted); }
 .psvstudio-director-launch { display: grid; gap: 8px; margin: 3px 0 5px; padding: 11px; background: linear-gradient(145deg, rgba(111, 79, 221, .2), rgba(52, 42, 91, .12)); border: 1px solid rgba(174, 153, 255, .42); border-radius: 12px; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035), 0 10px 28px rgba(37, 24, 83, .18); }
 .psvstudio-director-launch .psvstudio-field > span { color: #ded8f8; font-weight: 700; }
 .psvstudio-director-launch textarea { min-height: 68px; background: rgba(8, 9, 15, .8); }
@@ -341,7 +401,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-continuation-body { display: grid; gap: 13px; min-height: 0; padding: 16px; overflow: auto; }
 .psvstudio-continuation-body textarea { min-height: 150px; resize: vertical; }
 .psvstudio-continuation-note { padding: 10px 12px; color: #d6ccff; background: rgba(128, 103, 216, .12); border: 1px solid rgba(170, 150, 255, .28); border-radius: 10px; font-size: 11px; }
-.psvstudio-continuation-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; background: rgba(16, 18, 26, .98); border-top: 1px solid var(--psv-border); }
+.psvstudio-continuation-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 12px 16px; background: rgba(16, 18, 26, .98); border-top: 1px solid var(--psv-border); }
 .psvstudio-prompt-actions { justify-content: flex-end; flex-wrap: wrap; }
 .psvstudio-prompt-actions > :first-child { margin-right: auto; }
 
@@ -577,7 +637,8 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
   .psvstudio-app { grid-template-columns: minmax(0, 1fr) 330px; }
   .psvstudio-sidebar { position: absolute; z-index: 20; top: 0; bottom: 0; left: 0; width: 280px; box-shadow: 22px 0 55px rgba(0, 0, 0, .48); transform: translateX(-105%); transition: transform 160ms ease; }
   .psvstudio-app[data-drawer="projects"] .psvstudio-sidebar { transform: none; }
-  #psvstudio-mobile-projects { display: grid; }
+  .psvstudio-app[data-drawer="projects"] .psvstudio-drawer-scrim { display: block; }
+  #psvstudio-mobile-projects, #psvstudio-close-projects { display: grid; }
 }
 
 @media (max-width: 780px) {
@@ -585,6 +646,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
   .psvstudio-app { grid-template-columns: 1fr; width: 100vw; height: 100vh; border: 0; border-radius: 0; }
   .psvstudio-inspector { position: absolute; z-index: 20; top: 0; right: 0; bottom: 0; width: min(90vw, 360px); box-shadow: -22px 0 55px rgba(0, 0, 0, .48); transform: translateX(105%); transition: transform 160ms ease; }
   .psvstudio-app[data-drawer="inspector"] .psvstudio-inspector { transform: none; }
+  .psvstudio-app[data-drawer="inspector"] .psvstudio-drawer-scrim { display: block; }
   #psvstudio-mobile-inspector, #psvstudio-close-inspector { display: grid; }
   .psvstudio-topbar { flex-wrap: wrap; }
   .psvstudio-mobile-studio-switch { display: inline-grid; }
@@ -615,6 +677,20 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
   .psvstudio-shot-editor-footer > .psvstudio-inline { justify-content: flex-end; flex-wrap: wrap; }
   .psvstudio-step-header { grid-template-columns: auto minmax(0, 1fr); }
   .psvstudio-step-controls { grid-column: 1 / -1; justify-content: flex-end; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .psvstudio-app *,
+  .psvstudio-app *::before,
+  .psvstudio-app *::after,
+  dialog[class*="psvstudio-"] *,
+  dialog[class*="psvstudio-"] *::before,
+  dialog[class*="psvstudio-"] *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
 
 @media (max-width: 620px) {

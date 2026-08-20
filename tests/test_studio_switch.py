@@ -30,6 +30,15 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("VIDEO_ICON_URL", self.source)
         self.assertIn("psvstudio-inspector-brand", self.source)
 
+    def test_director_history_budgeting_keeps_complete_turns(self):
+        start = self.source.index("function boundedDirectorMessages")
+        end = self.source.index("\nfunction directorShotLabel", start)
+        helper = self.source[start:end]
+
+        self.assertIn("const turns = []", helper)
+        self.assertIn("retainedTurns", helper)
+        self.assertIn("return retainedTurns.reverse().flat()", helper)
+
     def test_video_switch_stays_beside_the_brand_like_image_mode(self):
         switch_rule = self.styles.split(".psvstudio-studio-switch {", 1)[1].split("}", 1)[0]
         self.assertIn("flex: 0 0 auto", switch_rule)
@@ -125,6 +134,16 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("for (const endpoint of COMFY_RESTART_ENDPOINTS)", restart)
         self.assertIn("![404, 405].includes(response.status)", restart)
 
+    def test_video_studio_freezes_controls_while_comfyui_is_disconnected(self):
+        self.assertIn('const DISCONNECTED_CONTROL_SELECTOR = "input, textarea, select, button"', self.source)
+        self.assertIn("disconnectedControls: new Map()", self.source)
+        self.assertIn("function freezeDisconnectedControls", self.source)
+        self.assertIn('panel.dataset.apiConnected = connected ? "true" : "false"', self.source)
+        self.assertIn('setStatus("ComfyUI disconnected — Video Studio is frozen.", "error")', self.source)
+        self.assertIn('id="psvstudio-api-connection"', self.source)
+        self.assertIn("state.disconnectedControlObserver.observe", self.source)
+        self.assertIn('.psvstudio-app[data-api-connected="false"]', self.styles)
+
     def test_empty_video_studio_offers_complete_default_workflow_setup(self):
         self.assertIn('"default_workflow_setup"', self.routes)
         self.assertIn('/promptstudio-video/default-workflows', self.routes)
@@ -150,6 +169,44 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("tokens received", progress)
         self.assertIn("llmActivityLabel", progress)
         self.assertNotIn("Director is generating", progress)
+
+    def test_status_popover_dismisses_and_live_queue_status_rerenders(self):
+        transient_start = self.source.index("function installTransientUiDismissal")
+        transient_end = self.source.index("function isVideoStudioControl", transient_start)
+        transient = self.source[transient_start:transient_end]
+        events_start = self.source.index("function setupProgressEvents")
+        events_end = self.source.index("function setStandaloneVisibility", events_start)
+        events = self.source[events_start:events_end]
+        status_handler = events[events.index('api.addEventListener("status"'):]
+
+        self.assertIn('control?.open && !control.contains(event.target)', transient)
+        self.assertIn('closeSystemStatus({ restoreFocus: true })', transient)
+        self.assertIn("renderSystemStatusSummary()", status_handler[:400])
+
+    def test_mobile_drawers_have_close_backdrop_escape_and_aria_state(self):
+        self.assertIn('id="psvstudio-close-projects"', self.source)
+        self.assertIn('class="psvstudio-drawer-scrim"', self.source)
+        self.assertIn('aria-controls="psvstudio-projects-drawer"', self.source)
+        self.assertIn('aria-controls="psvstudio-shots-drawer"', self.source)
+        self.assertIn("function closeVideoDrawer", self.source)
+        self.assertIn("closeVideoDrawer({ restoreFocus: true })", self.source)
+        self.assertIn('.psvstudio-app[data-drawer="projects"] .psvstudio-drawer-scrim', self.styles)
+        self.assertIn('.psvstudio-app[data-drawer="inspector"] .psvstudio-drawer-scrim', self.styles)
+
+    def test_destructive_media_removal_is_confirmed_and_controls_are_accessible(self):
+        start = self.source.index("function removeProjectReference")
+        end = self.source.index("function mediaLimit", start)
+        remove = self.source[start:end]
+
+        self.assertIn("dependentClips", remove)
+        self.assertIn("view?.confirm", remove)
+        self.assertIn("button:focus-visible", self.styles)
+        self.assertIn("prefers-reduced-motion: reduce", self.styles)
+        self.assertIn('close.ariaLabel = close.title', self.source)
+        self.assertIn('aria-label="Director message"', self.source)
+        self.assertIn('dialog.setAttribute("aria-labelledby", "psvstudio-director-title")', self.source)
+        self.assertGreaterEqual(self.source.count('dialog.setAttribute("aria-label"'), 8)
+        self.assertNotIn("function removeSelectedShot", self.source)
 
 
 if __name__ == "__main__":

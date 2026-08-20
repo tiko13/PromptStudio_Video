@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -119,30 +120,63 @@ def continuation_frame_plan(duration_seconds, context_frames=CONTINUATION_CONTEX
     }
 
 
-def _continuation_shot(parent, brief, action_start):
-    opening = (
-        "The carried opening frames are the exact end of the preceding clip. After those frames, "
-        "the camera holds completely still in the same closing position and framing. The visible "
-        "subjects, wardrobe, objects, poses, environment, lighting, and exposure remain unchanged. "
-        "Do not restart, reverse, or invent an action during this hold. There is no cut, zoom, "
-        "reframing, camera correction, or new sound event."
+def _final_action(shot):
+    for step in reversed(shot.get("steps") or []):
+        if str(step.get("type") or "").lower() != "action":
+            continue
+        text = _without_reference_tokens(step.get("text"))
+        text = re.sub(
+            r"^\s*at\s+\d+(?:\.\d+)?\s+seconds?\s*,?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        if text:
+            return text
+    return "the action and camera movement visible at the preceding ending"
+
+
+def _continuation_opening(parent):
+    previous = (parent.get("shots") or [{}])[-1]
+    incoming_action = _final_action(previous)
+    return (
+        "The carried opening frames overlap the exact ending of the preceding clip. Continue every "
+        "visible subject movement, object movement, camera movement, and active sound through this "
+        "overlap without a pause, reset, reversal, repeated onset, or cut. Preserve the incoming "
+        "pose, direction, momentum, composition, spatial relationships, lighting, and exposure. "
+        f"Carry forward the currently visible phase of this unfinished action without replaying its beginning: "
+        f"{incoming_action}"
     )
-    next_action = str(brief or "").strip() or "Continue the visible action naturally."
+
+
+def _continuation_shot(parent, brief):
+    previous = (parent.get("shots") or [{}])[-1]
+    opening = _continuation_opening(parent)
+    next_action = _without_reference_tokens(brief).strip() or "Continue the visible action naturally."
+    camera = dict(previous.get("camera") or {})
+    if not camera:
+        camera = {"type": "Static Shot", "amplitude": "default", "speed": "default", "target": ""}
+    else:
+        camera["target"] = _without_reference_tokens(camera.get("target")).strip()
     return {
         "id": "continuation-shot-1",
         "start": 0,
-        "transition": "the shot continues without a cut",
-        "composition": "The opening retains the exact closing composition and framing of the preceding clip.",
-        "subjects": "All established visible subjects, wardrobe, objects, poses, and spatial relationships remain consistent.",
-        "environment": "The established environment continues without a reset or newly introduced element.",
-        "lighting": "The established lighting and exposure remain continuous.",
-        "camera": {"type": "Static Shot", "amplitude": "default", "speed": "default", "target": ""},
+        "transition": "The same shot continues across the clip boundary without a cut or temporal reset.",
+        "composition": _without_reference_tokens(previous.get("composition")).strip()
+        or "The opening continues from the exact closing composition and framing of the preceding clip.",
+        "subjects": _without_reference_tokens(previous.get("subjects")).strip()
+        or "All visible subjects, wardrobe, objects, poses, and spatial relationships remain consistent.",
+        "environment": _without_reference_tokens(previous.get("environment")).strip()
+        or "The visible environment continues without resetting its established geometry.",
+        "lighting": _without_reference_tokens(previous.get("lighting")).strip()
+        or "The established lighting and exposure remain continuous across the boundary.",
+        "camera": camera,
         "steps": [
             {"id": "continuation-opening", "type": "action", "text": opening},
             {
                 "id": "continuation-action",
                 "type": "action",
-                "text": f"At {action_start:.2f} seconds, the continuation develops: {next_action}",
+                "text": f"Continue directly into the requested development: {next_action}",
             },
         ],
         # The pixels in Video 1 own any existing on-screen wording. Repeating
@@ -153,12 +187,99 @@ def _continuation_shot(parent, brief, action_start):
             []
             if parent.get("complete_silence")
             else [
-                "No new sound event begins during the opening hold.",
-                "After the hold, only sounds directly caused by visible new actions occur.",
+                "Any ambience, dialogue, music, or physical sound already in progress at the boundary continues without a gap or duplicate onset.",
+                "Synchronize new sounds and dialogue requested by the continuation with the new visible actions.",
             ]
         ),
         "notes": "",
     }
+
+
+def _offset_timed_items(items, offset):
+    for item in items or []:
+        if item.get("start") is not None:
+            item["start"] = float(item["start"]) + offset
+        if item.get("end") is not None:
+            item["end"] = float(item["end"]) + offset
+
+
+def _build_structured_continuation_document(parent, extension_document, timing):
+    if not isinstance(extension_document, dict):
+        raise PromptDocumentError("Structured extension document must be an object")
+    try:
+        requested_duration = float(extension_document.get("duration_seconds"))
+    except (TypeError, ValueError) as exc:
+        raise PromptDocumentError("Structured extension requires a valid duration") from exc
+    if abs(requested_duration - timing["requested_duration"]) > 1 / FPS:
+        raise PromptDocumentError("Structured extension duration does not match the continuation request")
+
+    authored_value = copy.deepcopy(extension_document)
+    # The authoring timeline describes only newly delivered frames. Normalize
+    # it against the exact native-grid tail so a cut cannot land in the overlap
+    # or beyond the frames that survive trimming.
+    authored_value["duration_seconds"] = timing["delivered_duration"]
+    authored = normalize_document(authored_value)
+    if authored.get("references"):
+        raise PromptDocumentError(
+            "Structured extensions currently support generated sound and dialogue, but not new media references"
+        )
+    if authored.get("prompt_override"):
+        raise PromptDocumentError(
+            "Structured extensions must use their shot timeline; manual prompt overrides are not supported"
+        )
+    if (authored["width"], authored["height"]) != (parent["width"], parent["height"]):
+        raise PromptDocumentError("Structured extension canvas must match the source video")
+
+    shots = copy.deepcopy(authored["shots"])
+    context_seconds = timing["context_seconds"] if "context_seconds" in timing else CONTINUATION_CONTEXT_SECONDS
+    for index, shot in enumerate(shots):
+        if index:
+            shot["start"] = float(shot["start"]) + context_seconds
+        else:
+            shot["start"] = 0.0
+            shot["transition"] = "The same shot continues across the clip boundary without a cut or temporal reset."
+            existing_ids = {item.get("id") for item in shot.get("steps") or []}
+            bridge_id = "continuation-opening"
+            suffix = 2
+            while bridge_id in existing_ids:
+                bridge_id = f"continuation-opening-{suffix}"
+                suffix += 1
+            _offset_timed_items(shot.get("steps"), context_seconds)
+            _offset_timed_items(shot.get("sound_cues"), context_seconds)
+            _offset_timed_items(shot.get("audio_clips"), context_seconds)
+            shot["steps"] = [{
+                "id": bridge_id,
+                "type": "action",
+                "text": _continuation_opening(parent),
+            }, *(shot.get("steps") or [])]
+            if not authored.get("complete_silence"):
+                bridge_sounds = [
+                    "Any ambience, dialogue, music, or physical sound already in progress at the boundary continues without a gap or duplicate onset.",
+                    "Synchronize the extension's authored sounds and dialogue with its new visible actions.",
+                ]
+                shot["sounds"] = [*bridge_sounds, *(shot.get("sounds") or [])]
+                shot["sound_cues"] = [
+                    {"id": f"continuation-bridge-sound-{index + 1}", "text": text}
+                    for index, text in enumerate(bridge_sounds)
+                ] + (shot.get("sound_cues") or [])
+
+    result = {
+        **copy.deepcopy(authored),
+        "mode": "t2va",
+        "duration_seconds": timing["sample_duration"],
+        "width": parent["width"],
+        "height": parent["height"],
+        "target_megapixels": parent.get("target_megapixels"),
+        "canvas_reference_id": "",
+        "prompt_override": "",
+        "shots": shots,
+        "references": [],
+        "task_types": [],
+        "subject_definitions": [],
+        "summary": "",
+        "retention_analysis": [],
+    }
+    return normalize_document(result)
 
 
 def _without_reference_tokens(value):
@@ -175,13 +296,16 @@ def build_continuation_document(
     brief,
     duration_seconds,
     context_frames=CONTINUATION_CONTEXT_FRAMES,
+    extension_document=None,
 ):
     """Build the segment-local prompt used with pinned audiovisual context."""
     parent = normalize_document(parent_document)
     timing = continuation_frame_plan(duration_seconds, context_frames)
+    if extension_document is not None:
+        return _build_structured_continuation_document(parent, extension_document, timing)
     complete_silence = bool(parent.get("complete_silence"))
     parent_music = str(parent.get("non_diegetic_music") or "N/A").strip()
-    action_start = max(2.0, timing["context_seconds"] + 0.75)
+    next_action = _without_reference_tokens(brief).strip()
     document = {
         "version": 1,
         "mode": "t2va",
@@ -191,24 +315,25 @@ def build_continuation_document(
         "target_megapixels": parent.get("target_megapixels"),
         "canvas_reference_id": "",
         "ref_image_size": parent.get("ref_image_size", "match"),
-        "main_description": str(brief or "").strip(),
+        "main_description": next_action,
         "prompt_override": "",
         "style": _without_reference_tokens(parent.get("style") or "Live-action, cinematic"),
-        "shots": [_continuation_shot(parent, brief, action_start)],
+        "shots": [_continuation_shot(parent, next_action)],
         "references": [],
         "overall_soundscape": (
             "N/A"
             if complete_silence
-            else "No new dialogue, ambience, music, or off-screen sound begins during the opening hold. "
-            "Continue only the sound bed already present in the carried audio context, at the same "
-            "level and character, without adding another ambient layer. Afterward, add only physical "
-            "sounds directly caused by visible new actions."
+            else "The audible ambience and every sound already in progress at the boundary continue "
+            "seamlessly from the carried audio context without a gap, restart, duplicate onset, or "
+            "abrupt level change. New dialogue, ambience, music, and physical sounds explicitly "
+            "requested by the continuation may begin naturally and remain synchronized with the image."
         ),
         "non_diegetic_music": (
             "N/A"
             if complete_silence or parent_music.upper() == "N/A"
-            else "No new musical layer begins. Existing non-diegetic music continues without a change "
-            "in instrumentation, tempo, rhythm, dynamics, or level."
+            else "The established non-diegetic music continues seamlessly from the carried audio "
+            "context, preserving its current tempo, rhythm, instrumentation, dynamics, and level "
+            "unless the requested continuation explicitly changes it."
         ),
         "complete_silence": complete_silence,
         "task_types": [],

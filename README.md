@@ -47,13 +47,36 @@ Suggested file: docs/images/reference-modes.png
 The structured project document remains authoritative while a deterministic compiler builds the guide-compliant MiniMax prompt. Every result keeps its prompt, project state, routing, and executable workflow snapshot for inspection and replay.
 
 Completed renders also expose **Continue video**. Video Studio sends the final
-22 frames and their synchronized audio latents into the head of a new MiniMax H3
-sample, trims that repeated context after decoding, saves the newly generated
-segment independently, and losslessly assembles a new cumulative MP4. Every
-generation stores its own compact continuation tail. Parent generations are
-never overwritten, so any shorter version can still be played or used as the
-start of an alternate continuation. This path is implemented in this repository
-and does not require a motion-context or looping node pack.
+22 frames and their clock-aligned 37 audio-latent steps into the head of a new
+MiniMax H3 sample through ComfyUI's native Add Guide contract. It trims that
+repeated context after decoding, saves the newly generated segment independently,
+and losslessly assembles a new cumulative MP4. Every generation stores its own
+compact continuation tail and the parent AV-clock offset needed for exact audio
+placement. Parent generations are never overwritten, so any shorter version can
+still be played or used as the start of an alternate continuation. This path is
+implemented in this repository and does not require a motion-context or looping
+node pack.
+
+The continuation dialog offers two paths. **Quick generate** sends one concise
+free-form development directly into a single continuation shot. **Build full
+extension** creates a durable extension project linked to the immutable source
+render and workflow snapshot. The extension uses the normal timeline and Shot
+Editor, so it may contain multiple cuts, ordered action and verbatim dialogue
+steps, camera changes, visible text, generated sound cues, ambience, and music.
+Its authored timeline describes only the new 5–15 second tail; Video Studio
+injects the 22-frame handoff, offsets authored cuts and first-shot event timing,
+then removes the overlap automatically. **Save & ask Director** works on every
+extension shot and receives a read-only description of the source's final shot
+so Shot 1 continues rather than replaying the boundary. Grand Director and new
+media references are intentionally disabled in structured extensions for now.
+
+Every completed, failed, interrupted, or cancelled continuation also exposes
+**Regenerate extension**. It queues only a new tail from the same immutable parent handoff;
+the original video and earlier accepted segments are not sampled again. Quick
+extensions may revise their free-form development and duration in the dialog,
+while structured extensions use the project's current authored shots. A fresh
+seed is used, the replacement is assembled against the same saved source
+segments, and the previous variation remains available for comparison.
 
 <!-- Screenshot slot: compiled prompt preview beside generation history and replay.
 Suggested file: docs/images/prompt-preview-and-replay.png
@@ -105,7 +128,7 @@ The current vertical slice contains:
 - first-frame, last-frame, image, video, and audio reference loading;
 - nested per-shot action, dialogue, generated-sound, and exact-audio timelines with overlapping ranges;
 - post-render exact-audio overlay/replacement with source trimming, gain, fades, and authoritative duration probing;
-- dependency-free native H3 audiovisual motion-context continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
+- dependency-free native H3 Add Guide audiovisual continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
 - context-budgeted Grand Director and selected-shot Director workflows for KoboldCpp, Ollama, or Llama.cpp, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and
@@ -188,6 +211,11 @@ requests that require a structured proposal cap temperature at `0.2` so camera
 types and the document's other enums remain stable; an automatic contract-
 correction attempt uses `0.0`.
 
+Exploratory questions and requests for explanation remain conversational and
+do not create an Apply action. Direct edit commands, including politely worded
+requests, produce a validated proposal for explicit review before anything is
+changed.
+
 The latest Director answer has the same response navigation as image Prompt
 Studio: move left and right through saved alternatives, or use the right arrow
 on the newest answer to regenerate the same user turn. Each alternative keeps
@@ -197,9 +225,13 @@ regenerable.
 The default 8,000-character context budget contains compact production data,
 canonical reference labels, and at most ten recent conversation messages. The
 Grand Director never silently drops shots: increase the context budget if a
-large production does not fit. KoboldCpp's reported token count and context
-length further cap the response when available. Chat history is retained
-locally but approved document state is the authoritative long-term memory.
+large production does not fit. Older chat turns are discarded first when that
+budget is tight; the current instruction is never tail-truncated, because doing
+so could discard a leading constraint such as "do not." If the complete current
+instruction cannot fit, the request stops with a clear error. KoboldCpp's
+reported token count and context length further cap the response when available.
+Chat history is retained locally but approved document state is the
+authoritative long-term memory.
 
 The response-token setting defaults to `0` (automatic). KoboldCpp uses the
 remaining context up to its Director safety cap, Ollama uses fill-context

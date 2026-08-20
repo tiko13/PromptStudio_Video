@@ -10,6 +10,7 @@ import uuid
 from aiohttp import web
 from server import PromptServer
 
+from .nodes.h3_motion_context import native_guides_available
 from .video.compiler import compile_prompt
 from .video.audio_mix import assemble_exact_audio, probe_input_audio
 from .video.continuation import (
@@ -103,7 +104,7 @@ CAPABILITY = {
         "kobold_control",
         "studio_image_handoff",
         "native_video_continuation",
-        "native_h3_motion_context",
+        "native_h3_add_guide",
         "unified_studio_shell",
         "default_workflow_setup",
         "shot_detail_timeline",
@@ -357,6 +358,10 @@ async def promptstudio_video_compile(request):
 
 async def promptstudio_video_continuation_prepare(request):
     try:
+        if not native_guides_available():
+            raise ValueError(
+                "Continue video requires current ComfyUI native MiniMax H3 Add Guide support"
+            )
         if request.content_length is not None and request.content_length > MAX_CONTINUATION_REQUEST_BYTES:
             raise ValueError("Continuation request exceeds the 256 KB limit")
         data = await request.json()
@@ -373,6 +378,7 @@ async def promptstudio_video_continuation_prepare(request):
             data.get("brief"),
             data.get("duration_seconds", 5),
             timing["context_frames"],
+            extension_document=data.get("extension_document"),
         )
         response = _document_response(document, include_prompt=True)
         # The Director/sampler renders the context-prefixed sample duration.
@@ -382,13 +388,14 @@ async def promptstudio_video_continuation_prepare(request):
         response["frame_count"] = timing["delivered_frames"]
         response["effective_duration"] = timing["delivered_duration"]
         response["continuation"] = {
-            "engine": "native_h3_motion_context",
+            "engine": "native_h3_add_guide",
             "context_frames": CONTINUATION_CONTEXT_FRAMES,
             "context_seconds": CONTINUATION_CONTEXT_SECONDS,
             "trim_frames": CONTINUATION_CONTEXT_FRAMES,
             "source_video": annotated_output_path(source),
             "source_duration": source_info["duration"],
             "source_has_audio": source_info["has_audio"],
+            "structured": isinstance(data.get("extension_document"), dict),
         }
         return web.json_response(response)
     except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:

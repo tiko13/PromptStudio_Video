@@ -193,6 +193,55 @@ def _normalize_generation_lineage(generations, project_index):
     return generations
 
 
+def _normalize_extension_source(value, project_index):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"Project {project_index + 1} extension source must be an object")
+    parent_project_id = _identifier(
+        value.get("parent_project_id"), f"Project {project_index + 1} extension parent project"
+    )
+    parent_generation_id = _identifier(
+        value.get("parent_generation_id"), f"Project {project_index + 1} extension parent generation"
+    )
+    root_generation_id = str(value.get("root_generation_id") or parent_generation_id).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", root_generation_id):
+        raise ValueError(f"Project {project_index + 1} extension root generation is invalid")
+    source = copy.deepcopy(value.get("source"))
+    if not isinstance(source, dict) or not str(source.get("filename") or "").strip():
+        raise ValueError(f"Project {project_index + 1} extension source output is invalid")
+    source_segments = copy.deepcopy(value.get("source_segments") or [])
+    if not isinstance(source_segments, list) or not source_segments:
+        raise ValueError(f"Project {project_index + 1} extension source segments must be a non-empty list")
+    workflow_snapshot = copy.deepcopy(value.get("workflow_snapshot"))
+    if not isinstance(workflow_snapshot, dict):
+        raise ValueError(f"Project {project_index + 1} extension workflow snapshot must be an object")
+    result_node_ids = [str(item)[:200] for item in (value.get("result_node_ids") or [])]
+    result_fields = [str(item)[:200] for item in (value.get("result_fields") or [])]
+    director_context = copy.deepcopy(value.get("director_context") or {})
+    if not isinstance(director_context, dict):
+        raise ValueError(f"Project {project_index + 1} extension Director context must be an object")
+    return {
+        "engine": "native_h3_add_guide",
+        "parent_project_id": parent_project_id,
+        "parent_generation_id": parent_generation_id,
+        "root_generation_id": root_generation_id,
+        "depth": max(1, int(value.get("depth") or 1)),
+        "continuation_base_duration": max(0.0, float(value.get("continuation_base_duration") or 0)),
+        "source": source,
+        "source_segments": source_segments,
+        "source_document": normalize_document(value.get("source_document") or {}),
+        "parent_context_latent_path": str(value.get("parent_context_latent_path") or "")[:4096],
+        "workflow_id": str(value.get("workflow_id") or "")[:1024],
+        "workflow_name": str(value.get("workflow_name") or "")[:1024],
+        "workflow_snapshot": workflow_snapshot,
+        "workflow_director_node_id": str(value.get("workflow_director_node_id") or "")[:200],
+        "result_node_ids": result_node_ids,
+        "result_fields": result_fields,
+        "director_context": director_context,
+    }
+
+
 def _normalize_project(value, index):
     if not isinstance(value, dict):
         raise ValueError(f"Project {index + 1} must be an object")
@@ -220,7 +269,7 @@ def _normalize_project(value, index):
         for item_index, item in enumerate(generations)
     ]
     _normalize_generation_lineage(normalized_generations, index)
-    return {
+    result = {
         "id": project_id,
         "name": _text(value.get("name") or "Untitled video", MAX_PROJECT_NAME_CHARS, "Project name"),
         "brief": document["main_description"],
@@ -230,6 +279,12 @@ def _normalize_project(value, index):
         "created_at": created_at,
         "updated_at": _timestamp(value.get("updated_at") or created_at),
     }
+    extension_source = _normalize_extension_source(value.get("extension_source"), index)
+    if extension_source is not None:
+        if document.get("references"):
+            raise ValueError(f"Project {index + 1} structured extension cannot contain media references")
+        result["extension_source"] = extension_source
+    return result
 
 
 def normalize_project_store(value):

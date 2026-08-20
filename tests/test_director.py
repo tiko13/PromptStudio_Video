@@ -49,6 +49,7 @@ from video.director import (
     _preserve_reference_only_request,
     _proposal_retry_messages,
     _proposal_requested,
+    _bounded_history,
     _restrict_first_frame_proposal,
     _restrict_reference_only_proposal,
     _restrict_ungrounded_audio_proposal,
@@ -97,8 +98,10 @@ def dialogue_steps(shot):
 
 
 def provider_context(messages):
-    marker = "Current production context (reference data):\n"
-    return json.loads(messages[0]["content"].split(marker, 1)[1])
+    content = messages[1]["content"]
+    return json.loads(
+        content.split("<production_context>\n", 1)[1].split("\n</production_context>", 1)[0]
+    )
 
 
 class DirectorTests(unittest.TestCase):
@@ -128,7 +131,7 @@ class DirectorTests(unittest.TestCase):
         with patch(
             "video.director.generate_chat",
             side_effect=[
-                RuntimeError("KoboldCpp exhausted the available-context Director response budget."),
+                RuntimeError("KoboldCpp exhausted the 8192-token completion budget before finishing."),
                 "valid response",
             ],
         ) as generate:
@@ -755,6 +758,31 @@ class DirectorTests(unittest.TestCase):
         self.assertNotIn("dialogue", shot)
         self.assertEqual(shot["token"], "[Shot 1]")
 
+    def test_shot_director_receives_structured_extension_handoff(self):
+        document = normalize_document(director_document())
+        messages, _usage = build_provider_messages({
+            "scope": "shot",
+            "document": document,
+            "selected_shot_id": "shot-1",
+            "messages": [{"role": "user", "content": "Make her continue through the doorway."}],
+            "continuation_context": {
+                "type": "native_h3_structured_extension",
+                "context_frames": 22,
+                "source_effective_duration": 8,
+                "source_final_shot": {
+                    "composition": "A tracking shot reaches the doorway.",
+                    "steps": [{"type": "action", "text": "She is already opening the door."}],
+                    "sounds": ["The latch is already turning."],
+                },
+            },
+        })
+
+        context = provider_context(messages)
+        self.assertEqual(context["continuation_context"]["context_frames"], 22)
+        self.assertIn("already opening", context["continuation_context"]["source_final_shot"]["steps"][0]["text"])
+        self.assertIn("NATIVE STRUCTURED EXTENSION", messages[0]["content"])
+        self.assertIn("without replaying its beginning", messages[0]["content"])
+
     def test_director_canonicalizes_retention_relationship_formatting(self):
         document = normalize_document(director_document())
         raw = (
@@ -1332,7 +1360,7 @@ class DirectorTests(unittest.TestCase):
             "messages": messages,
             "context_budget_chars": 8000,
         })
-        context = provider_messages[0]["content"]
+        context = provider_messages[1]["content"]
         self.assertIn('"role":"previous"', context)
         self.assertIn('"role":"selected"', context)
         self.assertNotIn('"role":"next"', context)
@@ -1439,6 +1467,60 @@ class DirectorTests(unittest.TestCase):
                 self.assertTrue(_proposal_requested({
                     "messages": [{"role": "user", "content": instruction}],
                 }))
+
+    def test_exploratory_questions_do_not_force_a_document_proposal(self):
+        for instruction in (
+            "How could I improve the pacing?",
+            "Do you think she walks too fast?",
+            "Would a push-in work better here?",
+            "Can you explain how to improve the ending?",
+            "Why does the dialogue feel awkward?",
+            "Do you think the lyrics are too long?",
+            "Why not add dialogue?",
+            "What would improve the pacing?",
+            "Could a push-in improve it?",
+            "Which camera move would work better?",
+        ):
+            with self.subTest(instruction=instruction):
+                self.assertFalse(_proposal_requested({
+                    "messages": [{"role": "user", "content": instruction}],
+                }))
+
+    def test_polite_explicit_director_commands_still_request_a_proposal(self):
+        for instruction in (
+            "Could you improve the pacing?",
+            "Can you please change this shot to a push-in?",
+            "Would you add a reaction shot?",
+        ):
+            with self.subTest(instruction=instruction):
+                self.assertTrue(_proposal_requested({
+                    "messages": [{"role": "user", "content": instruction}],
+                }))
+
+    def test_current_director_command_is_rejected_instead_of_tail_truncated(self):
+        current = "DO NOT ADD A DOG. " + "x" * 300
+        with self.assertRaisesRegex(ValueError, "will not discard the beginning"):
+            _bounded_history([{"role": "user", "content": current}], 100)
+
+    def test_old_director_history_is_dropped_before_the_current_command(self):
+        retained, omitted, _used = _bounded_history([
+            {"role": "user", "content": "Old question " + "x" * 80},
+            {"role": "assistant", "content": "Old answer " + "y" * 80},
+            {"role": "user", "content": "Keep the final action unchanged."},
+        ], 100)
+
+        self.assertEqual(retained, [{"role": "user", "content": "Keep the final action unchanged."}])
+        self.assertEqual(omitted, 2)
+
+    def test_director_history_never_retains_an_orphan_assistant_message(self):
+        retained, omitted, _used = _bounded_history([
+            {"role": "user", "content": "Original request with enough context to be dropped."},
+            {"role": "assistant", "content": "Add a red balloon."},
+            {"role": "user", "content": "What about the lighting?"},
+        ], 110)
+
+        self.assertEqual(retained, [{"role": "user", "content": "What about the lighting?"}])
+        self.assertEqual(omitted, 2)
 
     def test_dialogue_line_requests_require_an_applicable_proposal(self):
         for instruction in (
@@ -1853,6 +1935,41 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_args.args[0]["temperature"], 0.2)
         self.assertEqual(generate.call_args.args[0]["thinking_mode"], "High")
 
+    def test_advice_turn_discards_a_model_emitted_valid_proposal(self):
+        response = json.dumps({
+            "message": "The slower pacing comes from the long hold.",
+            "proposal": {
+                "summary": "Change lighting anyway",
+                "operations": [{
+                    "op": "update_shot",
+                    "shot_id": "shot-2",
+                    "fields": {"lighting": "Red emergency light fills the carriage."},
+                }],
+            },
+        })
+        with patch("video.director.generate_chat", return_value=response) as generate:
+            result = director_chat({
+                "document": director_document(),
+                "selected_shot_id": "shot-2",
+                "messages": [{"role": "user", "content": "Why does the pacing feel slow?"}],
+            })
+
+        self.assertIsNone(result["proposal"])
+        self.assertEqual(result["message"], "The slower pacing comes from the long hold.")
+        self.assertIn("_response_schema", generate.call_args.args[0])
+
+    def test_production_context_is_a_delimited_user_message(self):
+        messages, _usage = build_provider_messages({
+            "document": director_document(),
+            "selected_shot_id": "shot-2",
+            "messages": [{"role": "user", "content": "Review the lighting."}],
+        })
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertNotIn("<production_context>", messages[0]["content"])
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("<production_context>", messages[1]["content"])
+
     def test_attachment_context_distinguishes_description_from_reference(self):
         document = director_document()
         document["references"] = [{
@@ -1957,7 +2074,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(generate.call_args_list[0].args[2], images)
         self.assertEqual(generate.call_args_list[1].args[2], [])
-        self.assertEqual(generate.call_args_list[0].args[0]["thinking_mode"], "High")
+        self.assertEqual(generate.call_args_list[0].args[0]["thinking_mode"], "Disabled")
         self.assertEqual(generate.call_args_list[1].args[0]["thinking_mode"], "High")
         self.assertGreaterEqual(generate.call_args_list[0].args[0]["max_response_tokens"], 4_000)
         context = provider_context(generate.call_args_list[1].args[1])
@@ -2329,6 +2446,49 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("Train wheels", result["document"]["overall_soundscape"])
         self.assertIn("[Shot 3] At 00:06.000", result["compiled_prompt"])
         self.assertEqual(dialogue_steps(result["document"]["shots"][0])[0]["text"], "Do not rewrite this.")
+
+    def test_project_proposal_accepts_bare_json_without_changeset_markers(self):
+        document = normalize_document(director_document())
+        fingerprint = document_fingerprint(document)
+        raw = (
+            '{"summary":"Strengthen the ending","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She folds the letter and looks through the window."}]}}]}'
+        )
+
+        parsed = parse_director_response(raw, "", fingerprint, "project")
+
+        self.assertFalse(parsed["proposal_error"])
+        self.assertEqual(parsed["message"], "Strengthen the ending")
+        self.assertEqual(parsed["proposal"]["summary"], "Strengthen the ending")
+        self.assertEqual(parsed["proposal"]["operations"][0]["shot_id"], "shot-2")
+
+    def test_project_proposal_accepts_markers_around_a_json_fence(self):
+        document = normalize_document(director_document())
+        fingerprint = document_fingerprint(document)
+        raw = (
+            "Here is the production update.\n"
+            f"{CHANGESET_BEGIN}\n```json\n"
+            '{"summary":"Strengthen the ending","operations":[{"op":"update_shot",'
+            '"shot_id":"shot-2","fields":{"steps":['
+            '{"type":"action","text":"She folds the letter and looks through the window."}]}}]}'
+            f"\n```\n{CHANGESET_END}"
+        )
+
+        parsed = parse_director_response(raw, "", fingerprint, "project")
+
+        self.assertFalse(parsed["proposal_error"])
+        self.assertEqual(parsed["message"], "Here is the production update.")
+        self.assertEqual(parsed["proposal"]["summary"], "Strengthen the ending")
+
+    def test_advice_with_unrelated_json_does_not_create_apply_option(self):
+        raw = 'For example, a camera preset could look like {"type":"Static Shot"}.'
+
+        parsed = parse_director_response(raw, "", "fingerprint", "project")
+
+        self.assertIsNone(parsed["proposal"])
+        self.assertFalse(parsed["proposal_error"])
+        self.assertEqual(parsed["message"], raw)
 
     def test_project_proposal_cannot_remove_protected_dialogue(self):
         document = normalize_document(director_document())
@@ -2882,7 +3042,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(generate.call_args_list[1].args[0]["thinking_mode"], "Low")
         retry_messages = generate.call_args.args[1]
         self.assertIn("machine-applicable structured proposal", retry_messages[-2]["content"])
-        self.assertIn(CHANGESET_BEGIN, retry_messages[-1]["content"])
+        self.assertIn("exactly one JSON object", retry_messages[-1]["content"])
         self.assertEqual(progress, [
             {
                 "phase": "director_generation",

@@ -22,6 +22,8 @@ const COMFY_RESTART_ENDPOINTS = ["/v2/manager/reboot", "/manager/reboot"];
 const DIRECTOR_JOB_POLL_MS = 1000;
 const DIRECTOR_STATUS_RETRY_LIMIT = 3;
 const KOBOLD_STATUS_POLL_MS = 3000;
+const DISCONNECTED_CONTROL_SELECTOR = "input, textarea, select, button";
+const DISCONNECTED_CONTROL_SCOPE_SELECTOR = ".psvstudio-app, dialog[class*='psvstudio-']";
 const DIRECTOR_SETTINGS_KEY = "promptstudio.video.director.settings.v1";
 const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
 const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
@@ -111,6 +113,8 @@ const state = {
   promptWorkerHealthRequest: null,
   apiConnected: true,
   disconnectedGenerationTimer: null,
+  disconnectedControls: new Map(),
+  disconnectedControlObserver: null,
   timelineZoom: 80,
   shotDrag: null,
   shotStepDragId: "",
@@ -124,6 +128,7 @@ const state = {
   mediaDragId: "",
   mediaDropDocuments: new WeakSet(),
   mediaDropDepth: new WeakMap(),
+  transientUiDocuments: new WeakSet(),
   mediaDimensionLoads: new Set(),
   mediaDurationLoads: new Set(),
   drawer: "",
@@ -597,16 +602,28 @@ function boundedDirectorMessages(messages, maximumChars = 6500) {
   const normalized = (messages || [])
     .filter(message => ["user", "assistant"].includes(message?.role) && String(message?.text || "").trim())
     .map(message => ({ role: message.role, content: String(message.text).trim() }));
-  const retained = [];
-  let used = 0;
-  for (const message of normalized.slice().reverse()) {
-    const cost = message.content.length + 32;
-    if (retained.length && used + cost > maximumChars) break;
-    retained.push(message);
-    used += cost;
-    if (retained.length >= 10) break;
+  const turns = [];
+  let currentTurn = [];
+  for (const message of normalized) {
+    if (message.role === "user") {
+      if (currentTurn.length) turns.push(currentTurn);
+      currentTurn = [message];
+    } else if (currentTurn.length) {
+      currentTurn.push(message);
+    }
   }
-  return retained.reverse();
+  if (currentTurn.length) turns.push(currentTurn);
+  const retainedTurns = [];
+  let used = 0;
+  let retainedMessages = 0;
+  for (const turn of turns.slice().reverse()) {
+    const cost = turn.reduce((total, message) => total + message.content.length + 32, 0);
+    if (retainedTurns.length && (used + cost > maximumChars || retainedMessages + turn.length > 10)) break;
+    retainedTurns.push(turn);
+    used += cost;
+    retainedMessages += turn.length;
+  }
+  return retainedTurns.reverse().flat();
 }
 
 function directorShotLabel(project = activeProject(), shot = selectedShot(project)) {
@@ -1188,6 +1205,7 @@ function ensureDirectorDialog() {
   const settings = directorSettings();
   const dialog = owner.createElement("dialog");
   dialog.className = "psvstudio-director-dialog";
+  dialog.setAttribute("aria-labelledby", "psvstudio-director-title");
   dialog.innerHTML = `
     <header><div class="psvstudio-director-heading"><h2 id="psvstudio-director-title">Director</h2><small id="psvstudio-director-subtitle">Context-efficient selected-shot consultation</small></div><div class="psvstudio-director-header-actions"><button id="psvstudio-director-clear" class="psvstudio-button" type="button">Clear</button><button id="psvstudio-director-close" class="psvstudio-button psvstudio-icon-button" type="button" aria-label="Close Director">×</button></div></header>
     <div class="psvstudio-director-workspace">
@@ -1199,7 +1217,7 @@ function ensureDirectorDialog() {
         <div id="psvstudio-director-history" class="psvstudio-director-history"></div>
     <div class="psvstudio-director-composer">
       <div id="psvstudio-director-attachments" class="psvstudio-director-attachments is-empty"></div>
-      <textarea id="psvstudio-director-input" rows="3" placeholder="Ask about this shot or request a concrete revision…"></textarea>
+      <textarea id="psvstudio-director-input" rows="3" aria-label="Director message" placeholder="Ask about this shot or request a concrete revision…"></textarea>
       <div class="psvstudio-director-composer-actions"><small id="psvstudio-director-status">Only the selected shot is in write scope.</small><div class="psvstudio-inline"><button id="psvstudio-director-add-image" class="psvstudio-button" type="button">Add image</button><button id="psvstudio-director-send" class="psvstudio-button psvstudio-button-primary" type="button">Ask Director</button></div></div>
       <input id="psvstudio-director-image-input" class="psvstudio-sr-only" type="file" accept="image/*" multiple />
       </div>
@@ -1293,6 +1311,7 @@ function directorRequestPayload(project, shot, scope, attachments, messages, job
     selected_shot_id: normalizedScope === "project" ? "" : (shot?.id || ""),
     attachments: clone(attachments),
     pending_plan: clone(directorSession(project.id, normalizedScope).pending_plan || null),
+    continuation_context: clone(project.extension_source?.director_context || null),
     messages: boundedDirectorMessages(messages),
   };
 }
@@ -1567,6 +1586,10 @@ function resumeDirectorJobs() {
 }
 
 function sendDirectorMessage() {
+  if (!state.apiConnected) {
+    setStatus("ComfyUI disconnected — Video Studio is frozen.", "error");
+    return;
+  }
   const dialog = state.directorDialog;
   const project = activeProject();
   const shot = selectedShot(project);
@@ -2011,6 +2034,17 @@ function mediaDropDestination(lane, clientY) {
 }
 
 function removeProjectReference(project, reference, displayLabel = "Media") {
+  const dependentClips = (project.document.shots || []).reduce((count, shot) => (
+    count + (shot.audio_clips || []).filter(clip => clip.reference_id === reference.id).length
+  ), 0);
+  const canvasSource = project.document.canvas_reference_id === reference.id;
+  const consequences = [
+    dependentClips ? `${dependentClips} placed audio clip${dependentClips === 1 ? "" : "s"}` : "",
+    canvasSource ? "the current canvas source" : "",
+  ].filter(Boolean);
+  const detail = consequences.length ? ` This also removes ${consequences.join(" and ")}.` : "";
+  const view = state.panel?.ownerDocument.defaultView;
+  if (!view?.confirm(`Remove ${displayLabel} from this project?${detail}`)) return false;
   project.document.references = (project.document.references || []).filter(item => item.id !== reference.id);
   for (const shot of project.document.shots || []) {
     shot.audio_clips = (shot.audio_clips || []).filter(clip => clip.reference_id !== reference.id);
@@ -2020,6 +2054,7 @@ function removeProjectReference(project, reference, displayLabel = "Media") {
   if (project.document.canvas_reference_id === reference.id) synchronizeGeometryCanvas(project);
   markProjectChanged({ render: true });
   setStatus(`${displayLabel} removed from project references.`, "ready");
+  return true;
 }
 
 function mediaLimit(project, kind) {
@@ -2044,6 +2079,10 @@ async function addMediaFiles(fileList) {
   if (!activeProject()) newProject();
   const project = activeProject();
   if (!project) return;
+  if (isStructuredExtensionProject(project)) {
+    setStatus("New media references are not yet supported inside native structured extensions.", "warning");
+    return;
+  }
   let added = 0;
   const errors = [];
   for (const file of supported) {
@@ -2293,6 +2332,10 @@ function installMediaDrop(doc) {
 
 function activeProject() {
   return state.projects.find(project => project.id === state.activeProjectId) || null;
+}
+
+function isStructuredExtensionProject(project = activeProject()) {
+  return Boolean(project?.extension_source?.parent_project_id && project?.extension_source?.parent_generation_id);
 }
 
 function selectedShot(project = activeProject()) {
@@ -2552,6 +2595,85 @@ function setStatus(message, kind = "") {
   status.dataset.kind = kind;
 }
 
+function closeSystemStatus({ restoreFocus = false } = {}) {
+  const control = state.panel?.querySelector("#psvstudio-kobold-control");
+  if (!control?.open) return false;
+  control.open = false;
+  if (restoreFocus) control.querySelector("summary")?.focus({ preventScroll: true });
+  return true;
+}
+
+function closeVideoDrawer({ restoreFocus = false } = {}) {
+  if (!state.drawer) return false;
+  const drawer = state.drawer;
+  state.drawer = "";
+  if (state.panel) {
+    state.panel.dataset.drawer = "";
+    state.panel.querySelector("#psvstudio-mobile-projects")?.setAttribute("aria-expanded", "false");
+    state.panel.querySelector("#psvstudio-mobile-inspector")?.setAttribute("aria-expanded", "false");
+  }
+  if (restoreFocus) {
+    const trigger = drawer === "projects" ? "#psvstudio-mobile-projects" : "#psvstudio-mobile-inspector";
+    state.panel?.querySelector(trigger)?.focus({ preventScroll: true });
+  }
+  return true;
+}
+
+function installTransientUiDismissal(ownerDocument) {
+  if (!ownerDocument || state.transientUiDocuments.has(ownerDocument)) return;
+  state.transientUiDocuments.add(ownerDocument);
+  ownerDocument.addEventListener("pointerdown", event => {
+    if (!state.panel || state.panel.hidden || state.panel.ownerDocument !== ownerDocument) return;
+    const control = state.panel.querySelector("#psvstudio-kobold-control");
+    if (control?.open && !control.contains(event.target)) closeSystemStatus();
+  }, { capture: true });
+  ownerDocument.addEventListener("keydown", event => {
+    if (
+      event.defaultPrevented
+      || event.key !== "Escape"
+      || !state.panel
+      || state.panel.hidden
+      || state.panel.ownerDocument !== ownerDocument
+      || state.panel.querySelector("dialog[open]")
+    ) return;
+    if (closeSystemStatus({ restoreFocus: true }) || closeVideoDrawer({ restoreFocus: true })) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }, { capture: true });
+}
+
+function isVideoStudioControl(control) {
+  return Boolean(
+    control?.matches?.(DISCONNECTED_CONTROL_SELECTOR)
+    && control.closest?.(DISCONNECTED_CONTROL_SCOPE_SELECTOR),
+  );
+}
+
+function isDisconnectedAllowedControl(control) {
+  if (control?.dataset?.psvstudioAllowDisconnected === "true") return true;
+  if (!control?.closest?.("dialog")) return false;
+  const label = String(control.getAttribute?.("aria-label") || control.title || control.textContent || "").trim();
+  return /^(close|cancel|done)\b/i.test(label);
+}
+
+function freezeDisconnectedControls(root = state.panel) {
+  if (state.apiConnected || !root) return;
+  const controls = [
+    ...(isVideoStudioControl(root) ? [root] : []),
+    ...root.querySelectorAll(DISCONNECTED_CONTROL_SELECTOR),
+  ];
+  controls.forEach(control => {
+    if (!isVideoStudioControl(control) || isDisconnectedAllowedControl(control)) return;
+    if (!state.disconnectedControls.has(control)) {
+      state.disconnectedControls.set(control, control.disabled);
+    } else if (!control.disabled) {
+      state.disconnectedControls.set(control, false);
+    }
+    control.disabled = true;
+  });
+}
+
 function setSaveState(message) {
   const status = state.panel?.querySelector("#psvstudio-save-state");
   if (status) status.textContent = message;
@@ -2647,6 +2769,7 @@ function createProjectRecord() {
 
 function newProject() {
   const project = createProjectRecord();
+  closeVideoDrawer();
   markProjectChanged({ render: true });
   setStatus("New video project created.", "ready");
   return project;
@@ -2656,6 +2779,7 @@ function selectProject(projectId) {
   closeShotEditor({ force: true });
   state.activeProjectId = projectId;
   state.selectedShotId = activeProject()?.document?.shots?.[0]?.id || null;
+  closeVideoDrawer();
   state.projectMutation += 1;
   persistProjects();
   renderAll();
@@ -2790,7 +2914,12 @@ function addShot() {
   const lastStart = Number(shots.at(-1)?.start || 0);
   let start = Math.round((lastStart + Math.max(lastStart + 0.25, duration)) * 12) / 24;
   if (start >= duration) {
-    project.document.duration_seconds = Math.min(150, Math.ceil((duration + 1) * 4) / 4);
+    const maximumDuration = isStructuredExtensionProject(project) ? 15 : 150;
+    if (duration >= maximumDuration) {
+      setStatus(`This ${maximumDuration}s extension has no room for another shot. Move an existing cut earlier first.`, "warning");
+      return;
+    }
+    project.document.duration_seconds = Math.min(maximumDuration, Math.ceil((duration + 1) * 4) / 4);
     start = duration;
   }
   const shot = {
@@ -2802,17 +2931,6 @@ function addShot() {
   state.selectedShotId = shot.id;
   markProjectChanged({ render: true });
   return shot;
-}
-
-function removeSelectedShot() {
-  const project = activeProject();
-  const shot = selectedShot(project);
-  if (!project || !shot || project.document.shots.length < 2) return;
-  const index = project.document.shots.indexOf(shot);
-  project.document.shots.splice(index, 1);
-  project.document.shots[0].start = 0;
-  state.selectedShotId = project.document.shots[Math.max(0, index - 1)].id;
-  markProjectChanged({ render: true });
 }
 
 function effectiveDurationHint(seconds) {
@@ -3395,15 +3513,40 @@ function activeGenerationPromptIds() {
 
 function setApiConnected(connected) {
   connected = Boolean(connected);
+  if (state.apiConnected === connected && state.panel?.dataset.apiConnected) return;
+  const reconnected = connected && !state.apiConnected;
   const reconnectedAfterRestart = connected && !state.apiConnected && state.comfyRestartBusy;
   state.apiConnected = connected;
   if (reconnectedAfterRestart) state.comfyRestartBusy = false;
+  const panel = state.panel;
+  if (!panel) return;
+  const banner = panel.querySelector("#psvstudio-api-connection");
+  panel.dataset.apiConnected = connected ? "true" : "false";
+  if (banner) banner.hidden = connected;
   renderSystemStatusSummary();
-  if (state.apiConnected) {
+  if (connected) {
     if (state.disconnectedGenerationTimer) clearTimeout(state.disconnectedGenerationTimer);
     state.disconnectedGenerationTimer = null;
+    for (const [control, wasDisabled] of state.disconnectedControls) {
+      if (control.isConnected) control.disabled = wasDisabled;
+    }
+    state.disconnectedControls.clear();
+    if (reconnected) {
+      renderAll();
+      setStatus("Video Studio reconnected to ComfyUI.", "ready");
+    }
     return;
   }
+  freezeDisconnectedControls(panel.ownerDocument?.body || panel);
+  const activeElement = panel.ownerDocument?.activeElement;
+  if (
+    activeElement
+    && isVideoStudioControl(activeElement)
+    && !isDisconnectedAllowedControl(activeElement)
+  ) {
+    activeElement.blur();
+  }
+  setStatus("ComfyUI disconnected — Video Studio is frozen.", "error");
 }
 
 async function promptWorkerStopped() {
@@ -3625,8 +3768,16 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
 }
 
 async function generateProject() {
+  if (!state.apiConnected) {
+    setStatus("ComfyUI disconnected — Video Studio is frozen.", "error");
+    return;
+  }
   const project = activeProject();
   if (!project) return;
+  if (isStructuredExtensionProject(project)) {
+    await generateStructuredExtension(project);
+    return;
+  }
   const workflow = state.workflows.find(item => item.id === project.workflow_id);
   if (!workflow) {
     setStatus("Select a compatible [PSV] workflow before generating.", "error");
@@ -3759,6 +3910,205 @@ function savedGenerationWorkflow(generation) {
   };
 }
 
+function continuationDirectorContext(generation) {
+  const sourceDocument = generation?.document || {};
+  const shot = clone(sourceDocument.shots?.at(-1) || {});
+  const clean = value => String(value || "").replace(/<\s*(?:Picture|Video|Audio|Subject)\s+\d+\s*>/gi, "the established source");
+  return {
+    type: "native_h3_structured_extension",
+    context_frames: CONTINUATION_CONTEXT_FRAMES,
+    source_effective_duration: Number(generation?.effective_duration || 0),
+    source_final_shot: {
+      composition: clean(shot.composition),
+      subjects: clean(shot.subjects),
+      environment: clean(shot.environment),
+      lighting: clean(shot.lighting),
+      camera: {
+        type: shot.camera?.type || "Static Shot",
+        amplitude: shot.camera?.amplitude || "default",
+        speed: shot.camera?.speed || "default",
+        target: clean(shot.camera?.target),
+      },
+      steps: (shot.steps || []).filter(step => !String(step?.id || "").startsWith("continuation-opening")).map(step => ({
+        type: step.type,
+        text: clean(step.text),
+        ...(step.type === "dialogue" ? {
+          speaker: clean(step.speaker), speaker_id: step.speaker_id,
+          language: step.language, performance: step.performance,
+        } : {}),
+      })),
+      sounds: (shot.sounds || []).filter(sound => !/^(?:Any ambience, dialogue, music, or physical sound already in progress|Synchronize the extension's authored sounds)/.test(String(sound || ""))).map(clean),
+    },
+  };
+}
+
+function structuredExtensionDocument(parentDocument, brief, durationSeconds) {
+  const previous = clone(parentDocument?.shots?.at(-1) || {});
+  const clean = value => String(value || "").replace(/<\s*(?:Picture|Video|Audio|Subject)\s+\d+\s*>/gi, "the established source");
+  const action = String(brief || "").trim() || "Continue the visible action directly from the source ending.";
+  return {
+    version: Number(parentDocument?.version || 1),
+    mode: "t2va",
+    duration_seconds: durationSeconds,
+    width: Number(parentDocument?.width || 1344),
+    height: Number(parentDocument?.height || 768),
+    target_megapixels: parentDocument?.target_megapixels,
+    canvas_reference_id: "",
+    ref_image_size: parentDocument?.ref_image_size || "match",
+    main_description: action,
+    prompt_override: "",
+    style: clean(parentDocument?.style || "Live-action, cinematic"),
+    shots: [{
+      id: makeId("extension-shot"), start: 0,
+      transition: "The same shot continues across the clip boundary without a cut or temporal reset.",
+      composition: clean(previous.composition), subjects: clean(previous.subjects),
+      environment: clean(previous.environment), lighting: clean(previous.lighting),
+      camera: {
+        type: previous.camera?.type || "Static Shot",
+        amplitude: previous.camera?.amplitude || "default",
+        speed: previous.camera?.speed || "default",
+        target: clean(previous.camera?.target),
+      },
+      steps: [newActionStep(action)], visible_text: [], sounds: [], sound_cues: [], audio_clips: [], notes: "",
+    }],
+    references: [],
+    overall_soundscape: clean(parentDocument?.overall_soundscape),
+    non_diegetic_music: clean(parentDocument?.non_diegetic_music || "N/A"),
+    complete_silence: Boolean(parentDocument?.complete_silence),
+    task_types: [], subject_definitions: [], summary: "", retention_analysis: [],
+  };
+}
+
+function createStructuredExtensionProject(parentProject, generation, brief, durationSeconds, dialog) {
+  if (!parentProject || !generation) return null;
+  const duration = Number(durationSeconds);
+  if (!Number.isFinite(duration) || duration < 5 || duration > 15) {
+    throw new Error("Extension duration must be between 5 and 15 seconds.");
+  }
+  const source = continuationSourceOutput(generation);
+  if (!source) throw new Error("The selected generation has no saved video output to continue.");
+  const lineage = continuationLineageOutputs(generation);
+  const { workflow, snapshot } = savedGenerationWorkflow(generation);
+  const now = Date.now();
+  const project = {
+    id: makeId("project"),
+    name: `${parentProject.name || "Untitled video"} · Extension ${Number(generation.depth || 0) + 1}`,
+    brief: String(brief || "").trim(),
+    document: structuredExtensionDocument(generation.document, brief, duration),
+    workflow_id: workflow.id,
+    generations: [],
+    extension_source: {
+      engine: "native_h3_add_guide",
+      parent_project_id: parentProject.id,
+      parent_generation_id: generation.id,
+      root_generation_id: generation.root_generation_id || generation.id,
+      depth: Number(generation.depth || 0) + 1,
+      continuation_base_duration: Number(generation.total_effective_duration || generation.effective_duration || 0),
+      source: clone(source), source_segments: clone(lineage), source_document: clone(generation.document),
+      parent_context_latent_path: generation.context_latent_path
+        || continuationLatentPath(parentProject.id, generation.id),
+      workflow_id: workflow.id, workflow_name: workflow.name,
+      workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
+      result_node_ids: clone(workflow.result_node_ids || []), result_fields: clone(workflow.result_fields || []),
+      director_context: continuationDirectorContext(generation),
+    },
+    created_at: now, updated_at: now,
+  };
+  state.projects.unshift(project);
+  state.activeProjectId = project.id;
+  state.selectedShotId = project.document.shots[0].id;
+  dialog?.close();
+  markProjectChanged({ project, render: true });
+  setStatus("Structured extension created. Build its shots, then generate the extension.", "ready");
+  return project;
+}
+
+async function generateStructuredExtension(project) {
+  const source = project?.extension_source;
+  if (!project || !source?.workflow_snapshot || !source?.source_document) {
+    setStatus("This extension no longer has its saved source workflow and document.", "error");
+    return;
+  }
+  const workflow = {
+    id: source.workflow_id, name: source.workflow_name,
+    director_node_id: String(source.workflow_director_node_id || ""),
+    result_node_ids: clone(source.result_node_ids || []), result_fields: clone(source.result_fields || []),
+    snapshot: clone(source.workflow_snapshot),
+  };
+  const snapshot = clone(source.workflow_snapshot);
+  const durationSeconds = Number(project.document.duration_seconds || 5);
+  const operation = {
+    id: makeId("generation"), prompt_id: "", status: "compiling", error: "",
+    workflow_id: workflow.id, workflow_name: workflow.name,
+    workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
+    result_node_ids: clone(workflow.result_node_ids), result_fields: clone(workflow.result_fields),
+    document: clone(project.document), outputs: [], segment_outputs: [],
+    kind: "extension", preparation_kind: "continuation", parent_generation_id: source.parent_generation_id,
+    root_generation_id: source.root_generation_id, depth: Number(source.depth || 1),
+    continuation_base_duration: Number(source.continuation_base_duration || 0),
+    new_seed: state.panel.querySelector("#psvstudio-new-seed")?.checked !== false,
+    continuation_request: {
+      source: clone(source.source), source_document: clone(source.source_document),
+      extension_document: clone(project.document), brief: project.brief,
+      duration_seconds: durationSeconds, context_frames: CONTINUATION_CONTEXT_FRAMES,
+      source_segments: clone(source.source_segments || []),
+      parent_context_latent_path: source.parent_context_latent_path || "",
+    },
+    created_at: Date.now(), updated_at: Date.now(),
+  };
+  project.generations.unshift(operation);
+  project.generations = project.generations.slice(0, 200);
+  const controller = new AbortController();
+  state.generationControllers.set(operation.id, controller);
+  markProjectChanged({ project, render: true });
+  await persistProjects({ immediate: true });
+  const generate = state.panel.querySelector("#psvstudio-generate");
+  generate.disabled = true;
+  try {
+    const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
+      method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+      body: JSON.stringify({
+        document: source.source_document, extension_document: project.document,
+        source: source.source, brief: project.brief,
+        duration_seconds: durationSeconds, context_frames: CONTINUATION_CONTEXT_FRAMES,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The structured extension could not be prepared.");
+    const director = snapshot.output?.[workflow.director_node_id];
+    if (!director) throw new Error("The saved continuation workflow has no Director node.");
+    director.inputs ||= {};
+    director.inputs.document_json = JSON.stringify(data.document);
+    if (operation.new_seed !== false) randomizeSnapshotSeeds(snapshot);
+    Object.assign(operation, { status: "queueing", document: clone(data.document), updated_at: Date.now() });
+    markProjectChanged({ project, render: true });
+    await queueSnapshot(project, workflow, snapshot, {
+      ...data, kind: "extension",
+      parent_generation_id: source.parent_generation_id,
+      root_generation_id: source.root_generation_id,
+      depth: Number(source.depth || 1),
+      total_effective_duration: Number(source.continuation_base_duration || 0) + Number(data.effective_duration || 0),
+      continuation: {
+        ...data.continuation, source_generation_id: source.parent_generation_id,
+        source_segments: clone(source.source_segments || []),
+        parent_context_latent_path: source.parent_context_latent_path || "",
+        brief: project.brief, structured: true,
+      },
+    }, operation);
+  } catch (error) {
+    const cancelled = controller.signal.aborted;
+    Object.assign(operation, {
+      status: cancelled ? "cancelled" : "error",
+      error: cancelled ? "Cancelled." : (error.message || String(error)), updated_at: Date.now(),
+    });
+    markProjectChanged({ project, render: true });
+    await persistProjects({ immediate: true });
+  } finally {
+    state.generationControllers.delete(operation.id);
+    generate.disabled = false;
+  }
+}
+
 async function queueContinuation(project, parent, brief, durationSeconds, dialog, submit) {
   const source = continuationSourceOutput(parent);
   if (!source) throw new Error("The selected generation has no saved video output to continue.");
@@ -3775,8 +4125,11 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
     depth: Number(parent.depth || 0) + 1,
     continuation_base_duration: Number(parent.total_effective_duration || parent.effective_duration || 0),
     continuation_request: {
-      source: clone(source), brief, duration_seconds: durationSeconds,
+      source: clone(source), source_document: clone(parent.document),
+      brief, duration_seconds: durationSeconds,
       context_frames: CONTINUATION_CONTEXT_FRAMES, source_segments: clone(lineage),
+      parent_context_latent_path: parent.context_latent_path
+        || continuationLatentPath(project.id, parent.id),
     },
     created_at: Date.now(), updated_at: Date.now(),
   };
@@ -3842,10 +4195,205 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
   }
 }
 
+function extensionRegenerationRequest(project, generation) {
+  const saved = clone(generation?.continuation_request || {});
+  const structured = Boolean(generation?.continuation?.structured || saved.extension_document);
+  const extensionSource = isStructuredExtensionProject(project) ? project.extension_source : null;
+  const parent = project?.generations?.find(item => item.id === generation?.parent_generation_id);
+  const source = outputDescriptor(saved.source || extensionSource?.source);
+  const sourceDocument = clone(saved.source_document || extensionSource?.source_document || parent?.document || null);
+  const sourceSegments = clone(saved.source_segments || generation?.continuation?.source_segments || extensionSource?.source_segments || []);
+  if (!source || !sourceDocument || !sourceSegments.length) {
+    throw new Error("This extension no longer has the immutable source snapshot needed for regeneration.");
+  }
+  const extensionDocument = structured
+    ? clone(extensionSource ? project.document : saved.extension_document)
+    : null;
+  if (structured && !extensionDocument) {
+    throw new Error("This structured extension no longer has its authored shot document.");
+  }
+  return {
+    structured,
+    source,
+    source_document: sourceDocument,
+    source_segments: sourceSegments,
+    extension_document: extensionDocument,
+    brief: structured
+      ? String(project?.brief || extensionDocument?.main_description || "").trim()
+      : String(saved.brief || generation?.continuation?.brief || generation?.document?.main_description || "").trim(),
+    duration_seconds: Number(
+      structured
+        ? extensionDocument.duration_seconds
+        : (saved.duration_seconds || generation?.effective_duration || 5),
+    ),
+    parent_context_latent_path: saved.parent_context_latent_path
+      || generation?.continuation?.parent_context_latent_path
+      || extensionSource?.parent_context_latent_path
+      || "",
+  };
+}
+
+async function regenerateExtension(project, generation, request, dialog, submit) {
+  const { workflow, snapshot } = savedGenerationWorkflow(generation);
+  const operation = {
+    id: makeId("generation"), prompt_id: "", status: "compiling", error: "",
+    workflow_id: workflow.id, workflow_name: workflow.name,
+    workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
+    result_node_ids: clone(workflow.result_node_ids || []), result_fields: clone(workflow.result_fields || []),
+    document: clone(request.extension_document || request.source_document), outputs: [], segment_outputs: [],
+    kind: "extension", preparation_kind: "continuation",
+    parent_generation_id: generation.parent_generation_id,
+    root_generation_id: generation.root_generation_id,
+    depth: Number(generation.depth || 1),
+    continuation_base_duration: Math.max(
+      0,
+      Number(
+        generation.continuation_base_duration
+        ?? (Number(generation.total_effective_duration || 0) - Number(generation.effective_duration || 0)),
+      ),
+    ),
+    regenerated_from_generation_id: generation.id,
+    new_seed: true,
+    continuation_request: clone(request),
+    created_at: Date.now(), updated_at: Date.now(),
+  };
+  project.generations.unshift(operation);
+  project.generations = project.generations.slice(0, 200);
+  const controller = new AbortController();
+  state.generationControllers.set(operation.id, controller);
+  markProjectChanged({ project, render: true });
+  await persistProjects({ immediate: true });
+  submit.disabled = true;
+  try {
+    const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        document: request.source_document,
+        ...(request.extension_document ? { extension_document: request.extension_document } : {}),
+        source: request.source,
+        brief: request.brief,
+        duration_seconds: request.duration_seconds,
+        context_frames: CONTINUATION_CONTEXT_FRAMES,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "The replacement extension could not be prepared.");
+    const director = snapshot.output?.[workflow.director_node_id];
+    if (!director) throw new Error("The saved continuation workflow has no Director node.");
+    director.inputs ||= {};
+    director.inputs.document_json = JSON.stringify(data.document);
+    randomizeSnapshotSeeds(snapshot);
+    Object.assign(operation, { status: "queueing", document: clone(data.document), updated_at: Date.now() });
+    markProjectChanged({ project, render: true });
+    await queueSnapshot(project, workflow, snapshot, {
+      ...data,
+      kind: "extension",
+      parent_generation_id: generation.parent_generation_id,
+      root_generation_id: generation.root_generation_id,
+      depth: Number(generation.depth || 1),
+      total_effective_duration: operation.continuation_base_duration + Number(data.effective_duration || 0),
+      continuation: {
+        ...data.continuation,
+        source_generation_id: generation.parent_generation_id,
+        source_segments: clone(request.source_segments),
+        parent_context_latent_path: request.parent_context_latent_path,
+        brief: request.brief,
+        structured: request.structured,
+      },
+    }, operation);
+    dialog.close();
+    setStatus("Replacement extension queued from the same source ending.", "ready");
+  } catch (error) {
+    const cancelled = controller.signal.aborted || operation.status === "cancelled";
+    Object.assign(operation, {
+      status: cancelled ? "cancelled" : "error",
+      error: cancelled ? "Cancelled." : (error.message || String(error)),
+      updated_at: Date.now(),
+    });
+    markProjectChanged({ project, render: true });
+    await persistProjects({ immediate: true });
+    if (!cancelled) throw error;
+  } finally {
+    state.generationControllers.delete(operation.id);
+    submit.disabled = false;
+  }
+}
+
+function showRegenerateExtension(generation) {
+  const project = activeProject();
+  if (!project || !generation || generation.kind !== "extension") return;
+  let request;
+  try {
+    request = extensionRegenerationRequest(project, generation);
+  } catch (error) {
+    setStatus(error.message || String(error), "error");
+    return;
+  }
+  const dialog = el("dialog", "psvstudio-continuation-dialog");
+  dialog.setAttribute("aria-label", "Regenerate extension only");
+  const heading = el("div", "psvstudio-continuation-heading");
+  heading.append(
+    el("h2", "", "Regenerate extension only"),
+    el("p", "", "The original video and all earlier accepted segments stay untouched. The replacement branches from the same source ending with a new seed."),
+  );
+  const body = el("div", "psvstudio-continuation-body");
+  if (request.structured) {
+    body.append(el(
+      "div", "psvstudio-continuation-note",
+      "The current extension project shots, dialogue, camera, and sounds will be used. Close this dialog first if you want to edit them before regenerating.",
+    ));
+  } else {
+    const briefInput = textArea(request.brief, value => { request.brief = value; }, 7, "Describe only what should happen in the replacement extension.");
+    const durationInput = textInput(request.duration_seconds, value => { request.duration_seconds = value; }, "number");
+    durationInput.min = "5";
+    durationInput.max = "15";
+    durationInput.step = "0.1";
+    body.append(
+      field("What should happen instead?", briefInput, "Revise only the new action. The immutable source ending remains the same."),
+      field("Added duration (seconds)", durationInput, "The replacement is snapped to MiniMax's native frame grid."),
+    );
+  }
+  body.append(el(
+    "div", "psvstudio-continuation-note",
+    "The previous result remains in immutable history so you can compare it or return to it later.",
+  ));
+  const footer = el("footer", "psvstudio-continuation-actions");
+  const cancel = button("Cancel", () => dialog.close());
+  const submit = button("Regenerate extension", async () => {
+    request.brief = String(request.brief || "").trim();
+    request.duration_seconds = Number(request.duration_seconds);
+    if (!request.structured && !request.brief) {
+      setStatus("Describe what should happen in the replacement extension.", "warning");
+      return;
+    }
+    if (!Number.isFinite(request.duration_seconds) || request.duration_seconds < 5 || request.duration_seconds > 15) {
+      setStatus("Extension duration must be between 5 and 15 seconds.", "warning");
+      return;
+    }
+    try {
+      await regenerateExtension(project, generation, request, dialog, submit);
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    }
+  }, "psvstudio-button psvstudio-button-primary");
+  footer.append(cancel, submit);
+  dialog.append(heading, body, footer);
+  dialog.addEventListener("cancel", event => {
+    event.preventDefault();
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  state.panel.ownerDocument.body.append(dialog);
+  dialog.showModal();
+}
+
 function showContinueVideo(generation) {
   const project = activeProject();
   if (!project || generation.status !== "complete" || !continuationSourceOutput(generation)) return;
   const dialog = el("dialog", "psvstudio-continuation-dialog");
+  dialog.setAttribute("aria-label", "Continue video");
   const heading = el("div", "psvstudio-continuation-heading");
   heading.append(
     el("h2", "", "Continue video"),
@@ -3862,7 +4410,7 @@ function showContinueVideo(generation) {
   body.append(
     field("What happens next?", briefInput, "The continuation starts from the selected render's actual ending. Describe new action rather than repeating the previous video."),
     field("Added duration (seconds)", durationInput, "MiniMax snaps the result to its native frame grid."),
-    el("div", "psvstudio-continuation-note", "Native H3 motion context · 22 pinned audiovisual frames · repeated context trimmed before saving"),
+    el("div", "psvstudio-continuation-note", "Quick Continue uses this text directly. Build full extension creates a saved extension project with its own shots, structured dialogue, camera, and generated sounds. Both use Native H3 Add Guide with 22 carried video frames / 37 audio steps."),
   );
   const footer = el("footer", "psvstudio-continuation-actions");
   const cancel = button("Cancel", () => dialog.close());
@@ -3877,7 +4425,15 @@ function showContinueVideo(generation) {
       setStatus(error.message || String(error), "error");
     }
   }, "psvstudio-button psvstudio-button-primary");
-  footer.append(cancel, submit);
+  const build = button("Build full extension", () => {
+    try {
+      createStructuredExtensionProject(project, generation, brief.trim(), duration, dialog);
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    }
+  }, "psvstudio-button psvstudio-button-primary");
+  submit.textContent = "Quick generate";
+  footer.append(cancel, submit, build);
   dialog.append(heading, body, footer);
   dialog.addEventListener("cancel", event => {
     event.preventDefault();
@@ -3892,6 +4448,7 @@ function showContinueVideo(generation) {
 
 function showGenerationOutput(output, title) {
   const dialog = el("dialog", "psvstudio-media-preview-dialog");
+  dialog.setAttribute("aria-label", title || "Video output");
   const header = el("header", "psvstudio-media-preview-header");
   header.append(el("h2", "", title), button("Close", () => dialog.close()));
   const body = el("div", "psvstudio-media-preview-body");
@@ -3922,9 +4479,10 @@ function renderProjectList() {
     const control = el("button", "psvstudio-project");
     control.type = "button";
     control.setAttribute("aria-current", project.id === state.activeProjectId ? "true" : "false");
+    const projectKind = isStructuredExtensionProject(project) ? "Extension · " : "";
     control.append(
       el("strong", "", project.name || "Untitled video"),
-      el("small", "", `${project.document?.shots?.length || 0} shot${project.document?.shots?.length === 1 ? "" : "s"} · ${project.generations?.length || 0} render${project.generations?.length === 1 ? "" : "s"}`),
+      el("small", "", `${projectKind}${project.document?.shots?.length || 0} shot${project.document?.shots?.length === 1 ? "" : "s"} · ${project.generations?.length || 0} render${project.generations?.length === 1 ? "" : "s"}`),
     );
     control.addEventListener("click", () => selectProject(project.id));
     const remove = el("button", "psvstudio-project-delete", "Delete");
@@ -3959,7 +4517,10 @@ function renderWorkflowSelect() {
     select.append(option);
   }
   select.value = project?.workflow_id || "";
-  select.disabled = !project;
+  select.disabled = !project || isStructuredExtensionProject(project);
+  select.title = isStructuredExtensionProject(project)
+    ? "Extensions use the immutable workflow snapshot saved with their source render."
+    : "Choose a compatible [PSV] workflow.";
 }
 
 function latestOutput(project) {
@@ -3990,11 +4551,17 @@ function renderPreview() {
     return;
   }
   preview.append(
-    el("span", "psvstudio-mode-badge", localResolvedMode(project.document).toUpperCase()),
+    el("span", "psvstudio-mode-badge", isStructuredExtensionProject(project) ? "EXTENSION" : localResolvedMode(project.document).toUpperCase()),
     renderTurboProfileIndicator(project, true),
   );
   preview.append(button("Global settings", () => showGlobalSettings(project), "psvstudio-button psvstudio-global-settings-button"));
-  const output = latestOutput(project);
+  if (isStructuredExtensionProject(project)) {
+    preview.append(el(
+      "div", "psvstudio-extension-banner",
+      `Structured extension · ${CONTINUATION_CONTEXT_FRAMES} source frames are carried before authored Shot 1 · use the per-shot Director from any Shot Editor`,
+    ));
+  }
+  const output = latestOutput(project) || (isStructuredExtensionProject(project) ? project.extension_source.source : null);
   if (output) {
     const video = document.createElement("video");
     video.controls = true;
@@ -4005,8 +4572,10 @@ function renderPreview() {
   } else {
     const empty = el("div", "psvstudio-preview-empty");
     empty.append(
-      el("strong", "", "Your production starts here"),
-      el("span", "", "Describe the video, refine the selected shot, then generate an immutable workflow snapshot."),
+      el("strong", "", isStructuredExtensionProject(project) ? "Build the next segment" : "Your production starts here"),
+      el("span", "", isStructuredExtensionProject(project)
+        ? "Author shots, dialogue, camera, and sounds. Generation joins them seamlessly to the saved source ending."
+        : "Describe the video, refine the selected shot, then generate an immutable workflow snapshot."),
     );
     preview.append(empty);
   }
@@ -4193,6 +4762,35 @@ function appendGlobalSettings(container, project, refresh) {
     }
     renderPreview();
   };
+  if (isStructuredExtensionProject(project)) {
+    const duration = textInput(project.document.duration_seconds, value => {
+      if (!Number.isFinite(value)) return;
+      project.document.duration_seconds = Math.min(15, Math.max(5, value));
+      markProjectChanged();
+    }, "number");
+    duration.min = "5";
+    duration.max = "15";
+    duration.step = "0.1";
+    const fixed = el("div", "psvstudio-extension-settings-note");
+    fixed.append(
+      el("strong", "", "Native structured extension"),
+      el("span", "", `${project.document.width}×${project.document.height} source canvas · T2VA text document plus native audiovisual handoff`),
+      el("small", "", `The first ${CONTINUATION_CONTEXT_FRAMES} frames are injected from the source and removed after generation. Authored cut times are offset automatically.`),
+    );
+    const row = el("div", "psvstudio-field-row psvstudio-canvas-row");
+    row.append(field("Added duration", duration, "Each structured extension adds 5–15 seconds before native frame-grid snapping."));
+    turboIndicator = renderTurboProfileIndicator(project);
+    container.append(fixed, row, turboIndicator);
+    const production = inspectorDetails("Extension production settings", true);
+    production.body.append(
+      field("Visual style", textArea(project.document.style, value => { project.document.style = value; markProjectChanged(); }, 2, PLACEHOLDERS.style)),
+      field("Overall soundscape", textArea(project.document.overall_soundscape, value => { project.document.overall_soundscape = value; markProjectChanged(); }, 3, PLACEHOLDERS.soundscape)),
+      field("Non-diegetic music", textArea(project.document.non_diegetic_music, value => { project.document.non_diegetic_music = value; markProjectChanged(); }, 2, PLACEHOLDERS.music)),
+      checkControl("Complete silence", project.document.complete_silence, value => { project.document.complete_silence = value; markProjectChanged(); }),
+    );
+    container.append(production.details);
+    return;
+  }
   const sizeValue = `${project.document.width}x${project.document.height}`;
   const aspectOptions = state.config.aspect_presets.map(item => ({ value: `size:${item.width}x${item.height}`, label: item.label }));
   for (const reference of project.document.references || []) {
@@ -4314,7 +4912,23 @@ function appendProjectBrief(container, project) {
     project.document.main_description = value;
     markProjectChanged();
   }, 4, PLACEHOLDERS.brief);
-  section.body.append(field("Video overview", brief, "Planning synopsis for you and the Grand Director. It is not sent to MiniMax; the Director translates it into the required shot timeline."));
+  const structuredExtension = isStructuredExtensionProject(project);
+  section.body.append(field(
+    structuredExtension ? "Extension overview" : "Video overview",
+    brief,
+    structuredExtension
+      ? "Planning synopsis for this extension. Author prompt-relevant details in its shots; use Save & ask Director for focused assistance."
+      : "Planning synopsis for you and the Grand Director. It is not sent to MiniMax; the Director translates it into the required shot timeline.",
+  ));
+
+  if (structuredExtension) {
+    section.body.append(el(
+      "div", "psvstudio-extension-settings-note",
+      "Grand Director is intentionally disabled for extension projects. The per-shot Director receives the source-ending handoff and can revise each authored extension shot.",
+    ));
+    container.append(section.details);
+    return;
+  }
 
   const command = textArea("", () => {}, 2, PLACEHOLDERS.directorCommand);
   const ask = button(
@@ -4336,6 +4950,7 @@ function appendProjectBrief(container, project) {
 function showGlobalSettings(project = activeProject()) {
   if (!project) return;
   const dialog = el("dialog", "psvstudio-global-settings-dialog");
+  dialog.setAttribute("aria-label", "Global video settings");
   const render = () => {
     if (!dialog.isConnected) return;
     dialog.replaceChildren();
@@ -4480,7 +5095,7 @@ function setBoundary(project, boundaryIndex, requestedTime) {
   const minimum = (Number(shots[boundaryIndex - 1].start) || 0) + 0.25;
   const maximum = boundaryIndex < shots.length
     ? Number(shots[boundaryIndex + 1]?.start ?? documentDuration(project)) - 0.25
-    : 150;
+    : (isStructuredExtensionProject(project) ? 15 : 150);
   const time = Math.round(Math.max(minimum, Math.min(maximum, requestedTime)) * 1000) / 1000;
   if (boundaryIndex < shots.length) shots[boundaryIndex].start = time;
   else project.document.duration_seconds = time;
@@ -4780,6 +5395,7 @@ function renderMediaLane() {
 
 function showMediaPreview(reference, displayLabel = "Media") {
   const dialog = el("dialog", "psvstudio-media-preview-dialog");
+  dialog.setAttribute("aria-label", `${displayLabel} preview`);
   const header = el("header", "psvstudio-media-preview-header");
   const heading = el("div", "psvstudio-media-preview-heading");
   heading.append(
@@ -4824,6 +5440,7 @@ function showMediaPreview(reference, displayLabel = "Media") {
 function showMediaLibrary(project = activeProject()) {
   if (!project) return;
   const dialog = el("dialog", "psvstudio-media-library-dialog");
+  dialog.setAttribute("aria-label", "Project media");
   const render = () => {
     if (!dialog.isConnected) return;
     dialog.replaceChildren();
@@ -4890,6 +5507,8 @@ function showMediaLibrary(project = activeProject()) {
       down.disabled = index === references.length - 1;
       up.title = `Move ${displayLabel} up`;
       down.title = `Move ${displayLabel} down`;
+      up.ariaLabel = up.title;
+      down.ariaLabel = down.title;
       order.append(up, down);
       cardHeading.append(identity, order);
 
@@ -5057,6 +5676,10 @@ function renderShotSteps(container, shot) {
     const controls = el("div", "psvstudio-step-controls");
     const up = button("↑", () => moveShotStep(shot, step.id, index - 1), "psvstudio-button psvstudio-icon-button");
     const down = button("↓", () => moveShotStep(shot, step.id, index + 2), "psvstudio-button psvstudio-icon-button");
+    up.title = `Move step ${index + 1} earlier`;
+    up.ariaLabel = up.title;
+    down.title = `Move step ${index + 1} later`;
+    down.ariaLabel = down.title;
     up.disabled = index === 0;
     down.disabled = index === steps.length - 1;
     const duplicate = button("Duplicate", () => {
@@ -5568,7 +6191,10 @@ function renderShotEditorDialog() {
     el("h2", "", `Edit Shot ${index + 1}`),
     el("small", "", `${Number(draft.start || 0).toFixed(2)}–${end.toFixed(2)}s · ${draft.steps.length} chronological step${draft.steps.length === 1 ? "" : "s"}`),
   );
-  header.append(heading, button("×", () => closeShotEditor(), "psvstudio-button psvstudio-icon-button"));
+  const close = button("×", () => closeShotEditor(), "psvstudio-button psvstudio-icon-button");
+  close.title = "Close shot editor";
+  close.ariaLabel = close.title;
+  header.append(heading, close);
 
   const workspace = el("div", "psvstudio-shot-editor-workspace");
   const setup = el("div", "psvstudio-shot-editor-setup");
@@ -5713,6 +6339,7 @@ function openShotEditor(shotId = state.selectedShotId) {
   state.shotEditorRevealStepId = "";
   state.shotTimelineSelectionId = "";
   const dialog = el("dialog", "psvstudio-shot-editor-dialog");
+  dialog.setAttribute("aria-label", `Edit Shot ${project.document.shots.indexOf(shot) + 1}`);
   dialog.addEventListener("cancel", event => {
     event.preventDefault();
     closeShotEditor();
@@ -5883,6 +6510,9 @@ function renderGenerations() {
     if (isExtension && generation.segment_outputs?.[0]) {
       actions.append(button("View extension", () => showGenerationOutput(generation.segment_outputs[0], `Extension ${Number(generation.depth || 1)} segment`)));
     }
+    if (isExtension && ["complete", "error", "interrupted", "cancelled"].includes(generation.status)) {
+      actions.append(button("Regenerate extension", () => showRegenerateExtension(generation), "psvstudio-button psvstudio-button-primary"));
+    }
     actions.append(button("Replay exact", () => replayGeneration(generation)));
     if (generation.compiled_prompt) actions.append(button("View prompt", () => showCompiledPrompt(generation.compiled_prompt)));
     body.append(actions);
@@ -5899,6 +6529,7 @@ function renderGenerations() {
 
 function showCompiledPrompt(prompt) {
   const dialog = el("dialog", "psvstudio-prompt-dialog");
+  dialog.setAttribute("aria-label", "Compiled MiniMax prompt");
   const title = el("h2", "", "Compiled MiniMax prompt");
   const copy = document.createElement("textarea");
   copy.readOnly = true;
@@ -5920,6 +6551,7 @@ function showCompiledPrompt(prompt) {
 
 function showEditableProjectPrompt(project, { prompt = "", settingsPrompt = "", settingsError = "" } = {}) {
   const dialog = el("dialog", "psvstudio-prompt-dialog");
+  dialog.setAttribute("aria-label", "Editable MiniMax prompt");
   const title = el("h2", "", "Editable MiniMax prompt");
   const warning = el("div", "psvstudio-prompt-warning");
   warning.setAttribute("role", "status");
@@ -5985,9 +6617,32 @@ function showEditableProjectPrompt(project, { prompt = "", settingsPrompt = "", 
 }
 
 async function compilePreview() {
+  if (!state.apiConnected) {
+    setStatus("ComfyUI disconnected — Video Studio is frozen.", "error");
+    return;
+  }
   const project = activeProject();
   if (!project) return;
   try {
+    if (isStructuredExtensionProject(project)) {
+      const source = project.extension_source;
+      const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          document: source.source_document,
+          extension_document: project.document,
+          source: source.source,
+          brief: project.brief,
+          duration_seconds: Number(project.document.duration_seconds || 5),
+          context_frames: CONTINUATION_CONTEXT_FRAMES,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "The structured extension could not be compiled.");
+      showCompiledPrompt(data.compiled_prompt);
+      return;
+    }
     const response = await api.fetchApi("/promptstudio-video/document/compile", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -6018,18 +6673,33 @@ function renderHeader() {
   const duplicate = state.panel?.querySelector("#psvstudio-duplicate");
   const reset = state.panel?.querySelector("#psvstudio-reset");
   const preview = state.panel?.querySelector("#psvstudio-compile-preview");
+  const grandDirector = state.panel?.querySelector("#psvstudio-grand-director");
+  const addMedia = state.panel?.querySelector("#psvstudio-add-media");
+  const viewMedia = state.panel?.querySelector("#psvstudio-view-all-media");
+  const structuredExtension = isStructuredExtensionProject(project);
   if (title) {
     title.disabled = !project;
     title.value = project?.name || "Prompt Studio Video";
   }
-  if (generate) generate.disabled = !project || !state.workflows.length;
+  if (generate) {
+    generate.disabled = !project || (!structuredExtension && !state.workflows.length);
+    generate.textContent = structuredExtension ? "Generate extension" : "Generate";
+  }
   if (duplicate) duplicate.disabled = !project;
-  if (reset) reset.disabled = !project || Boolean(projectPendingGenerationCount(project)) || projectHasPendingDirectorJob(project.id) || state.directorBusy;
+  if (reset) reset.disabled = !project || structuredExtension || Boolean(projectPendingGenerationCount(project)) || projectHasPendingDirectorJob(project.id) || state.directorBusy;
+  if (grandDirector) grandDirector.hidden = structuredExtension;
+  if (addMedia) {
+    addMedia.disabled = structuredExtension;
+    addMedia.title = structuredExtension ? "New media references are not yet supported inside native structured extensions." : "Add project media";
+  }
+  if (viewMedia) viewMedia.disabled = structuredExtension;
   if (preview) preview.disabled = !project;
   if (preview) {
     const overridden = Boolean(project?.document?.prompt_override);
     preview.textContent = overridden ? "Prompt*" : "Prompt";
-    preview.title = overridden
+    preview.title = structuredExtension
+      ? "Preview the context-prefixed extension prompt"
+      : overridden
       ? "A manual prompt override is active and may not match the Shot Composer settings"
       : "View or edit the compiled MiniMax prompt";
     preview.dataset.override = overridden ? "true" : "false";
@@ -6051,19 +6721,27 @@ function renderAll() {
 
 function buildPanel() {
   if (state.panel) return state.panel;
+  const llmSettings = directorSettings();
+  const initialProvider = normalizeLlmProvider(llmSettings.llm_provider);
   const panel = el("section", "psvstudio-app");
   panel.hidden = true;
   panel.innerHTML = `
-    <aside class="psvstudio-sidebar">
+    <div id="psvstudio-api-connection" class="psvstudio-api-connection" role="alert" hidden>
+      <span aria-hidden="true"></span>
+      <strong>ComfyUI disconnected</strong>
+      <small>Video Studio is frozen until the API connection returns.</small>
+    </div>
+    <aside id="psvstudio-projects-drawer" class="psvstudio-sidebar">
       <div class="psvstudio-sidebar-header">
         <h2>Projects</h2>
-        <button id="psvstudio-new-project" class="psvstudio-button psvstudio-button-primary" type="button">New</button>
+        <div class="psvstudio-inline"><button id="psvstudio-new-project" class="psvstudio-button psvstudio-button-primary" type="button">New</button><button id="psvstudio-close-projects" class="psvstudio-button psvstudio-icon-button" type="button" title="Close projects" aria-label="Close projects">×</button></div>
       </div>
       <div id="psvstudio-project-list" class="psvstudio-project-list"></div>
     </aside>
+    <button class="psvstudio-drawer-scrim" type="button" aria-label="Close open drawer"></button>
     <main class="psvstudio-main">
       <header class="psvstudio-topbar">
-        <button id="psvstudio-mobile-projects" class="psvstudio-button psvstudio-icon-button" type="button" title="Projects" aria-label="Projects">☰</button>
+        <button id="psvstudio-mobile-projects" class="psvstudio-button psvstudio-icon-button" type="button" title="Projects" aria-label="Projects" aria-controls="psvstudio-projects-drawer" aria-expanded="false">☰</button>
         <div class="psvstudio-studio-switch psvstudio-mobile-studio-switch" role="group" aria-label="Studio mode">
           <button type="button" data-promptstudio-studio-mode="image" aria-pressed="false">Image</button>
           <button type="button" data-promptstudio-studio-mode="video" data-available="true" aria-pressed="true">Video</button>
@@ -6078,14 +6756,14 @@ function buildPanel() {
           <div class="psvstudio-kobold-popover">
             <strong class="psvstudio-system-status-heading">System status</strong>
             <section class="psvstudio-system-status-section">
-              <strong id="psvstudio-llm-status-heading">KoboldCpp</strong>
+              <strong id="psvstudio-llm-status-heading">${llmProviderDisplayName(initialProvider)}</strong>
               <span id="psvstudio-kobold-status-detail" role="status" aria-live="polite">Checking local status…</span>
               <dl class="psvstudio-kobold-metadata">
                 <div><dt>Model</dt><dd id="psvstudio-kobold-model">Checking…</dd></div>
                 <div><dt>Vision</dt><dd id="psvstudio-kobold-vision" data-state="unknown">Checking…</dd></div>
               </dl>
-              <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled>Force stop processing</button>
-              <small id="psvstudio-kobold-stop-help">Stops LLM processing only. KoboldCpp stays loaded.</small>
+              <button id="psvstudio-kobold-stop" class="psvstudio-button psvstudio-button-danger" type="button" disabled ${initialProvider === "ollama" ? "hidden" : ""}>Force stop processing</button>
+              <small id="psvstudio-kobold-stop-help" ${initialProvider === "ollama" ? "hidden" : ""}>${initialProvider === "llamacpp" ? "Stops Video Studio text streams only. Manage the Llama.cpp server in Prompt Studio settings." : "Stops LLM processing only. KoboldCpp stays loaded."}</small>
             </section>
             <section class="psvstudio-system-status-section">
               <div class="psvstudio-system-status-row"><strong>ComfyUI</strong><span id="psvstudio-comfy-status-detail" data-state="busy" role="status" aria-live="polite">Checking…</span></div>
@@ -6098,7 +6776,7 @@ function buildPanel() {
         <button id="psvstudio-compile-preview" class="psvstudio-button" type="button">Prompt</button>
         <button id="psvstudio-duplicate" class="psvstudio-button" type="button">Duplicate</button>
         <button id="psvstudio-reset" class="psvstudio-button psvstudio-button-danger" type="button" title="Reset this project while retaining its reference media">Reset</button>
-        <button id="psvstudio-mobile-inspector" class="psvstudio-button psvstudio-icon-button" type="button" title="Shots" aria-label="Shots">☷</button>
+        <button id="psvstudio-mobile-inspector" class="psvstudio-button psvstudio-icon-button" type="button" title="Shots" aria-label="Shots" aria-controls="psvstudio-shots-drawer" aria-expanded="false">☷</button>
       </header>
       <div class="psvstudio-workspace">
         <div class="psvstudio-editor-scroll">
@@ -6141,7 +6819,7 @@ function buildPanel() {
         <button id="psvstudio-generate" class="psvstudio-button psvstudio-button-primary" type="button">Generate</button>
       </footer>
     </main>
-    <aside class="psvstudio-inspector">
+    <aside id="psvstudio-shots-drawer" class="psvstudio-inspector">
       <div class="psvstudio-brand psvstudio-inspector-brand">
         <img class="psvstudio-brand-mark" src="${VIDEO_ICON_URL}" alt="" aria-hidden="true">
         <div><strong>Prompt Studio Video</strong><small>by tiko13</small></div>
@@ -6155,6 +6833,9 @@ function buildPanel() {
     </aside>`;
 
   panel.querySelector("#psvstudio-new-project").addEventListener("click", newProject);
+  panel.querySelectorAll('[data-promptstudio-studio-mode="image"], #psvstudio-close-inspector, #psvstudio-close-projects, .psvstudio-drawer-scrim, #psvstudio-comfy-restart').forEach(control => {
+    control.dataset.psvstudioAllowDisconnected = "true";
+  });
   panel.querySelector("#psvstudio-add-shot").addEventListener("click", addShot);
   panel.querySelector("#psvstudio-grand-director").addEventListener("click", () => openDirector("project"));
   panel.querySelector("#psvstudio-add-media").addEventListener("click", () => panel.querySelector("#psvstudio-media-input").click());
@@ -6192,18 +6873,24 @@ function buildPanel() {
   panel.querySelector("#psvstudio-mobile-projects").addEventListener("click", () => {
     state.drawer = state.drawer === "projects" ? "" : "projects";
     panel.dataset.drawer = state.drawer;
+    panel.querySelector("#psvstudio-mobile-projects").setAttribute("aria-expanded", String(state.drawer === "projects"));
+    panel.querySelector("#psvstudio-mobile-inspector").setAttribute("aria-expanded", "false");
   });
   panel.querySelector("#psvstudio-mobile-inspector").addEventListener("click", () => {
     state.drawer = state.drawer === "inspector" ? "" : "inspector";
     panel.dataset.drawer = state.drawer;
+    panel.querySelector("#psvstudio-mobile-inspector").setAttribute("aria-expanded", String(state.drawer === "inspector"));
+    panel.querySelector("#psvstudio-mobile-projects").setAttribute("aria-expanded", "false");
   });
   panel.querySelector("#psvstudio-close-inspector").addEventListener("click", () => {
-    state.drawer = "";
-    panel.dataset.drawer = "";
+    closeVideoDrawer();
   });
+  panel.querySelector("#psvstudio-close-projects").addEventListener("click", () => closeVideoDrawer());
+  panel.querySelector(".psvstudio-drawer-scrim").addEventListener("click", () => closeVideoDrawer());
   state.panel = panel;
   document.body.append(panel);
   installMediaDrop(document);
+  installTransientUiDismissal(document);
   return panel;
 }
 
@@ -6281,13 +6968,46 @@ function setupProgressEvents() {
     const queueRemaining = Number(event.detail?.exec_info?.queue_remaining);
     if (Number.isFinite(queueRemaining)) state.comfyQueueRemaining = Math.max(0, queueRemaining);
     setApiConnected(event.detail !== null);
+    renderSystemStatusSummary();
+  });
+
+  state.disconnectedControlObserver?.disconnect();
+  state.disconnectedControlObserver = new MutationObserver(mutations => {
+    if (state.apiConnected) return;
+    for (const mutation of mutations) {
+      if (mutation.type === "childList") {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) freezeDisconnectedControls(node);
+        });
+      } else if (
+        mutation.type === "attributes"
+        && isVideoStudioControl(mutation.target)
+        && !mutation.target.disabled
+        && !isDisconnectedAllowedControl(mutation.target)
+      ) {
+        state.disconnectedControls.set(mutation.target, false);
+        mutation.target.disabled = true;
+      }
+    }
+  });
+  state.disconnectedControlObserver.observe(state.panel, {
+    attributes: true,
+    attributeFilter: ["disabled"],
+    childList: true,
+    subtree: true,
   });
   setApiConnected(api.socket ? api.socket.readyState === WebSocket.OPEN : true);
 }
 
 function setStandaloneVisibility(visible) {
   state.standaloneVisible = Boolean(visible);
-  if (state.panel?.ownerDocument === state.popup?.document) state.panel.hidden = !state.standaloneVisible;
+  if (state.panel?.ownerDocument === state.popup?.document) {
+    if (!state.standaloneVisible) {
+      closeSystemStatus();
+      closeVideoDrawer();
+    }
+    state.panel.hidden = !state.standaloneVisible;
+  }
   postVideoStudioPresence();
 }
 
@@ -6307,6 +7027,7 @@ async function attachStandalone(popup, { unified = false } = {}) {
   state.panel.hidden = !state.standaloneVisible;
   state.studioOpenedAt = Date.now();
   installMediaDrop(popup.document);
+  installTransientUiDismissal(popup.document);
   renderAll();
   postVideoStudioPresence();
   popup.addEventListener("beforeunload", () => {
@@ -6423,7 +7144,8 @@ function resumeVideoPreparations() {
               headers: { "Content-Type": "application/json" },
               signal: controller.signal,
               body: JSON.stringify({
-                document: operation.document,
+                document: request.source_document || operation.document,
+                extension_document: request.extension_document,
                 source: request.source,
                 brief: request.brief,
                 duration_seconds: request.duration_seconds,
@@ -6438,7 +7160,7 @@ function resumeVideoPreparations() {
             if (!director) throw new Error("The saved continuation workflow has no Director node.");
             director.inputs ||= {};
             director.inputs.document_json = JSON.stringify(data.document);
-            randomizeSnapshotSeeds(snapshot);
+            if (operation.new_seed !== false) randomizeSnapshotSeeds(snapshot);
             Object.assign(operation, { status: "queueing", document: clone(data.document), updated_at: Date.now() });
             markProjectChanged({ project, render: project.id === state.activeProjectId });
             await queueSnapshot(project, {
@@ -6458,7 +7180,9 @@ function resumeVideoPreparations() {
                 ...data.continuation,
                 source_generation_id: operation.parent_generation_id,
                 source_segments: clone(request.source_segments || []),
+                parent_context_latent_path: request.parent_context_latent_path || "",
                 brief: request.brief,
+                structured: Boolean(request.extension_document),
               },
             }, operation);
             return;

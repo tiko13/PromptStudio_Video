@@ -154,6 +154,44 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["workflow_snapshot"], generation["workflow_snapshot"])
             self.assertEqual(restored["outputs"][0]["filename"], "video.mp4")
 
+    def test_structured_extension_source_survives_project_store_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "projects.json")
+            document = default_document()
+            extension_source = {
+                "parent_project_id": "project-parent",
+                "parent_generation_id": "generation-parent",
+                "root_generation_id": "generation-root",
+                "depth": 2,
+                "continuation_base_duration": 10.0,
+                "source": {"filename": "parent.mp4", "subfolder": "video", "type": "output"},
+                "source_segments": [{"filename": "parent.mp4", "subfolder": "video", "type": "output"}],
+                "source_document": document,
+                "parent_context_latent_path": "video/latents/parent.safetensors",
+                "workflow_id": "[PSV] MiniMax.json",
+                "workflow_name": "MiniMax",
+                "workflow_snapshot": {"output": {"1": {"class_type": "PSV_MiniMaxH3Director"}}},
+                "workflow_director_node_id": "1",
+                "result_node_ids": ["2"],
+                "result_fields": ["videos"],
+                "director_context": {"type": "native_h3_structured_extension", "context_frames": 22},
+            }
+            update_project_store(path, {
+                "version": 2, "revision": 0, "active_project_id": "project-extension",
+                "projects": [{
+                    "id": "project-extension", "name": "Extension", "brief": "Continue.",
+                    "document": document, "workflow_id": "[PSV] MiniMax.json", "generations": [],
+                    "extension_source": extension_source, "created_at": 1, "updated_at": 2,
+                }],
+            })
+
+            restored = read_project_store(path)["projects"][0]["extension_source"]
+
+            self.assertEqual(restored["parent_generation_id"], "generation-parent")
+            self.assertEqual(restored["depth"], 2)
+            self.assertEqual(restored["source_document"]["resolved_mode"], "t2va")
+            self.assertEqual(restored["director_context"]["context_frames"], 22)
+
     def test_in_message_operation_statuses_survive_reload(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "projects.json")
@@ -198,7 +236,15 @@ class StoreTests(unittest.TestCase):
                 "segment_outputs": [{"filename": "segment.mp4", "type": "output"}],
                 "effective_duration": 5.17, "total_effective_duration": 10.34,
                 "context_latent_path": "video/PromptStudio_Video/latents/project-1/generation-extension.safetensors",
-                "continuation": {"engine": "native_h3_motion_context", "context_frames": 22},
+                "continuation": {"engine": "native_h3_add_guide", "context_frames": 22},
+                "continuation_request": {
+                    "source": {"filename": "base.mp4", "type": "output"},
+                    "source_document": document,
+                    "source_segments": [{"filename": "base.mp4", "type": "output"}],
+                    "brief": "A different ending.",
+                    "duration_seconds": 5,
+                    "parent_context_latent_path": "video/PromptStudio_Video/latents/project-1/generation-base.safetensors",
+                },
                 "created_at": 2, "updated_at": 2,
             }
             update_project_store(path, {
@@ -216,6 +262,8 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored_extension["kind"], "extension")
             self.assertEqual(restored_extension["segment_outputs"][0]["filename"], "segment.mp4")
             self.assertTrue(restored_extension["context_latent_path"].endswith(".safetensors"))
+            self.assertEqual(restored_extension["continuation_request"]["brief"], "A different ending.")
+            self.assertEqual(restored_extension["continuation_request"]["source_document"]["version"], document["version"])
 
     def test_pruned_continuation_parent_preserves_saved_lineage_coordinates(self):
         with tempfile.TemporaryDirectory() as directory:
