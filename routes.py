@@ -10,7 +10,7 @@ import uuid
 from aiohttp import web
 from server import PromptServer
 
-from .nodes.h3_motion_context import native_guides_available
+from .nodes.h3_motion_context import native_masks_available
 from .video.compiler import compile_prompt
 from .video.audio_mix import assemble_exact_audio, probe_input_audio
 from .video.continuation import (
@@ -104,7 +104,7 @@ CAPABILITY = {
         "kobold_control",
         "studio_image_handoff",
         "native_video_continuation",
-        "native_h3_add_guide",
+        "native_h3_soft_av_39",
         "unified_studio_shell",
         "default_workflow_setup",
         "shot_detail_timeline",
@@ -358,9 +358,9 @@ async def promptstudio_video_compile(request):
 
 async def promptstudio_video_continuation_prepare(request):
     try:
-        if not native_guides_available():
+        if not native_masks_available():
             raise ValueError(
-                "Continue video requires current ComfyUI native MiniMax H3 Add Guide support"
+                "Continue video requires current ComfyUI native MiniMax H3 nested mask support"
             )
         if request.content_length is not None and request.content_length > MAX_CONTINUATION_REQUEST_BYTES:
             raise ValueError("Continuation request exceeds the 256 KB limit")
@@ -380,6 +380,17 @@ async def promptstudio_video_continuation_prepare(request):
             timing["context_frames"],
             extension_document=data.get("extension_document"),
         )
+        if source_info["duration"] + 1 / FPS < timing["context_seconds"]:
+            raise ValueError("The source video is shorter than the 39-frame Soft AV context")
+        if abs(float(source_info["fps"]) - FPS) > 0.01:
+            raise ValueError(f"Continue video requires a {FPS:g} fps CFR source")
+        if (
+            int(source_info["width"]) != int(document["width"])
+            or int(source_info["height"]) != int(document["height"])
+        ):
+            raise ValueError(
+                "The source video dimensions do not match the saved H3 generation canvas"
+            )
         response = _document_response(document, include_prompt=True)
         # The Director/sampler renders the context-prefixed sample duration.
         # Video Studio presents and accounts for only the newly generated tail.
@@ -388,10 +399,16 @@ async def promptstudio_video_continuation_prepare(request):
         response["frame_count"] = timing["delivered_frames"]
         response["effective_duration"] = timing["delivered_duration"]
         response["continuation"] = {
-            "engine": "native_h3_add_guide",
+            "engine": "native_h3_soft_av_39",
             "context_frames": CONTINUATION_CONTEXT_FRAMES,
             "context_seconds": CONTINUATION_CONTEXT_SECONDS,
             "trim_frames": CONTINUATION_CONTEXT_FRAMES,
+            "video_latent_steps": 12,
+            "audio_latent_steps": 65,
+            "audio_feather_steps": 8,
+            "visual_assembly": "full_overlap_linear_blend",
+            "audio_assembly": "incoming_overlap_ownership",
+            "context_format": "promptstudio_h3_av_tail_v3",
             "source_video": annotated_output_path(source),
             "source_duration": source_info["duration"],
             "source_has_audio": source_info["has_audio"],

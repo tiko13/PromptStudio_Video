@@ -190,7 +190,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         variants = self.source[variants_start:variants_end]
 
         self.assertIn('progress.phase === "intent_classification"', progress)
-        self.assertIn("Classifying this turn as a concrete edit or discussion", progress)
+        self.assertIn("Classifying request", progress)
         self.assertIn("intent_route", variants)
         self.assertIn("intent_warning", variants)
 

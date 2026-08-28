@@ -42,7 +42,7 @@ const DIRECTOR_IMAGE_USAGES = Object.freeze([
   { value: "camera", label: "Camera / composition reference" },
   { value: "storyboard", label: "Storyboard reference" },
 ]);
-const CONTINUATION_CONTEXT_FRAMES = 22;
+const CONTINUATION_CONTEXT_FRAMES = 39;
 const STUDIO_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const VIDEO_ICON_URL = new URL("../prompt-studio-video-icon.svg", import.meta.url).href;
 
@@ -1394,7 +1394,7 @@ function directorJobStatusText(job) {
   if (job.status === "queued") return "Director request is queued…";
   const progress = job.director_progress || {};
   if (progress.phase === "intent_classification") {
-    return "Classifying this turn as a concrete edit or discussion…";
+    return "Classifying request…";
   }
   if (progress.phase === "proposal_correction") {
     const attempt = Math.max(1, Number(progress.attempt) || 1);
@@ -3274,6 +3274,31 @@ function continuationLineageOutputs(generation) {
   return [...lineage, current];
 }
 
+function continuationAssemblyLineageOutputs(generation) {
+  const currentPublic = continuationSourceOutput(generation);
+  if (!currentPublic) throw new Error("The selected generation has no saved video output to assemble.");
+  if (generation?.kind !== "extension" && !generation?.parent_generation_id) {
+    return [{ ...currentPublic, overlap_frames: 0 }];
+  }
+  const savedSources = generation?.continuation?.source_assembly_segments;
+  const fallbackSources = generation?.continuation?.source_segments;
+  const sourceValues = Array.isArray(savedSources) && savedSources.length
+    ? savedSources
+    : (fallbackSources || []).map(value => ({ ...value, overlap_frames: 0 }));
+  const lineage = sourceValues.map(value => {
+    const output = outputDescriptor(value);
+    return output ? { ...output, overlap_frames: Number(value?.overlap_frames || 0) } : null;
+  });
+  if (lineage.some(output => !output)) {
+    throw new Error("An assembly source in this continuation lineage is no longer available.");
+  }
+  const overlapOutput = outputDescriptor(generation?.assembly_outputs?.[0]);
+  return [...lineage, {
+    ...(overlapOutput || currentPublic),
+    overlap_frames: overlapOutput ? Number(generation?.continuation?.context_frames || CONTINUATION_CONTEXT_FRAMES) : 0,
+  }];
+}
+
 function workflowSupportsMotionContext(snapshot, directorNodeId) {
   const inputs = snapshot?.output?.[directorNodeId]?.inputs || {};
   return Boolean(inputs.fl2va_model && inputs.video_vae && inputs.audio_vae);
@@ -3308,7 +3333,7 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
     if (isExtension) {
       throw new Error("Video continuation requires connected MiniMax H3 FL2VA, video VAE, and audio VAE inputs.");
     }
-    return "";
+    return { contextPath: "", assemblyResultNodeId: "" };
   }
 
   const samplerEntry = Object.entries(output).find(([, node]) => (
@@ -3320,7 +3345,7 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
     if (isExtension) {
       throw new Error("The workflow must connect the Director latent directly to SamplerCustomAdvanced.");
     }
-    return "";
+    return { contextPath: "", assemblyResultNodeId: "" };
   }
   const [samplerId, sampler] = samplerEntry;
   let nextId = Number(nextPromptNodeId(output));
@@ -3340,7 +3365,7 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
     class_type: "PSV_H3SaveContext",
     _meta: { title: "Prompt Studio Save H3 Context" },
   };
-  if (!isExtension) return contextPath;
+  if (!isExtension) return { contextPath, assemblyResultNodeId: "" };
 
   const [, guider] = linkedPromptNode(output, sampler.inputs?.guider, "sampler guider");
   if (!Array.isArray(guider.inputs?.conditioning) || String(guider.inputs.conditioning[0]) !== directorId) {
@@ -3363,8 +3388,16 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
     && String(node.inputs?.audio?.[0]) === audioDecoderId
   ));
   if (!createVideoEntry) throw new Error("The workflow must combine the decoded H3 video and audio in CreateVideo.");
-  const [, createVideo] = createVideoEntry;
+  const [createVideoId, createVideo] = createVideoEntry;
+  const saveVideoId = (workflow.result_node_ids || []).map(String).find(id => (
+    output[id]?.class_type === "SaveVideo"
+  ));
+  const saveVideo = saveVideoId ? output[saveVideoId] : null;
+  if (!saveVideo || !Array.isArray(saveVideo.inputs?.video) || String(saveVideo.inputs.video[0]) !== createVideoId) {
+    throw new Error("The workflow must save its native CreateVideo output directly.");
+  }
 
+  let assemblyResultNodeId = "";
   if (isExtension) {
     const continuation = metadata.continuation || {};
     const contextId = allocate();
@@ -3397,13 +3430,34 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
     };
     createVideo.inputs.images = [trimId, 0];
     createVideo.inputs.audio = [trimId, 1];
+    const overlapCreateId = allocate();
+    output[overlapCreateId] = {
+      ...clone(createVideo),
+      inputs: {
+        ...clone(createVideo.inputs),
+        images: [trimId, 2],
+        audio: [trimId, 3],
+      },
+      _meta: { title: "Prompt Studio Soft AV Assembly Video" },
+    };
+    assemblyResultNodeId = allocate();
+    const originalPrefix = String(saveVideo.inputs.filename_prefix || "video/PromptStudio_Video");
+    output[assemblyResultNodeId] = {
+      ...clone(saveVideo),
+      inputs: {
+        ...clone(saveVideo.inputs),
+        video: [overlapCreateId, 0],
+        filename_prefix: `${originalPrefix}_soft_av_overlap`,
+      },
+      _meta: { title: "Prompt Studio Save Soft AV Assembly Overlap" },
+    };
     for (const node of Object.values(output)) {
       if (node?.class_type === "SpectrumApplyMiniMaxH3" && "enabled" in (node.inputs || {})) {
         node.inputs.enabled = false;
       }
     }
   }
-  return contextPath;
+  return { contextPath, assemblyResultNodeId };
 }
 
 function collectHistoryOutputs(historyItem, resultNodeIds = [], resultFields = []) {
@@ -3608,20 +3662,23 @@ async function promptWorkerStopped() {
   return state.promptWorkerHealthRequest;
 }
 
-async function assembleContinuation(record, segmentOutputs) {
+async function assembleContinuation(record, segmentOutputs, assemblyOutputs) {
   const { project, generation } = record;
   const segment = outputDescriptor(segmentOutputs?.[0]);
-  const sources = generation.continuation?.source_segments || [];
-  if (!segment || !sources.length) throw new Error("Continuation assembly is missing its source segments.");
+  const assemblySegment = outputDescriptor(assemblyOutputs?.[0]);
+  const sources = generation.continuation?.source_assembly_segments || [];
+  if (!segment || !assemblySegment || !sources.length) {
+    throw new Error("Continuation assembly is missing its public segment or private Soft AV overlap.");
+  }
   state.generationProgress.set(String(generation.prompt_id), { phase: "assembling" });
-  updateGeneration(generation.prompt_id, { segment_outputs: clone(segmentOutputs) });
+  updateGeneration(generation.prompt_id, { segment_outputs: clone(segmentOutputs), assembly_outputs: clone(assemblyOutputs) });
   const response = await api.fetchApi(CONTINUATION_ASSEMBLE_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       project_id: project.id,
       generation_id: generation.id,
-      sources: [...sources, segment],
+      sources: [...sources, { ...assemblySegment, overlap_frames: CONTINUATION_CONTEXT_FRAMES }],
     }),
   });
   const data = await response.json().catch(() => ({}));
@@ -3630,6 +3687,7 @@ async function assembleContinuation(record, segmentOutputs) {
     status: "complete",
     outputs: [data.output],
     segment_outputs: clone(segmentOutputs),
+    assembly_outputs: clone(assemblyOutputs),
     error: "",
   });
 }
@@ -3689,13 +3747,19 @@ function pollGeneration(promptId) {
           }
           if (item.status?.completed) {
             if (outputs.length && record.generation.kind === "extension") {
+              const assemblyOutputs = collectHistoryOutputs(
+                item,
+                [record.generation.assembly_result_node_id],
+                ["videos", "gifs", "images"],
+              );
               try {
-                await assembleContinuation(record, outputs);
+                await assembleContinuation(record, outputs, assemblyOutputs);
               } catch (error) {
                 updateGeneration(id, {
                   status: "error",
                   outputs,
                   segment_outputs: outputs,
+                  assembly_outputs: assemblyOutputs,
                   error: `The extension rendered, but cumulative assembly failed: ${error.message || error}`,
                 });
               }
@@ -3741,9 +3805,10 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
   const generationId = existingGeneration?.id || makeId("generation");
   const savedSnapshot = clone(snapshot);
   const queuedSnapshot = clone(snapshot);
-  const contextLatentPath = instrumentGenerationSnapshot(
+  const instrumentation = instrumentGenerationSnapshot(
     queuedSnapshot, workflow, project, generationId, metadata,
   );
+  const { contextPath: contextLatentPath, assemblyResultNodeId } = instrumentation;
   const queued = await api.queuePrompt(-1, queuedSnapshot);
   const promptId = queued?.prompt_id;
   if (!promptId) throw new Error("ComfyUI did not return a prompt ID.");
@@ -3774,10 +3839,12 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
     workflow_name: workflow.name,
     workflow_snapshot: savedSnapshot,
     context_latent_path: contextLatentPath,
+    assembly_result_node_id: assemblyResultNodeId,
     result_node_ids: clone(workflow.result_node_ids),
     result_fields: clone(workflow.result_fields),
     outputs: [],
     segment_outputs: [],
+    assembly_outputs: [],
     kind: metadata.kind || "base",
     parent_generation_id: metadata.parent_generation_id || "",
     root_generation_id: metadata.root_generation_id || generationId,
@@ -3950,8 +4017,13 @@ function continuationDirectorContext(generation) {
   const shot = clone(sourceDocument.shots?.at(-1) || {});
   const clean = value => String(value || "").replace(/<\s*(?:Picture|Video|Audio|Subject)\s+\d+\s*>/gi, "the established source");
   return {
-    type: "native_h3_structured_extension",
+    type: "native_h3_soft_av_extension",
+    engine: "native_h3_soft_av_39",
+    transition_policy: "soft_av",
     context_frames: CONTINUATION_CONTEXT_FRAMES,
+    video_latent_steps: 12,
+    audio_latent_steps: 65,
+    audio_feather_steps: 8,
     source_effective_duration: Number(generation?.effective_duration || 0),
     source_final_shot: {
       composition: clean(shot.composition),
@@ -4023,6 +4095,7 @@ function createStructuredExtensionProject(parentProject, generation, brief, dura
   const source = continuationSourceOutput(generation);
   if (!source) throw new Error("The selected generation has no saved video output to continue.");
   const lineage = continuationLineageOutputs(generation);
+  const assemblyLineage = continuationAssemblyLineageOutputs(generation);
   const { workflow, snapshot } = savedGenerationWorkflow(generation);
   const now = Date.now();
   const project = {
@@ -4033,13 +4106,14 @@ function createStructuredExtensionProject(parentProject, generation, brief, dura
     workflow_id: workflow.id,
     generations: [],
     extension_source: {
-      engine: "native_h3_add_guide",
+      engine: "native_h3_soft_av_39",
       parent_project_id: parentProject.id,
       parent_generation_id: generation.id,
       root_generation_id: generation.root_generation_id || generation.id,
       depth: Number(generation.depth || 0) + 1,
       continuation_base_duration: Number(generation.total_effective_duration || generation.effective_duration || 0),
       source: clone(source), source_segments: clone(lineage), source_document: clone(generation.document),
+      source_assembly_segments: clone(assemblyLineage),
       parent_context_latent_path: generation.context_latent_path
         || continuationLatentPath(parentProject.id, generation.id),
       workflow_id: workflow.id, workflow_name: workflow.name,
@@ -4077,7 +4151,7 @@ async function generateStructuredExtension(project) {
     workflow_id: workflow.id, workflow_name: workflow.name,
     workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
     result_node_ids: clone(workflow.result_node_ids), result_fields: clone(workflow.result_fields),
-    document: clone(project.document), outputs: [], segment_outputs: [],
+    document: clone(project.document), outputs: [], segment_outputs: [], assembly_outputs: [],
     kind: "extension", preparation_kind: "continuation", parent_generation_id: source.parent_generation_id,
     root_generation_id: source.root_generation_id, depth: Number(source.depth || 1),
     continuation_base_duration: Number(source.continuation_base_duration || 0),
@@ -4088,6 +4162,7 @@ async function generateStructuredExtension(project) {
       duration_seconds: durationSeconds, context_frames: CONTINUATION_CONTEXT_FRAMES,
       source_segments: clone(source.source_segments || []),
       parent_context_latent_path: source.parent_context_latent_path || "",
+      source_assembly_segments: clone(source.source_assembly_segments || source.source_segments || []),
     },
     created_at: Date.now(), updated_at: Date.now(),
   };
@@ -4127,6 +4202,7 @@ async function generateStructuredExtension(project) {
         ...data.continuation, source_generation_id: source.parent_generation_id,
         source_segments: clone(source.source_segments || []),
         parent_context_latent_path: source.parent_context_latent_path || "",
+        source_assembly_segments: clone(source.source_assembly_segments || source.source_segments || []),
         brief: project.brief, structured: true,
       },
     }, operation);
@@ -4149,12 +4225,13 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
   if (!source) throw new Error("The selected generation has no saved video output to continue.");
   const lineage = continuationLineageOutputs(parent);
   const { workflow, snapshot } = savedGenerationWorkflow(parent);
+  const assemblyLineage = continuationAssemblyLineageOutputs(parent);
   const operation = {
     id: makeId("generation"), prompt_id: "", status: "compiling", error: "",
     workflow_id: workflow.id, workflow_name: workflow.name,
     workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
     result_node_ids: clone(workflow.result_node_ids || []), result_fields: clone(workflow.result_fields || []),
-    document: clone(parent.document), outputs: [], segment_outputs: [],
+    document: clone(parent.document), outputs: [], segment_outputs: [], assembly_outputs: [],
     kind: "extension", preparation_kind: "continuation", parent_generation_id: parent.id,
     root_generation_id: parent.root_generation_id || parent.id,
     depth: Number(parent.depth || 0) + 1,
@@ -4165,6 +4242,7 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
       context_frames: CONTINUATION_CONTEXT_FRAMES, source_segments: clone(lineage),
       parent_context_latent_path: parent.context_latent_path
         || continuationLatentPath(project.id, parent.id),
+      source_assembly_segments: clone(assemblyLineage),
     },
     created_at: Date.now(), updated_at: Date.now(),
   };
@@ -4210,6 +4288,7 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
         source_segments: lineage,
         parent_context_latent_path: parent.context_latent_path
           || continuationLatentPath(project.id, parent.id),
+        source_assembly_segments: assemblyLineage,
         brief,
       },
     }, operation);
@@ -4247,11 +4326,17 @@ function extensionRegenerationRequest(project, generation) {
   if (structured && !extensionDocument) {
     throw new Error("This structured extension no longer has its authored shot document.");
   }
+  const sourceAssemblySegments = clone(
+    saved.source_assembly_segments || generation?.continuation?.source_assembly_segments
+      || extensionSource?.source_assembly_segments
+      || sourceSegments.map(value => ({ ...value, overlap_frames: 0 })),
+  );
   return {
     structured,
     source,
     source_document: sourceDocument,
     source_segments: sourceSegments,
+    source_assembly_segments: sourceAssemblySegments,
     extension_document: extensionDocument,
     brief: structured
       ? String(project?.brief || extensionDocument?.main_description || "").trim()
@@ -4275,7 +4360,7 @@ async function regenerateExtension(project, generation, request, dialog, submit)
     workflow_id: workflow.id, workflow_name: workflow.name,
     workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
     result_node_ids: clone(workflow.result_node_ids || []), result_fields: clone(workflow.result_fields || []),
-    document: clone(request.extension_document || request.source_document), outputs: [], segment_outputs: [],
+    document: clone(request.extension_document || request.source_document), outputs: [], segment_outputs: [], assembly_outputs: [],
     kind: "extension", preparation_kind: "continuation",
     parent_generation_id: generation.parent_generation_id,
     root_generation_id: generation.root_generation_id,
@@ -4336,6 +4421,7 @@ async function regenerateExtension(project, generation, request, dialog, submit)
         parent_context_latent_path: request.parent_context_latent_path,
         brief: request.brief,
         structured: request.structured,
+        source_assembly_segments: clone(request.source_assembly_segments),
       },
     }, operation);
     dialog.close();
@@ -4445,7 +4531,7 @@ function showContinueVideo(generation) {
   body.append(
     field("What happens next?", briefInput, "The continuation starts from the selected render's actual ending. Describe new action rather than repeating the previous video."),
     field("Added duration (seconds)", durationInput, "MiniMax snaps the result to its native frame grid."),
-    el("div", "psvstudio-continuation-note", "Quick Continue uses this text directly. Build full extension creates a saved extension project with its own shots, structured dialogue, camera, and generated sounds. Both use Native H3 Add Guide with 22 carried video frames / 37 audio steps."),
+    el("div", "psvstudio-continuation-note", "Quick Continue uses this text directly. Build full extension creates a saved extension project with its own shots, structured dialogue, camera, and generated sounds. Both use native Soft AV: 39 exact carried video frames / 65 audio steps with an eight-tick half-cosine release."),
   );
   const footer = el("footer", "psvstudio-continuation-actions");
   const cancel = button("Cancel", () => dialog.close());
@@ -7226,6 +7312,7 @@ function resumeVideoPreparations() {
                 parent_context_latent_path: request.parent_context_latent_path || "",
                 brief: request.brief,
                 structured: Boolean(request.extension_document),
+                source_assembly_segments: clone(request.source_assembly_segments || request.source_segments || []),
               },
             }, operation);
             return;

@@ -1,9 +1,9 @@
 """Prompt Studio-owned MiniMax H3 audiovisual continuation primitives.
 
-Current ComfyUI owns arbitrary-position MiniMax H3 guides. Video Studio saves
-an exact compact AV latent tail, places the intact video and audio runs at the
-head of the child timeline through that native contract, and trims the repeated
-head after decode so the stored segment begins immediately after its parent.
+Current ComfyUI owns nested video/audio denoise masks for MiniMax H3. Video
+Studio saves an exact compact AV latent tail, copies its 39-frame / 65-audio-step
+run into the child target, protects the picture exactly, and releases only the
+last eight audio ticks with the maintained Soft AV half-cosine recipe.
 """
 
 from __future__ import annotations
@@ -23,8 +23,10 @@ FPS = 24.0
 AUDIO_LATENT_HZ = 40.0
 FRAME_RESCALE = 5.0 / 3.0
 FRAME_SPANS = (1, 4, 4, 4, 4)
-DEFAULT_CONTEXT_FRAMES = 22
+DEFAULT_CONTEXT_FRAMES = 39
 CONTEXT_FRAME_OPTIONS = (5, 22, 39, 56)
+SOFT_AV_AUDIO_FEATHER_STEPS = 8
+SOFT_AV_FORMAT = "promptstudio_h3_av_tail_v3"
 
 _LOG = logging.getLogger("promptstudio_video.motion_context")
 
@@ -126,9 +128,11 @@ def _output_path(relative_path, must_exist=False):
     return path
 
 
-def native_guides_available():
-    """Return whether ComfyUI owns arbitrary-position MiniMax H3 guides."""
+def native_masks_available():
+    """Return whether ComfyUI owns MiniMax H3 nested fractional masks."""
     try:
+        import comfy.model_base as model_base
+        import comfy.nested_tensor as nested_tensor
         import comfy.ldm.minimax.model as minimax_model
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
 
@@ -139,15 +143,28 @@ def native_guides_available():
         MiniMaxH3AddGuide is not None
         and "keyframes" in parameters
         and "frame_count" not in parameters
+        and getattr(nested_tensor, "NestedTensor", None) is not None
+        and callable(getattr(getattr(model_base, "MiniMaxH3", None), "_denoise_mask_values", None))
+        and callable(getattr(getattr(model_base, "MiniMaxH3", None), "scale_latent_inpaint", None))
     )
 
 
-def require_native_guides():
-    if not native_guides_available():
+def native_guides_available():
+    """Compatibility name retained for routes and older focused tests."""
+    return native_masks_available()
+
+
+def require_native_masks():
+    if not native_masks_available():
         raise RuntimeError(
-            "Prompt Studio continuation requires current ComfyUI native MiniMax H3 Add Guide support. "
+            "Prompt Studio Soft AV continuation requires current ComfyUI native MiniMax H3 mask support. "
             "Update ComfyUI master and restart it before continuing a video."
         )
+
+
+def require_native_guides():
+    """Compatibility alias for persisted workflows created before Soft AV."""
+    return require_native_masks()
 
 
 def av_clock_metadata(latent):
@@ -196,6 +213,81 @@ def _apply_native_guides(conditioning, guides, context_frames):
         metadata["minimax_keyframes"] = retained + guides
         output.append([embedding, metadata])
     return output
+
+
+def _drop_prefix_guides(conditioning, context_frames):
+    """Remove native guides that conflict with the protected target prefix."""
+    output = []
+    for embedding, extra in conditioning:
+        metadata = extra.copy()
+        retained = []
+        for guide in metadata.get("minimax_keyframes") or []:
+            position = float(guide.get("resolved_frame_index", guide.get("frame_index", 0)))
+            if not 0 <= position < int(context_frames):
+                retained.append(guide)
+        if "minimax_keyframes" in metadata:
+            metadata["minimax_keyframes"] = retained
+        output.append([embedding, metadata])
+    return output
+
+
+def _existing_mask_streams(latent, video, audio):
+    mask = latent.get("noise_mask") if isinstance(latent, dict) else None
+    if mask is None:
+        return (
+            torch.ones(
+                (1, 1, int(video.shape[2]), int(video.shape[3]), int(video.shape[4])),
+                device=video.device,
+                dtype=torch.float32,
+            ),
+            torch.ones(
+                (1, 1, int(audio.shape[2]), int(audio.shape[3])),
+                device=audio.device,
+                dtype=torch.float32,
+            ),
+        )
+    if hasattr(mask, "unbind"):
+        parts = list(mask.unbind())
+    elif isinstance(mask, (list, tuple)):
+        parts = list(mask)
+    else:
+        raise ValueError("Existing H3 noise mask is not a nested video/audio mask")
+    if len(parts) < 2:
+        raise ValueError("Existing H3 noise mask is missing its audio stream")
+    video_shape = (1, 1, int(video.shape[2]), int(video.shape[3]), int(video.shape[4]))
+    audio_shape = (1, 1, int(audio.shape[2]), int(audio.shape[3]))
+    try:
+        return (
+            torch.broadcast_to(parts[0], video_shape).clone().float(),
+            torch.broadcast_to(parts[1], audio_shape).clone().float(),
+        )
+    except RuntimeError as exc:
+        raise ValueError("Existing H3 video/audio masks do not match the continuation target") from exc
+
+
+def soft_av_masks(latent, video_steps, audio_steps):
+    """Compose the maintained exact-picture, eight-tick audio-release masks."""
+    video, audio = _streams(latent)
+    video_mask, audio_mask = _existing_mask_streams(latent, video, audio)
+    video_steps = int(video_steps)
+    audio_steps = int(audio_steps)
+    video_mask[:, :, :video_steps] = 0.0
+    feather = min(SOFT_AV_AUDIO_FEATHER_STEPS, audio_steps)
+    hard_steps = audio_steps - feather
+    audio_mask[..., :hard_steps] = 0.0
+    if feather:
+        indices = torch.arange(
+            1,
+            feather + 1,
+            device=audio_mask.device,
+            dtype=audio_mask.dtype,
+        )
+        ramp = 0.5 - 0.5 * torch.cos(torch.pi * indices / float(feather))
+        audio_mask[..., hard_steps:audio_steps] = torch.minimum(
+            audio_mask[..., hard_steps:audio_steps],
+            ramp.view(1, 1, 1, feather),
+        )
+    return video_mask, audio_mask
 
 
 def _load_saved_tail(relative_path):
@@ -254,7 +346,18 @@ def _fallback_tail(video_path, video_vae, audio_vae, target_video, frame_count):
         waveform = waveform[..., -samples:]
         if waveform.shape[-1] < samples:
             waveform = torch.nn.functional.pad(waveform, (samples - waveform.shape[-1], 0))
+    if waveform.shape[1] == 1:
+        waveform = waveform.repeat(1, 2, 1)
+    elif waveform.shape[1] > 2:
+        waveform = waveform[:, :2]
     audio = audio_vae.encode(waveform[:1].movedim(1, -1))
+    wanted_audio_steps = round(frame_count / FPS * AUDIO_LATENT_HZ)
+    if int(audio.shape[-1]) < wanted_audio_steps:
+        raise ValueError(
+            f"The fallback audio encoded to {audio.shape[-1]} H3 steps; "
+            f"the {frame_count}-frame Soft AV prefix requires {wanted_audio_steps}"
+        )
+    audio = audio[:1, ..., -wanted_audio_steps:].contiguous()
     context = {"samples": [video, audio]}
     context["metadata"] = av_clock_metadata(context)
     return context
@@ -284,15 +387,23 @@ class PromptStudioH3MotionContext:
         self, conditioning, latent, video_vae, audio_vae,
         context_latent_path, context_video, context_frames=DEFAULT_CONTEXT_FRAMES,
     ):
-        require_native_guides()
+        require_native_masks()
         context_frames = int(context_frames)
         target_video, target_audio = _streams(latent)
+        if int(target_video.shape[0]) != 1 or int(target_audio.shape[0]) != 1:
+            raise ValueError("Prompt Studio Soft AV continuation supports H3 batch size 1")
         steps = steps_for_frames(context_frames)
-        if context_frames not in CONTEXT_FRAME_OPTIONS or steps is None:
-            raise ValueError("H3 context must use 5, 22, 39, or 56 frames")
+        if context_frames != DEFAULT_CONTEXT_FRAMES or steps is None:
+            raise ValueError("Prompt Studio Soft AV continuation requires exactly 39 context frames")
         target_frames = pixel_frames_for_steps(target_video.shape[2])
         if context_frames >= target_frames:
             raise ValueError("Continuation context must be shorter than the sampled extension")
+        expected_target_audio = round(target_frames / FPS * AUDIO_LATENT_HZ)
+        if int(target_audio.shape[-1]) != expected_target_audio:
+            raise ValueError(
+                f"H3 target has {target_audio.shape[-1]} audio steps for {target_frames} frames; "
+                f"Soft AV requires the exact {expected_target_audio}-step shared clock"
+            )
 
         context = None
         source = ""
@@ -300,12 +411,15 @@ class PromptStudioH3MotionContext:
             context = _load_saved_tail(context_latent_path)
             source = "saved latent"
             saved_video, saved_audio = _streams(context)
-            if (context.get("metadata") or {}).get("format") != "promptstudio_h3_av_tail_v2":
+            if (context.get("metadata") or {}).get("format") not in {
+                "promptstudio_h3_av_tail_v2",
+                SOFT_AV_FORMAT,
+            }:
                 raise ValueError("Saved context predates exact H3 audio-clock metadata")
             if saved_video.shape[2] < steps or saved_audio.shape[-1] < round(
                 context_frames / FPS * AUDIO_LATENT_HZ
             ):
-                raise ValueError("Saved context predates the current continuation window")
+                raise ValueError("Saved context does not contain the 39-frame Soft AV window")
         except (FileNotFoundError, ValueError) as saved_error:
             if not context_video:
                 raise ValueError(
@@ -320,38 +434,43 @@ class PromptStudioH3MotionContext:
             raise ValueError("Parent and extension H3 latents use different channels or resolution")
         if source_audio.shape[1:3] != target_audio.shape[1:3]:
             raise ValueError("Parent and extension H3 audio latents are incompatible")
+        if int(source_video.shape[0]) != 1 or int(source_audio.shape[0]) != 1:
+            raise ValueError("Parent continuation context must use H3 batch size 1")
         if source_video.shape[2] < steps:
             raise ValueError("Parent context does not contain a complete H3 continuation window")
         start = int(source_video.shape[2]) - steps
         if start % len(FRAME_SPANS):
             raise ValueError("Parent context is off the native H3 temporal phase grid")
-        video_tail = source_video[:1, :, start:].clone()
+        video_tail = source_video[:1, :, start:].to(
+            device=target_video.device, dtype=target_video.dtype
+        )
         audio_steps = max(1, round(context_frames / FPS * AUDIO_LATENT_HZ))
         if source_audio.shape[-1] < audio_steps:
             raise ValueError("Parent context does not contain the matching H3 audio window")
-        audio_tail = source_audio[:1, ..., -audio_steps:].clone()
-        raw_overhang = (context.get("metadata") or {}).get("audio_overhang_steps", 0)
-        try:
-            overhang = float(raw_overhang)
-        except (TypeError, ValueError):
-            overhang = 0.0
-        if not -0.500001 < overhang < 0.500001:
-            raise ValueError("Saved continuation audio-clock metadata is invalid")
-        audio_start_offset = _audio_start_offset_steps(
-            context_frames, audio_steps, overhang
+        audio_tail = source_audio[:1, ..., -audio_steps:].to(
+            device=target_audio.device, dtype=target_audio.dtype
         )
-        guides = _continuation_guides(video_tail, audio_tail, audio_start_offset)
-        output = _apply_native_guides(conditioning, guides, context_frames)
+        out_video = target_video.clone()
+        out_audio = target_audio.clone()
+        out_video[:, :, :steps] = video_tail
+        out_audio[..., :audio_steps] = audio_tail
+        out_latent = latent.copy()
+        import comfy.nested_tensor
+
+        out_latent["samples"] = comfy.nested_tensor.NestedTensor((out_video, out_audio))
+        video_mask, audio_mask = soft_av_masks(out_latent, steps, audio_steps)
+        out_latent["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+        output = _drop_prefix_guides(conditioning, context_frames)
         _LOG.info(
-            "Prompt Studio native continuation guides: %d frames, %d video steps, "
-            "%d audio steps, audio start offset %.3f from %s",
+            "Prompt Studio Soft AV continuation: exact %d-frame picture prefix, "
+            "%d video steps / %d audio steps, final %d audio ticks half-cosine released from %s",
             context_frames,
             steps,
             audio_steps,
-            audio_start_offset,
+            SOFT_AV_AUDIO_FEATHER_STEPS,
             source,
         )
-        return output, latent, context_frames
+        return output, out_latent, context_frames
 
 
 class PromptStudioH3SaveContext:
@@ -387,7 +506,11 @@ class PromptStudioH3SaveContext:
                 {"video": video, "audio": audio},
                 temporary,
                 metadata={
-                    "format": "promptstudio_h3_av_tail_v2",
+                    "format": SOFT_AV_FORMAT,
+                    "transition_recipe": "soft_av_39_exact_video_half_cosine_audio_8",
+                    "video_shape": "x".join(str(int(value)) for value in video.shape),
+                    "audio_shape": "x".join(str(int(value)) for value in audio.shape),
+                    "dtype": str(video.dtype),
                     "context_frames": str(int(context_frames)),
                     "source_video_frames": str(clock["source_video_frames"]),
                     "source_audio_steps": str(clock["source_audio_steps"]),
@@ -413,8 +536,8 @@ class PromptStudioH3TrimContext:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio", "assembly_images", "assembly_audio")
     FUNCTION = "trim"
     CATEGORY = "Prompt Studio/Video"
 
@@ -426,16 +549,30 @@ class PromptStudioH3TrimContext:
         output_images = images[count:]
         waveform = audio["waveform"]
         sample_rate = int(audio["sample_rate"])
+        full_wanted = round(total / float(fps) * sample_rate)
+        if waveform.shape[-1] > full_wanted:
+            assembly_waveform = waveform[..., :full_wanted]
+        elif waveform.shape[-1] < full_wanted:
+            assembly_waveform = torch.nn.functional.pad(
+                waveform, (0, full_wanted - waveform.shape[-1])
+            )
+        else:
+            assembly_waveform = waveform
         cut = round(count / float(fps) * sample_rate)
-        if cut >= waveform.shape[-1]:
+        if cut >= assembly_waveform.shape[-1]:
             raise ValueError("Continuation audio is shorter than its repeated context head")
-        waveform = waveform[..., cut:]
+        waveform = assembly_waveform[..., cut:]
         wanted = round(len(output_images) / float(fps) * sample_rate)
         if waveform.shape[-1] > wanted:
             waveform = waveform[..., :wanted]
         elif waveform.shape[-1] < wanted:
             waveform = torch.nn.functional.pad(waveform, (0, wanted - waveform.shape[-1]))
-        return output_images, {"waveform": waveform, "sample_rate": sample_rate}
+        return (
+            output_images,
+            {"waveform": waveform, "sample_rate": sample_rate},
+            images,
+            {"waveform": assembly_waveform, "sample_rate": sample_rate},
+        )
 
 
 NODE_CLASS_MAPPINGS = {

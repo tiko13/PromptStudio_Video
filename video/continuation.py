@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 import json
 import math
 import os
@@ -13,7 +14,7 @@ from fractions import Fraction
 from .contracts import FPS, PromptDocumentError, normalize_document
 
 
-CONTINUATION_CONTEXT_FRAMES = 22
+CONTINUATION_CONTEXT_FRAMES = 39
 CONTINUATION_CONTEXT_SECONDS = CONTINUATION_CONTEXT_FRAMES / FPS
 # Kept as aliases for persisted metadata written by the first prototype.
 CONTINUATION_TAIL_FRAMES = CONTINUATION_CONTEXT_FRAMES
@@ -140,9 +141,11 @@ def _continuation_opening(parent):
     previous = (parent.get("shots") or [{}])[-1]
     incoming_action = _final_action(previous)
     return (
-        "The carried opening frames overlap the exact ending of the preceding clip. Continue every "
-        "visible subject movement, object movement, camera movement, and active sound through this "
-        "overlap without a pause, reset, reversal, repeated onset, or cut. Preserve the incoming "
+        "The first 39 picture frames and their 65-step audio run are the protected exact ending "
+        "of the preceding clip, not a new action or a replay. Continue every visible subject "
+        "movement, object movement, camera movement, and active sound from the exact boundary "
+        "phase into the newly generated future without a pause, reset, reversal, repeated onset, "
+        "held transition pose, or cut. Preserve the incoming "
         "pose, direction, momentum, composition, spatial relationships, lighting, and exposure. "
         f"Carry forward the currently visible phase of this unfinished action without replaying its beginning: "
         f"{incoming_action}"
@@ -378,8 +381,275 @@ def _media_duration(container, streams):
     raise ValueError("A continuation segment has no usable duration metadata")
 
 
-def concatenate_media_files(source_paths, target_path, metadata=None):
-    """Losslessly remux compatible MP4 segments onto one cumulative timeline."""
+
+
+def _normalize_overlap_frames(overlap_frames, source_count):
+    if overlap_frames is None:
+        return [0] * int(source_count)
+    values = [int(value or 0) for value in overlap_frames]
+    if len(values) != int(source_count):
+        raise ValueError("Continuation overlap metadata does not match its source count")
+    if values and values[0] != 0:
+        raise ValueError("The first continuation source cannot have an incoming overlap")
+    for value in values[1:]:
+        if value not in {0, CONTINUATION_CONTEXT_FRAMES}:
+            raise ValueError(
+                f"Continuation overlap must be 0 or {CONTINUATION_CONTEXT_FRAMES} frames"
+            )
+    return values
+
+
+def _probe_blend_streams(paths, overlaps):
+    import av
+
+    infos = []
+    canvas = None
+    sample_rate = None
+    audio_layout = None
+    for index, path in enumerate(paths):
+        with av.open(path, mode="r") as container:
+            if not container.streams.video:
+                raise ValueError("A continuation source has no video stream")
+            stream = container.streams.video[0]
+            rate = float(stream.average_rate or 0)
+            if not rate or abs(rate - float(FPS)) > 0.01:
+                raise ValueError(f"Continuation assembly requires {FPS:g} fps CFR video")
+            geometry = (int(stream.width or 0), int(stream.height or 0))
+            if not all(geometry):
+                raise ValueError("A continuation source has invalid video dimensions")
+            if canvas is None:
+                canvas = geometry
+            elif geometry != canvas:
+                raise ValueError("Continuation sources must use matching video dimensions")
+            frame_count = int(stream.frames or 0)
+            if frame_count <= 0:
+                if stream.duration is not None and stream.time_base is not None:
+                    frame_count = round(float(stream.duration * stream.time_base) * FPS)
+                elif container.duration is not None:
+                    frame_count = round(float(container.duration / av.time_base) * FPS)
+            if frame_count <= int(overlaps[index]):
+                raise ValueError("A continuation source is not longer than its incoming overlap")
+            if container.streams.audio:
+                audio = container.streams.audio[0]
+                codec = audio.codec_context
+                current_rate = int(codec.sample_rate or audio.rate or 0)
+                current_layout = str(getattr(codec.layout, "name", "") or "")
+                if current_rate > 0 and sample_rate is None:
+                    sample_rate = current_rate
+                if current_layout and audio_layout is None:
+                    audio_layout = current_layout
+            infos.append({"frames": frame_count, "width": geometry[0], "height": geometry[1]})
+    return infos, int(sample_rate or 32000), str(audio_layout or "stereo")
+
+
+def _resampled_audio_frames(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _decode_audio_array(path, sample_rate, layout, wanted_samples):
+    import av
+    import numpy as np
+
+    channels = len(av.AudioLayout(layout).channels)
+    chunks = []
+    with av.open(path, mode="r") as container:
+        if container.streams.audio:
+            resampler = av.AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+            for frame in container.decode(audio=0):
+                for converted in _resampled_audio_frames(resampler.resample(frame)):
+                    value = converted.to_ndarray()
+                    if value.ndim == 1:
+                        value = value.reshape(1, -1)
+                    chunks.append(value.astype(np.float32, copy=False))
+            for converted in _resampled_audio_frames(resampler.resample(None)):
+                value = converted.to_ndarray()
+                if value.ndim == 1:
+                    value = value.reshape(1, -1)
+                chunks.append(value.astype(np.float32, copy=False))
+    if chunks:
+        audio = np.concatenate(chunks, axis=1)
+    else:
+        audio = np.zeros((channels, 0), dtype=np.float32)
+    if audio.shape[0] != channels:
+        raise ValueError("Continuation audio resampling produced an unexpected channel layout")
+    wanted_samples = int(wanted_samples)
+    if audio.shape[1] > wanted_samples:
+        return np.ascontiguousarray(audio[:, :wanted_samples])
+    if audio.shape[1] < wanted_samples:
+        audio = np.pad(audio, ((0, 0), (0, wanted_samples - audio.shape[1])))
+    return np.ascontiguousarray(audio)
+
+
+def _iter_crossfaded_video(paths, overlaps, infos):
+    import av
+    import numpy as np
+
+    pending = deque()
+    for index, path in enumerate(paths):
+        incoming = int(overlaps[index])
+        hold = int(overlaps[index + 1]) if index + 1 < len(paths) else 0
+        with av.open(path, mode="r") as container:
+            frames = iter(container.decode(video=0))
+            if incoming:
+                prefix = []
+                for _position in range(incoming):
+                    try:
+                        prefix.append(next(frames))
+                    except StopIteration as exc:
+                        raise ValueError("A continuation source ended inside its overlap") from exc
+                if len(pending) != incoming:
+                    raise ValueError("The preceding source does not contain the required seam window")
+                denominator = max(1, incoming - 1)
+                for position, (previous, current) in enumerate(zip(pending, prefix)):
+                    if (previous.width, previous.height) != (current.width, current.height):
+                        raise ValueError("Continuation overlap frames use different dimensions")
+                    alpha = position / denominator
+                    first = previous.to_ndarray(format="rgb24").astype(np.float32)
+                    second = current.to_ndarray(format="rgb24").astype(np.float32)
+                    blended = np.clip(
+                        np.rint(first * (1.0 - alpha) + second * alpha), 0, 255
+                    ).astype(np.uint8)
+                    yield av.VideoFrame.from_ndarray(blended, format="rgb24")
+                pending.clear()
+            for frame in frames:
+                if (int(frame.width), int(frame.height)) != (
+                    int(infos[index]["width"]),
+                    int(infos[index]["height"]),
+                ):
+                    raise ValueError("A continuation source changes dimensions mid-stream")
+                pending.append(frame)
+                if len(pending) > hold:
+                    yield pending.popleft()
+        if len(pending) != hold:
+            raise ValueError("A continuation source does not contain its outgoing seam window")
+    while pending:
+        yield pending.popleft()
+
+
+def _iter_owned_audio(paths, overlaps, infos, sample_rate, layout, wanted_total, chunk_size=1024):
+    import numpy as np
+
+    emitted = 0
+    for index, path in enumerate(paths):
+        segment_samples = round(int(infos[index]["frames"]) / FPS * sample_rate)
+        audio = _decode_audio_array(path, sample_rate, layout, segment_samples)
+        outgoing = (
+            round(int(overlaps[index + 1]) / FPS * sample_rate)
+            if index + 1 < len(paths)
+            else 0
+        )
+        if outgoing >= audio.shape[1]:
+            raise ValueError("A continuation audio stream is not longer than its seam window")
+        owned = audio[:, : audio.shape[1] - outgoing if outgoing else audio.shape[1]]
+        available = min(owned.shape[1], max(0, int(wanted_total) - emitted))
+        position = 0
+        while position < available:
+            stop = min(available, position + int(chunk_size))
+            yield np.ascontiguousarray(owned[:, position:stop])
+            emitted += stop - position
+            position = stop
+    if emitted < int(wanted_total):
+        channels = len(__import__("av").AudioLayout(layout).channels)
+        remaining = int(wanted_total) - emitted
+        while remaining:
+            count = min(int(chunk_size), remaining)
+            yield np.zeros((channels, count), dtype=np.float32)
+            remaining -= count
+
+
+def _blend_media_files(paths, target_path, overlaps, metadata=None):
+    """Encode a cumulative full-overlap video with incoming Soft AV audio ownership."""
+    import av
+
+    infos, sample_rate, layout = _probe_blend_streams(paths, overlaps)
+    total_frames = sum(int(item["frames"]) for item in infos) - sum(overlaps)
+    total_samples = round(total_frames / FPS * sample_rate)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=os.path.basename(target_path) + ".",
+        suffix=".tmp.mp4",
+        dir=os.path.dirname(target_path),
+    )
+    os.close(descriptor)
+    try:
+        with av.open(
+            temporary,
+            mode="w",
+            format="mp4",
+            options={"movflags": "use_metadata_tags+faststart"},
+        ) as output:
+            if metadata:
+                output.metadata["promptstudio_continuation"] = json.dumps(
+                    metadata, ensure_ascii=False, separators=(",", ":")
+                )
+            video_stream = output.add_stream("h264", rate=Fraction(int(FPS), 1))
+            video_stream.width = int(infos[0]["width"])
+            video_stream.height = int(infos[0]["height"])
+            video_stream.pix_fmt = "yuv420p"
+            video_stream.options = {"crf": "18", "preset": "medium"}
+            audio_stream = output.add_stream("aac", rate=sample_rate)
+            audio_stream.layout = layout
+            audio_stream.bit_rate = 192000
+
+            video_frames = iter(_iter_crossfaded_video(paths, overlaps, infos))
+            audio_chunks = iter(
+                _iter_owned_audio(
+                    paths, overlaps, infos, sample_rate, layout, total_samples
+                )
+            )
+            next_video = next(video_frames, None)
+            next_audio = next(audio_chunks, None)
+            video_index = 0
+            audio_index = 0
+            while next_video is not None or next_audio is not None:
+                video_time = video_index / FPS if next_video is not None else math.inf
+                audio_time = audio_index / sample_rate if next_audio is not None else math.inf
+                if video_time <= audio_time:
+                    frame = next_video.reformat(
+                        width=video_stream.width,
+                        height=video_stream.height,
+                        format="yuv420p",
+                    )
+                    frame.pts = video_index
+                    frame.time_base = Fraction(1, int(FPS))
+                    for packet in video_stream.encode(frame):
+                        output.mux(packet)
+                    video_index += 1
+                    next_video = next(video_frames, None)
+                else:
+                    frame = av.AudioFrame.from_ndarray(
+                        next_audio, format="fltp", layout=layout
+                    )
+                    frame.sample_rate = sample_rate
+                    frame.pts = audio_index
+                    frame.time_base = Fraction(1, sample_rate)
+                    for packet in audio_stream.encode(frame):
+                        output.mux(packet)
+                    audio_index += int(next_audio.shape[1])
+                    next_audio = next(audio_chunks, None)
+            if video_index != total_frames:
+                raise ValueError(
+                    f"Continuation assembly produced {video_index} frames; expected {total_frames}"
+                )
+            if audio_index != total_samples:
+                raise ValueError(
+                    f"Continuation assembly produced {audio_index} audio samples; expected {total_samples}"
+                )
+            for packet in video_stream.encode(None):
+                output.mux(packet)
+            for packet in audio_stream.encode(None):
+                output.mux(packet)
+        os.replace(temporary, target_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return target_path
+
+def concatenate_media_files(source_paths, target_path, metadata=None, overlap_frames=None):
+    """Assemble compatible MP4 segments, blending explicitly retained overlaps."""
     import av
 
     paths = [os.path.abspath(path) for path in source_paths]
@@ -388,8 +658,11 @@ def concatenate_media_files(source_paths, target_path, metadata=None):
     if any(not os.path.isfile(path) for path in paths):
         raise ValueError("A continuation segment no longer exists")
 
+    overlaps = _normalize_overlap_frames(overlap_frames, len(paths))
     target_path = os.path.abspath(target_path)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    if any(overlaps):
+        return _blend_media_files(paths, target_path, overlaps, metadata)
     descriptor, temporary = tempfile.mkstemp(
         prefix=os.path.basename(target_path) + ".",
         suffix=".tmp.mp4",
@@ -472,7 +745,18 @@ def assemble_generation_outputs(source_descriptors, project_id, generation_id):
         raise ValueError("Project identifier is invalid")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", str(generation_id or "")):
         raise ValueError("Generation identifier is invalid")
-    resolved = [resolve_output_path(item) for item in source_descriptors]
+    if not isinstance(source_descriptors, list):
+        raise ValueError("Continuation assembly sources must be a list")
+    resolved = []
+    overlaps = []
+    for index, item in enumerate(source_descriptors):
+        resolved.append(resolve_output_path(item))
+        try:
+            overlap = int(item.get("overlap_frames") or 0)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"Continuation source {index + 1} has invalid overlap metadata") from exc
+        overlaps.append(overlap)
+    overlaps = _normalize_overlap_frames(overlaps, len(resolved))
     import folder_paths
 
     subfolder = f"video/PromptStudio_Video/continuations/{project_id}"
@@ -485,5 +769,6 @@ def assemble_generation_outputs(source_descriptors, project_id, generation_id):
         [path for path, _descriptor in resolved],
         target,
         metadata={"project_id": project_id, "generation_id": generation_id},
+        overlap_frames=overlaps,
     )
     return {"filename": filename, "subfolder": subfolder, "type": "output"}

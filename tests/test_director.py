@@ -834,8 +834,8 @@ class DirectorTests(unittest.TestCase):
             "selected_shot_id": "shot-1",
             "messages": [{"role": "user", "content": "Make her continue through the doorway."}],
             "continuation_context": {
-                "type": "native_h3_structured_extension",
-                "context_frames": 22,
+                "type": "native_h3_soft_av_extension",
+                "context_frames": 39,
                 "source_effective_duration": 8,
                 "source_final_shot": {
                     "composition": "A tracking shot reaches the doorway.",
@@ -846,10 +846,13 @@ class DirectorTests(unittest.TestCase):
         })
 
         context = provider_context(messages)
-        self.assertEqual(context["continuation_context"]["context_frames"], 22)
+        continuation = context["continuation_context"]
+        self.assertEqual(continuation["context_frames"], 39)
+        self.assertEqual(continuation["audio_latent_steps"], 65)
+        self.assertEqual(continuation["audio_feather_steps"], 8)
         self.assertIn("already opening", context["continuation_context"]["source_final_shot"]["steps"][0]["text"])
         self.assertIn("NATIVE STRUCTURED EXTENSION", messages[0]["content"])
-        self.assertIn("without replaying its beginning", messages[0]["content"])
+        self.assertIn("without pausing, replaying the source ending", messages[0]["content"])
 
     def test_director_canonicalizes_retention_relationship_formatting(self):
         document = normalize_document(director_document())

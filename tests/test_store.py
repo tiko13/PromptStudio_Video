@@ -166,6 +166,7 @@ class StoreTests(unittest.TestCase):
                 "continuation_base_duration": 10.0,
                 "source": {"filename": "parent.mp4", "subfolder": "video", "type": "output"},
                 "source_segments": [{"filename": "parent.mp4", "subfolder": "video", "type": "output"}],
+                "source_assembly_segments": [{"filename": "parent.mp4", "subfolder": "video", "type": "output", "overlap_frames": 0}],
                 "source_document": document,
                 "parent_context_latent_path": "video/latents/parent.safetensors",
                 "workflow_id": "[PSV] MiniMax.json",
@@ -174,7 +175,7 @@ class StoreTests(unittest.TestCase):
                 "workflow_director_node_id": "1",
                 "result_node_ids": ["2"],
                 "result_fields": ["videos"],
-                "director_context": {"type": "native_h3_structured_extension", "context_frames": 22},
+                "director_context": {"type": "native_h3_soft_av_extension", "context_frames": 39},
             }
             update_project_store(path, {
                 "version": 2, "revision": 0, "active_project_id": "project-extension",
@@ -190,7 +191,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["parent_generation_id"], "generation-parent")
             self.assertEqual(restored["depth"], 2)
             self.assertEqual(restored["source_document"]["resolved_mode"], "t2va")
-            self.assertEqual(restored["director_context"]["context_frames"], 22)
+            self.assertEqual(restored["director_context"]["context_frames"], 39)
+            self.assertEqual(restored["engine"], "native_h3_soft_av_39")
+            self.assertEqual(restored["source_assembly_segments"][0]["overlap_frames"], 0)
 
     def test_in_message_operation_statuses_survive_reload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -236,7 +239,8 @@ class StoreTests(unittest.TestCase):
                 "segment_outputs": [{"filename": "segment.mp4", "type": "output"}],
                 "effective_duration": 5.17, "total_effective_duration": 10.34,
                 "context_latent_path": "video/PromptStudio_Video/latents/project-1/generation-extension.safetensors",
-                "continuation": {"engine": "native_h3_add_guide", "context_frames": 22},
+                "assembly_outputs": [{"filename": "segment-overlap.mp4", "type": "output"}],
+                "continuation": {"engine": "native_h3_soft_av_39", "context_frames": 39},
                 "continuation_request": {
                     "source": {"filename": "base.mp4", "type": "output"},
                     "source_document": document,
@@ -264,6 +268,9 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(restored_extension["context_latent_path"].endswith(".safetensors"))
             self.assertEqual(restored_extension["continuation_request"]["brief"], "A different ending.")
             self.assertEqual(restored_extension["continuation_request"]["source_document"]["version"], document["version"])
+
+            self.assertEqual(restored_extension["assembly_outputs"][0]["filename"], "segment-overlap.mp4")
+            self.assertEqual(restored_extension["continuation"]["context_frames"], 39)
 
     def test_pruned_continuation_parent_preserves_saved_lineage_coordinates(self):
         with tempfile.TemporaryDirectory() as directory:

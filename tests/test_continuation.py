@@ -1,10 +1,12 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import av
 import numpy as np
 from video.compiler import compile_prompt
+import video.continuation as continuation_module
 from video.continuation import (
     CONTINUATION_CONTEXT_FRAMES,
     annotated_output_path,
@@ -33,6 +35,8 @@ class ContinuationTests(unittest.TestCase):
         )
         prompt = compile_prompt(document)
 
+        self.assertIn("first 39 picture frames", prompt.lower())
+        self.assertIn("65-step audio run", prompt.lower())
         self.assertEqual(document["resolved_mode"], "t2va")
         self.assertEqual(document["references"], [])
         self.assertEqual(document["shots"][0]["camera"]["type"], "Tracking Shot")
@@ -46,7 +50,7 @@ class ContinuationTests(unittest.TestCase):
     def test_continuation_frame_plan_accounts_for_trimmed_context(self):
         timing = continuation_frame_plan(5)
         self.assertEqual(timing["context_frames"], CONTINUATION_CONTEXT_FRAMES)
-        self.assertEqual(timing["sample_frames"], 141)
+        self.assertEqual(timing["sample_frames"], 158)
         self.assertEqual(timing["delivered_frames"], 119)
         self.assertAlmostEqual(timing["delivered_duration"], 119 / 24)
 
@@ -144,7 +148,7 @@ class ContinuationTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _write_video(path, color):
+    def _write_video(path, color, frame_count=24):
         with av.open(path, mode="w", format="mp4") as container:
             stream = container.add_stream("h264", rate=24)
             stream.width = 64
@@ -152,7 +156,7 @@ class ContinuationTests(unittest.TestCase):
             stream.pix_fmt = "yuv420p"
             image = np.zeros((64, 64, 3), dtype=np.uint8)
             image[:, :] = color
-            for _index in range(24):
+            for _index in range(frame_count):
                 frame = av.VideoFrame.from_ndarray(image, format="rgb24")
                 container.mux(stream.encode(frame))
             container.mux(stream.encode(None))
@@ -172,6 +176,62 @@ class ContinuationTests(unittest.TestCase):
             with av.open(joined, mode="r") as container:
                 self.assertEqual(container.streams.video[0].frames, 48)
                 self.assertAlmostEqual(float(container.duration / av.time_base), 2.0, places=2)
+
+    def test_soft_av_assembly_blends_full_overlap_and_keeps_exact_frame_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = os.path.join(directory, "first.mp4")
+            second = os.path.join(directory, "second.mp4")
+            joined = os.path.join(directory, "joined.mp4")
+            self._write_video(first, (255, 0, 0), 48)
+            self._write_video(second, (0, 0, 255), 48)
+
+            concatenate_media_files(
+                [first, second],
+                joined,
+                overlap_frames=[0, CONTINUATION_CONTEXT_FRAMES],
+            )
+
+            with av.open(joined, mode="r") as container:
+                frames = list(container.decode(video=0))
+                self.assertEqual(len(frames), 57)
+                self.assertEqual(container.streams.video[0].frames, 57)
+                self.assertTrue(container.streams.audio)
+                first_pixel = frames[0].to_ndarray(format="rgb24")[0, 0]
+                seam_start = frames[9].to_ndarray(format="rgb24")[0, 0]
+                seam_end = frames[47].to_ndarray(format="rgb24")[0, 0]
+                last_pixel = frames[-1].to_ndarray(format="rgb24")[0, 0]
+                self.assertGreater(first_pixel[0], first_pixel[2])
+                self.assertGreater(seam_start[0], seam_start[2])
+                self.assertGreater(seam_end[2], seam_end[0])
+                self.assertGreater(last_pixel[2], last_pixel[0])
+
+    def test_soft_av_audio_assembly_gives_incoming_overlap_ownership(self):
+        infos = [
+            {"frames": 48, "width": 64, "height": 64},
+            {"frames": 48, "width": 64, "height": 64},
+        ]
+        first = np.ones((2, 48), dtype=np.float32)
+        incoming = np.full((2, 48), 2.0, dtype=np.float32)
+
+        with patch.object(
+            continuation_module,
+            "_decode_audio_array",
+            side_effect=[first, incoming],
+        ):
+            chunks = list(continuation_module._iter_owned_audio(
+                ["first.mp4", "second.mp4"],
+                [0, CONTINUATION_CONTEXT_FRAMES],
+                infos,
+                24,
+                "stereo",
+                57,
+                chunk_size=999,
+            ))
+
+        assembled = np.concatenate(chunks, axis=1)
+        self.assertEqual(assembled.shape, (2, 57))
+        self.assertTrue(np.all(assembled[:, :9] == 1.0))
+        self.assertTrue(np.all(assembled[:, 9:] == 2.0))
 
 
 if __name__ == "__main__":

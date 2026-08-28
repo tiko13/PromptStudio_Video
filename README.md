@@ -47,15 +47,21 @@ Suggested file: docs/images/reference-modes.png
 The structured project document remains authoritative while a deterministic compiler builds the guide-compliant MiniMax prompt. Every result keeps its prompt, project state, routing, and executable workflow snapshot for inspection and replay.
 
 Completed renders also expose **Continue video**. Video Studio sends the final
-22 frames and their clock-aligned 37 audio-latent steps into the head of a new
-MiniMax H3 sample through ComfyUI's native Add Guide contract. It trims that
-repeated context after decoding, saves the newly generated segment independently,
-and losslessly assembles a new cumulative MP4. Every generation stores its own
-compact continuation tail and the parent AV-clock offset needed for exact audio
-placement. Parent generations are never overwritten, so any shorter version can
-still be played or used as the start of an alternate continuation. This path is
-implemented in this repository and does not require a motion-context or looping
-node pack.
+39 frames and their exact 65 audio-latent steps into the target head of a new
+MiniMax H3 sample. ComfyUI's native nested denoise mask protects the complete
+picture prefix and the first 57 audio steps; the final eight audio steps use a
+half-cosine release into the generated future. Native guides inside the protected
+prefix are removed so they cannot compete with the exact target latent.
+
+After decoding, Video Studio saves both a separately playable trimmed extension
+and a private overlap-bearing assembly segment. Cumulative output uses the full
+39-frame visual blend and gives the incoming segment ownership of overlap audio,
+so the model's Soft AV audio release reaches the final soundtrack. Every
+generation stores a compact v3 latent tail plus immutable public and assembly
+lineage. Parent generations are never overwritten, so any shorter version can
+still be played or branched. Generated parents reuse their sampled latent
+directly; older or imported parents fall back through the audiovisual VAEs. No
+third-party motion-context node pack or ComfyUI runtime patch is required.
 
 The continuation dialog offers two paths. **Quick generate** sends one concise
 free-form development directly into a single continuation shot. **Build full
@@ -64,7 +70,7 @@ render and workflow snapshot. The extension uses the normal timeline and Shot
 Editor, so it may contain multiple cuts, ordered action and verbatim dialogue
 steps, camera changes, visible text, generated sound cues, ambience, and music.
 Its authored timeline describes only the new 5–15 second tail; Video Studio
-injects the 22-frame handoff, offsets authored cuts and first-shot event timing,
+injects the 39-frame Soft AV handoff, offsets authored cuts and first-shot event timing,
 then removes the overlap automatically. **Shot director** works on every
 extension shot and receives a read-only description of the source's final shot
 so Shot 1 continues rather than replaying the boundary. Video director and new
@@ -129,7 +135,7 @@ The current vertical slice contains:
 - first-frame, last-frame, image, video, and audio reference loading;
 - nested per-shot action, dialogue, generated-sound, and exact-audio timelines with overlapping ranges;
 - post-render exact-audio overlay/replacement with source trimming, gain, fades, and authoritative duration probing;
-- dependency-free native H3 Add Guide audiovisual continuation with immutable parent/child lineage, separately viewable extension segments, and cumulative outputs;
+- dependency-free native H3 Soft AV continuation with exact target-prefix masks, immutable parent/child lineage, separately viewable extension segments, and overlap-aware cumulative outputs;
 - a transactional full-screen Director Canvas with frame-snapped shot trimming, drag-to-reorder editing, media drag-and-drop, camera direction, dialogue, visible text, sound, and media roles;
 - a standalone Video Studio with durable projects, authoritative manual shot editing, a docked proportional timeline, frame-snapped trimming, per-shot editors, draggable action/dialogue steps, media roles, `[PSV]` workflow discovery, deterministic prompt preview, queueing, progress, video history, and exact workflow replay;
 - context-budgeted Video director and Shot director workflows for KoboldCpp, Ollama, or Llama.cpp, with conversational advice, validated structured proposals, stale-document protection, and explicit apply/discard review; and

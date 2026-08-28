@@ -146,6 +146,9 @@ def _normalize_generation(value, index):
     if "segment_outputs" in result and not isinstance(result["segment_outputs"], list):
         raise ValueError(f"Generation {index + 1} segment outputs must be a list")
     result.setdefault("segment_outputs", [])
+    if "assembly_outputs" in result and not isinstance(result["assembly_outputs"], list):
+        raise ValueError(f"Generation {index + 1} assembly outputs must be a list")
+    result.setdefault("assembly_outputs", [])
     if "continuation" in result and not isinstance(result["continuation"], dict):
         raise ValueError(f"Generation {index + 1} continuation metadata must be an object")
     return result
@@ -214,6 +217,11 @@ def _normalize_extension_source(value, project_index):
     if not isinstance(source_segments, list) or not source_segments:
         raise ValueError(f"Project {project_index + 1} extension source segments must be a non-empty list")
     workflow_snapshot = copy.deepcopy(value.get("workflow_snapshot"))
+    source_assembly_segments = copy.deepcopy(
+        value.get("source_assembly_segments") or source_segments
+    )
+    if not isinstance(source_assembly_segments, list) or not source_assembly_segments:
+        raise ValueError(f"Project {project_index + 1} extension assembly sources must be a non-empty list")
     if not isinstance(workflow_snapshot, dict):
         raise ValueError(f"Project {project_index + 1} extension workflow snapshot must be an object")
     result_node_ids = [str(item)[:200] for item in (value.get("result_node_ids") or [])]
@@ -222,7 +230,7 @@ def _normalize_extension_source(value, project_index):
     if not isinstance(director_context, dict):
         raise ValueError(f"Project {project_index + 1} extension Director context must be an object")
     return {
-        "engine": "native_h3_add_guide",
+        "engine": "native_h3_soft_av_39",
         "parent_project_id": parent_project_id,
         "parent_generation_id": parent_generation_id,
         "root_generation_id": root_generation_id,
@@ -231,6 +239,7 @@ def _normalize_extension_source(value, project_index):
         "source": source,
         "source_segments": source_segments,
         "source_document": normalize_document(value.get("source_document") or {}),
+        "source_assembly_segments": source_assembly_segments,
         "parent_context_latent_path": str(value.get("parent_context_latent_path") or "")[:4096],
         "workflow_id": str(value.get("workflow_id") or "")[:1024],
         "workflow_name": str(value.get("workflow_name") or "")[:1024],

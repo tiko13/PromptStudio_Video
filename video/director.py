@@ -384,9 +384,9 @@ This project uses the base keyframe prompt contract, not REF2VA's six-section re
 
 
 CONTINUATION_DIRECTOR_POLICY = """NATIVE STRUCTURED EXTENSION:
-This document authors only the newly delivered continuation after a native audiovisual handoff. The source_final_shot in continuation_context describes the production state entering authored Shot 1. An invisible 22-frame continuity bridge is injected before Shot 1 during generation and trimmed afterward.
+This document authors only the newly delivered continuation after a native audiovisual handoff. The source_final_shot in continuation_context describes the production state entering authored Shot 1. A protected 39-picture-frame / 65-audio-latent-step Soft AV context window is injected before Shot 1 during generation and removed from the separately delivered extension afterward. The picture context is held exactly; the final 8 audio latent steps are feathered into generation. Cumulative assembly blends the full 39-frame visual overlap while the incoming extension owns overlap audio.
 
-For authored Shot 1, continue from the source's final visible phase without replaying its beginning, resetting pose or momentum, duplicating an active sound onset, or introducing a cut at the boundary. Treat source_final_shot as read-only context: do not copy its dialogue, sounds, or full action sequence into the extension, and do not claim to edit it. Preserve its subjects, environment, composition, lighting, camera direction, and active sound unless the user explicitly requests a change that develops after the handoff. Later extension shots may cut and change normally. Return only selected-shot operations; the Video director is not used for extension projects."""
+For authored Shot 1, continue from the exact boundary phase without pausing, replaying the source ending, resetting or reversing pose, momentum, camera motion, or cyclic action, duplicating an active sound onset, holding the final pose, or introducing a cut at the boundary. The first new action and sound must advance immediately beyond the source state. Treat source_final_shot as read-only context: do not copy its dialogue, sounds, or full action sequence into the extension, and do not claim to edit it. Preserve its subjects, environment, composition, lighting, camera direction, and active sound unless the user explicitly requests a change that develops after the handoff. Later extension shots may cut and change normally. Return only selected-shot operations; the Video director is not used for extension projects."""
 
 
 def _text(value, maximum=MAX_MESSAGE_CHARS):
@@ -879,13 +879,19 @@ def _base_context(data, document, attachments, duration):
     if isinstance(turn_intent, dict) and _text(turn_intent.get("resolved_instruction"), 8_000):
         context["resolved_turn_instruction"] = _text(turn_intent["resolved_instruction"], 8_000)
     continuation = data.get("continuation_context")
-    if isinstance(continuation, dict) and continuation.get("type") == "native_h3_structured_extension":
+    continuation_types = {"native_h3_soft_av_extension", "native_h3_structured_extension"}
+    if isinstance(continuation, dict) and continuation.get("type") in continuation_types:
         source_shot = continuation.get("source_final_shot")
         source_shot = source_shot if isinstance(source_shot, dict) else {}
         camera = source_shot.get("camera") if isinstance(source_shot.get("camera"), dict) else {}
         context["continuation_context"] = {
-            "type": "native_h3_structured_extension",
-            "context_frames": 22,
+            "type": "native_h3_soft_av_extension",
+            "engine": "native_h3_soft_av_39",
+            "transition_policy": "soft_av",
+            "context_frames": 39,
+            "video_latent_steps": 12,
+            "audio_latent_steps": 65,
+            "audio_feather_steps": 8,
             "source_effective_duration": max(0.0, float(continuation.get("source_effective_duration") or 0)),
             "source_final_shot": {
                 "composition": _text(source_shot.get("composition"), 1_000),
