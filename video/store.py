@@ -290,8 +290,11 @@ def _normalize_project(value, index):
     }
     extension_source = _normalize_extension_source(value.get("extension_source"), index)
     if extension_source is not None:
-        if document.get("references"):
-            raise ValueError(f"Project {index + 1} structured extension cannot contain media references")
+        # Keep persisted authoring state lossless. Continuation execution owns
+        # capability validation, including the current restriction on adding
+        # media references to a structured extension. Rejecting that state here
+        # would make one incompatible session prevent the entire store from
+        # loading, leaving every otherwise-valid session inaccessible.
         result["extension_source"] = extension_source
     return result
 

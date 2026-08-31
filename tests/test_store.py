@@ -195,6 +195,46 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["engine"], "native_h3_soft_av_39")
             self.assertEqual(restored["source_assembly_segments"][0]["overlap_frames"], 0)
 
+    def test_structured_extension_reference_does_not_block_project_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "projects.json")
+            document = default_document()
+            document["references"] = [{
+                "id": "picture-1",
+                "kind": "image",
+                "path": "subject.png",
+                "roles": ["subject"],
+            }]
+            extension_source = {
+                "parent_project_id": "project-parent",
+                "parent_generation_id": "generation-parent",
+                "source": {"filename": "parent.mp4", "subfolder": "video", "type": "output"},
+                "source_segments": [{"filename": "parent.mp4", "subfolder": "video", "type": "output"}],
+                "workflow_snapshot": {"output": {"1": {"class_type": "PSV_MiniMaxH3Director"}}},
+            }
+
+            update_project_store(path, {
+                "version": 2,
+                "revision": 0,
+                "active_project_id": "project-extension",
+                "projects": [{
+                    "id": "project-extension",
+                    "name": "Extension with retained reference",
+                    "brief": "Continue.",
+                    "document": document,
+                    "workflow_id": "[PSV] MiniMax.json",
+                    "generations": [],
+                    "extension_source": extension_source,
+                    "created_at": 1,
+                    "updated_at": 2,
+                }],
+            })
+
+            restored = read_project_store(path)["projects"][0]
+
+            self.assertEqual(restored["extension_source"]["parent_generation_id"], "generation-parent")
+            self.assertEqual(restored["document"]["references"][0]["id"], "picture-1")
+
     def test_in_message_operation_statuses_survive_reload(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "projects.json")
