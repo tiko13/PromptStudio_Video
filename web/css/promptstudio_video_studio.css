@@ -2,7 +2,6 @@
   color-scheme: dark;
   --psv-bg: #0c0d12;
   --psv-panel: #13151d;
-  --psv-panel-strong: #191c27;
   --psv-panel-soft: #10121a;
   --psv-border: rgba(255, 255, 255, 0.09);
   --psv-border-strong: rgba(151, 126, 255, 0.5);
@@ -352,7 +351,6 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-progress > span { display: block; width: var(--progress, 10%); height: 100%; background: var(--psv-accent); transition: width .2s ease; }
 
 .psvstudio-inspector-content { display: grid; gap: 7px; padding: 0 10px 14px; }
-.psvstudio-inspector-director-actions { display: grid; gap: 5px; padding: 9px; background: rgba(141, 115, 255, .09); border: 1px solid rgba(151, 126, 255, .24); border-radius: 11px; }
 .psvstudio-shots-intro { padding: 9px 4px 5px; color: var(--psv-muted); }
 .psvstudio-shots-intro small { font-size: 10px; line-height: 1.45; }
 .psvstudio-shot-navigator { display: grid; gap: 8px; }
@@ -374,6 +372,17 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-inspector-section[open] > summary::after { content: "−"; }
 .psvstudio-inspector-section-body { display: grid; gap: 9px; padding: 0 9px 9px; }
 .psvstudio-inspector-section-body .psvstudio-inspector-section-body { padding: 9px; background: var(--psv-panel-soft); border: 1px solid var(--psv-border); border-radius: 9px; }
+.psvstudio-additional-inputs { gap: 8px; }
+.psvstudio-additional-input-row { min-width: 0; display: grid; gap: 7px; padding: 9px; background: rgba(255, 255, 255, .035); border: 1px solid var(--psv-border); border-radius: 9px; }
+.psvstudio-additional-input-heading { min-width: 0; display: flex; align-items: start; justify-content: space-between; gap: 8px; }
+.psvstudio-additional-input-heading > span { min-width: 0; display: grid; gap: 2px; }
+.psvstudio-additional-input-heading strong, .psvstudio-additional-input-heading small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.psvstudio-additional-input-heading strong { font-size: 11px; }
+.psvstudio-additional-input-heading small { color: var(--psv-muted); font-size: 9px; }
+.psvstudio-additional-input-heading .psvstudio-button { min-height: 26px; padding: 3px 7px; font-size: 9px; }
+.psvstudio-additional-input-row > input, .psvstudio-additional-input-row > select, .psvstudio-additional-input-row > textarea { width: 100%; }
+.psvstudio-additional-input-boolean { display: flex; align-items: center; gap: 8px; color: var(--psv-text); font-size: 10px; }
+.psvstudio-additional-input-boolean input { width: auto; margin: 0; accent-color: var(--psv-accent); }
 .psvstudio-semantic-intro, .psvstudio-prompt-warning { padding: 9px 10px; color: #f0dfae; background: rgba(158, 112, 25, .14); border: 1px solid rgba(226, 177, 72, .36); border-radius: 9px; font-size: 10px; line-height: 1.45; }
 .psvstudio-semantic-card { display: grid; gap: 8px; padding: 9px; background: rgba(255, 255, 255, .025); border: 1px solid var(--psv-border); border-radius: 9px; }
 .psvstudio-semantic-card > strong { color: #dcd8ed; font-size: 10px; }

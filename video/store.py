@@ -284,6 +284,9 @@ def _normalize_project(value, index):
         "brief": document["main_description"],
         "document": document,
         "workflow_id": str(value.get("workflow_id") or "").strip()[:1024],
+        "additional_input_selections": _normalize_additional_input_selections(
+            value.get("additional_input_selections")
+        ),
         "generations": normalized_generations,
         "created_at": created_at,
         "updated_at": _timestamp(value.get("updated_at") or created_at),
@@ -297,6 +300,26 @@ def _normalize_project(value, index):
         # loading, leaving every otherwise-valid session inaccessible.
         result["extension_source"] = extension_source
     return result
+
+
+def _normalize_additional_input_selections(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > 1000:
+        raise ValueError("Additional Input selections must be an object with at most 1000 entries")
+    normalized = {}
+    for key, entry in value.items():
+        key = str(key)
+        if not key or len(key) > 2048 or not isinstance(entry, dict):
+            raise ValueError("Additional Input selection is invalid")
+        selected = entry.get("value")
+        if selected is not None and not isinstance(selected, (str, int, float, bool)):
+            raise ValueError("Additional Input values must be JSON scalars")
+        fingerprint = str(entry.get("schemaFingerprint") or "")
+        if len(fingerprint) > 256 * 1024:
+            raise ValueError("Additional Input schema fingerprint is too large")
+        normalized[key] = {"value": selected, "schemaFingerprint": fingerprint}
+    return normalized
 
 
 def normalize_project_store(value):
@@ -508,6 +531,38 @@ def _normalize_workflow(value, index):
     result_ids = [str(item) for item in (value.get("result_node_ids") or [])]
     if not result_ids or any(item not in output for item in result_ids):
         raise ValueError(f"Workflow {index + 1} has invalid result nodes")
+    additional_inputs_value = value.get("additionalInputs", [])
+    if additional_inputs_value is None:
+        additional_inputs_value = []
+    additional_inputs = copy.deepcopy(additional_inputs_value)
+    if not isinstance(additional_inputs, list) or len(additional_inputs) > 1000:
+        raise ValueError(f"Workflow {index + 1} has invalid Additional Inputs")
+    seen_additional_ids = set()
+    for descriptor in additional_inputs:
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"Workflow {index + 1} has an invalid Additional Input")
+        source_id = str(descriptor.get("id") or "").strip()
+        target_id = str(descriptor.get("targetNodeId") or "").strip()
+        input_name = str(descriptor.get("targetInputName") or "").strip()
+        schema = descriptor.get("schema")
+        input_type = str(schema.get("type") if isinstance(schema, dict) else "").upper()
+        target_inputs = output.get(target_id, {}).get("inputs")
+        if not source_id or source_id in seen_additional_ids:
+            raise ValueError(f"Workflow {index + 1} has duplicate Additional Input nodes")
+        if not isinstance(target_inputs, dict) or input_name not in target_inputs:
+            raise ValueError(f"Workflow {index + 1} has an invalid Additional Input target")
+        if input_type not in {"INT", "FLOAT", "BOOLEAN", "STRING", "COMBO"}:
+            raise ValueError(f"Workflow {index + 1} has an unsupported Additional Input type")
+        options = schema.get("options", []) if isinstance(schema, dict) else []
+        if input_type == "COMBO" and (
+            not isinstance(options, list)
+            or any(not isinstance(option, (str, int, float)) or isinstance(option, bool) for option in options)
+        ):
+            raise ValueError(f"Workflow {index + 1} has invalid Additional Input options")
+        default_value = descriptor.get("defaultValue")
+        if default_value is not None and not isinstance(default_value, (str, int, float, bool)):
+            raise ValueError(f"Workflow {index + 1} has an invalid Additional Input default")
+        seen_additional_ids.add(source_id)
     return {
         "id": path,
         "path": path,
@@ -516,6 +571,8 @@ def _normalize_workflow(value, index):
         "director_node_id": director_id,
         "result_node_ids": result_ids,
         "result_fields": [str(item) for item in (value.get("result_fields") or ["videos", "gifs", "images"])],
+        "additionalInputs": additional_inputs,
+        "promptStudioInputVersion": max(0, int(value.get("promptStudioInputVersion") or 0)),
         "snapshot": copy.deepcopy(snapshot),
         "source_modified": _timestamp(value.get("source_modified")),
         "updated_at": _timestamp(value.get("updated_at")),

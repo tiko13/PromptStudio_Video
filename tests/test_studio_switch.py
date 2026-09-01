@@ -9,9 +9,6 @@ class UnifiedStudioContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = (ROOT / "web" / "js" / "promptstudio_video_studio.js").read_text(encoding="utf-8")
-        cls.standalone = (
-            ROOT / "web" / "js" / "promptstudio_video_standalone.js"
-        ).read_text(encoding="utf-8")
         cls.redirect = (ROOT / "web" / "js" / "promptstudio_video_redirect.js").read_text(encoding="utf-8")
         cls.page = (ROOT / "web" / "prompt_studio_video.html").read_text(encoding="utf-8")
         cls.routes = (ROOT / "routes.py").read_text(encoding="utf-8")
@@ -29,9 +26,36 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("setStandaloneVisibility", self.source)
 
     def test_cancelled_refresh_does_not_detach_the_video_panel(self):
-        for source in (self.source, self.standalone):
-            self.assertNotIn('addEventListener("beforeunload"', source)
-            self.assertIn('addEventListener("pagehide"', source)
+        legacy = (ROOT / "web" / "js" / "promptstudio_video_standalone.js").read_text(encoding="utf-8")
+        self.assertNotIn("BroadcastChannel", legacy)
+        self.assertNotIn("setInterval", legacy)
+        self.assertNotIn('addEventListener("beforeunload"', self.source)
+        self.assertIn('addEventListener("pagehide"', self.source)
+
+    def test_director_persists_only_video_owned_settings(self):
+        start = self.source.index("function saveDirectorSettings")
+        end = self.source.index("\nfunction comfyUiIsProcessing", start)
+        save = self.source[start:end]
+
+        self.assertIn("JSON.stringify(overrides)", save)
+        self.assertIn("return { ...shared, ...overrides, sampler_seed: -1 }", save)
+        for shared_key in (
+            "llm_provider",
+            "kobold_url",
+            "ollama_url",
+            "ollama_model",
+            "llamacpp_url",
+            "llamacpp_model",
+            "thinking_mode",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "rep_pen",
+            "rep_pen_range",
+        ):
+            self.assertNotIn(f"{shared_key}:", save)
 
     def test_video_header_has_the_shared_switch_and_absolute_icon(self):
         self.assertGreaterEqual(self.source.count('data-promptstudio-studio-mode="image"'), 2)
@@ -133,7 +157,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("studio.llamacpp_autostart", self.source)
         self.assertIn("profile.llamacpp_reasoning_budget_tokens", self.source)
         self.assertIn("Shared Prompt Studio LLM", self.source)
-        self.assertIn("llamacpp_config_profile: shared.llamacpp_config_profile", self.source)
+        self.assertIn("return { ...shared, ...overrides, sampler_seed: -1 }", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/config-builder", self.routes)
 
@@ -166,6 +190,22 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("await offerDefaultWorkflowSetup()", self.source)
         self.assertIn("overwrite: false", self.source)
         self.assertIn("void pollDefaultSetup(job.id)", self.source)
+
+    def test_additional_inputs_share_the_image_contract_and_preserve_exact_replays(self):
+        self.assertIn(
+            'from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/prompt-studio-input.js"',
+            self.source,
+        )
+        self.assertIn("extractPromptStudioInputs(graph, snapshot, workflowData)", self.source)
+        self.assertIn("PROMPT_STUDIO_INPUT_PROFILE_VERSION", self.source)
+        self.assertIn('inspectorDetails("Additional Inputs", true)', self.source)
+        self.assertIn("project.additional_input_selections", self.source)
+        queue_start = self.source.index("async function queueSnapshot")
+        queue_end = self.source.index("\nasync function generateProject", queue_start)
+        queue = self.source[queue_start:queue_end]
+        self.assertIn('existingGeneration?.preparation_kind !== "replay"', queue)
+        self.assertIn("applyPromptStudioInputValues", queue)
+        self.assertIn(".psvstudio-additional-input-row", self.styles)
 
     def test_director_progress_prefers_live_token_counts(self):
         activity_start = self.source.index("function llmActivityLabel")

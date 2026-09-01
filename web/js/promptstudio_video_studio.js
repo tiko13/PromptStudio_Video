@@ -1,5 +1,15 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
+import {
+  PROMPT_STUDIO_INPUT_PROFILE_VERSION,
+  applyPromptStudioInputValues,
+  extractPromptStudioInputs,
+  normalizePromptStudioInputDescriptors,
+  normalizePromptStudioInputSelections,
+  promptStudioInputSelectionKey,
+  promptStudioInputValue,
+  selectedPromptStudioInputValue,
+} from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/prompt-studio-input.js";
 
 const EXTENSION_NAME = "PromptStudio.Video.Standalone";
 const CHANNEL_NAME = "promptstudio.video.standalone.v1";
@@ -332,34 +342,17 @@ function llmGeneratedTokenCount(status = {}) {
 function saveDirectorSettings(dialog = state.directorDialog) {
   if (!dialog) return directorSettings();
   const shared = directorSettings();
-  const settings = {
-    llm_provider: shared.llm_provider,
-    kobold_url: shared.kobold_url,
-    ollama_url: shared.ollama_url,
-    ollama_model: shared.ollama_model,
-    llamacpp_url: shared.llamacpp_url,
-    llamacpp_model: shared.llamacpp_model,
-    llamacpp_config_profile: shared.llamacpp_config_profile,
-    llamacpp_reasoning_budget_tokens: shared.llamacpp_reasoning_budget_tokens,
-    thinking_mode: shared.thinking_mode,
+  const overrides = {
     max_response_tokens: Math.max(0, Math.min(131072, Number(directorControlValue(dialog, "psvstudio-director-max-tokens") || 0))),
     context_budget_chars: Number(directorControlValue(dialog, "psvstudio-director-context-budget") || 8000),
-    temperature: shared.temperature,
-    top_p: shared.top_p,
-    top_k: shared.top_k,
-    min_p: shared.min_p,
-    presence_penalty: shared.presence_penalty,
-    rep_pen: shared.rep_pen,
-    rep_pen_range: shared.rep_pen_range,
-    sampler_seed: -1,
     request_timeout: Math.max(5, Math.min(3600, Number(directorControlValue(dialog, "psvstudio-director-timeout") || 600))),
   };
   try {
-    localStorage.setItem(DIRECTOR_SETTINGS_KEY, JSON.stringify(settings));
+    localStorage.setItem(DIRECTOR_SETTINGS_KEY, JSON.stringify(overrides));
   } catch (_) {
     // The active request can still use these settings when storage is unavailable.
   }
-  return settings;
+  return { ...shared, ...overrides, sampler_seed: -1 };
 }
 
 function comfyUiIsProcessing() {
@@ -2792,6 +2785,7 @@ function createProjectRecord() {
     brief: "",
     document,
     workflow_id: state.workflows[0]?.id || "",
+    additional_input_selections: {},
     generations: [],
     created_at: now,
     updated_at: now,
@@ -2931,6 +2925,7 @@ function resetProject() {
   synchronizeGeometryCanvas(project);
   project.brief = "";
   project.workflow_id = state.workflows[0]?.id || "";
+  project.additional_input_selections = {};
   project.generations = [];
   state.selectedShotId = document.shots[0].id;
 
@@ -3002,6 +2997,7 @@ async function buildWorkflowTemplate(file, workflowData) {
   if (saveVideoNodes.length !== 1) {
     throw new Error(`Workflow needs exactly one executable native Save Video node; found ${saveVideoNodes.length}.`);
   }
+  const additionalInputs = extractPromptStudioInputs(graph, snapshot, workflowData);
   return {
     id: file.path,
     path: file.path,
@@ -3010,6 +3006,8 @@ async function buildWorkflowTemplate(file, workflowData) {
     director_node_id: String(directors[0][0]),
     result_node_ids: [String(saveVideoNodes[0][0])],
     result_fields: ["videos", "gifs", "images"],
+    additionalInputs,
+    promptStudioInputVersion: PROMPT_STUDIO_INPUT_PROFILE_VERSION,
     snapshot,
     source_modified: Number(file.modified || 0),
     updated_at: Date.now(),
@@ -3022,7 +3020,12 @@ async function loadWorkflowCache() {
   const response = await api.fetchApi(WORKFLOWS_ENDPOINT);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || "Video workflow cache could not be loaded.");
-  state.workflows = Array.isArray(data.templates) ? data.templates : [];
+  state.workflows = Array.isArray(data.templates)
+    ? data.templates.map(workflow => ({
+      ...workflow,
+      additionalInputs: normalizePromptStudioInputDescriptors(workflow.additionalInputs),
+    }))
+    : [];
   state.workflowRevision = Number(data.revision || 0);
 }
 
@@ -3191,7 +3194,11 @@ async function refreshWorkflows({ announce = true } = {}) {
       .sort((left, right) => left.path.localeCompare(right.path));
     for (const file of files) {
       const old = cached.get(file.path);
-      if (old && !old.stale && Number(old.source_modified || 0) === Number(file.modified || 0)) {
+      if (
+        old && !old.stale
+        && Number(old.source_modified || 0) === Number(file.modified || 0)
+        && Number(old.promptStudioInputVersion || 0) === PROMPT_STUDIO_INPUT_PROFILE_VERSION
+      ) {
         next.push(old);
         continue;
       }
@@ -3803,6 +3810,13 @@ function pollGeneration(promptId) {
 
 async function queueSnapshot(project, workflow, snapshot, metadata, existingGeneration = null) {
   const generationId = existingGeneration?.id || makeId("generation");
+  if (existingGeneration?.preparation_kind !== "replay") {
+    applyPromptStudioInputValues(
+      snapshot,
+      workflow,
+      normalizePromptStudioInputSelections(project?.additional_input_selections),
+    );
+  }
   const savedSnapshot = clone(snapshot);
   const queuedSnapshot = clone(snapshot);
   const instrumentation = instrumentGenerationSnapshot(
@@ -6479,6 +6493,106 @@ function openShotEditor(shotId = state.selectedShotId) {
   renderInspector();
 }
 
+function setVideoAdditionalInputSelection(project, workflow, descriptor, value) {
+  project.additional_input_selections = normalizePromptStudioInputSelections(project.additional_input_selections);
+  const key = promptStudioInputSelectionKey(workflow?.id, descriptor?.id);
+  const normalized = promptStudioInputValue(descriptor, value);
+  if (normalized === descriptor.defaultValue) delete project.additional_input_selections[key];
+  else {
+    project.additional_input_selections[key] = {
+      value: normalized,
+      schemaFingerprint: descriptor.schemaFingerprint,
+    };
+  }
+  markProjectChanged({ project });
+}
+
+function videoAdditionalInputControl(project, workflow, descriptor) {
+  const row = el("div", "psvstudio-additional-input-row");
+  const heading = el("div", "psvstudio-additional-input-heading");
+  const copy = el("span");
+  copy.append(
+    el("strong", "", descriptor.label),
+    el("small", "", `${descriptor.targetNodeLabel} · ${descriptor.targetLabel}`),
+  );
+  const reset = button("Reset", () => {
+    delete project.additional_input_selections[promptStudioInputSelectionKey(workflow.id, descriptor.id)];
+    markProjectChanged({ project });
+    renderInspector();
+  }, "psvstudio-button");
+  heading.append(copy, reset);
+  row.append(heading);
+  const selected = selectedPromptStudioInputValue(
+    workflow.id,
+    descriptor,
+    project.additional_input_selections,
+  );
+  const schema = descriptor.schema;
+  let control;
+  if (schema.type === "COMBO") {
+    control = document.createElement("select");
+    schema.options.forEach((optionValue, index) => {
+      const option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = String(optionValue);
+      option.selected = optionValue === selected;
+      control.append(option);
+    });
+    control.addEventListener("change", () => {
+      setVideoAdditionalInputSelection(project, workflow, descriptor, schema.options[Number(control.value)]);
+    });
+  } else if (schema.type === "BOOLEAN") {
+    const label = el("label", "psvstudio-additional-input-boolean");
+    control = document.createElement("input");
+    control.type = "checkbox";
+    control.checked = Boolean(selected);
+    const stateLabel = el("span", "", control.checked ? schema.labelOn : schema.labelOff);
+    control.addEventListener("change", () => {
+      stateLabel.textContent = control.checked ? schema.labelOn : schema.labelOff;
+      setVideoAdditionalInputSelection(project, workflow, descriptor, control.checked);
+    });
+    control.setAttribute("aria-label", descriptor.label);
+    label.append(control, stateLabel);
+    row.append(label);
+    return row;
+  } else if (schema.type === "STRING" && schema.multiline) {
+    control = document.createElement("textarea");
+    control.rows = 3;
+    control.value = String(selected ?? "");
+    control.addEventListener("change", () => setVideoAdditionalInputSelection(project, workflow, descriptor, control.value));
+  } else {
+    control = document.createElement("input");
+    if (["INT", "FLOAT"].includes(schema.type)) {
+      control.type = "number";
+      if (schema.min != null) control.min = String(schema.min);
+      if (schema.max != null) control.max = String(schema.max);
+      control.step = String(schema.step ?? (schema.type === "INT" ? 1 : "any"));
+      control.value = String(selected);
+      control.addEventListener("change", () => setVideoAdditionalInputSelection(project, workflow, descriptor, control.valueAsNumber));
+    } else {
+      control.type = "text";
+      control.value = String(selected ?? "");
+      control.addEventListener("change", () => setVideoAdditionalInputSelection(project, workflow, descriptor, control.value));
+    }
+  }
+  control.setAttribute("aria-label", descriptor.label);
+  row.append(control);
+  return row;
+}
+
+function renderVideoAdditionalInputs(project) {
+  const workflow = selectedWorkflow(project);
+  const descriptors = normalizePromptStudioInputDescriptors(workflow?.additionalInputs);
+  if (!descriptors.length) return null;
+  project.additional_input_selections = normalizePromptStudioInputSelections(project.additional_input_selections);
+  const section = inspectorDetails("Additional Inputs", true);
+  section.body.classList.add("psvstudio-additional-inputs");
+  section.body.append(...descriptors.map(descriptor => (
+    videoAdditionalInputControl(project, workflow, descriptor)
+  )));
+  return section.details;
+}
+
 function renderInspector() {
   const content = state.panel?.querySelector("#psvstudio-inspector-content");
   const project = activeProject();
@@ -6490,6 +6604,8 @@ function renderInspector() {
     content.append(el("div", "psvstudio-empty", "Create a project to begin building shots."));
     return;
   }
+  const additionalInputs = renderVideoAdditionalInputs(project);
+  if (additionalInputs) content.append(additionalInputs);
   const intro = el("div", "psvstudio-shots-intro");
   intro.append(el("small", "", "Select a shot to locate it on the timeline. Open it to edit setup and chronological steps."));
   content.append(intro);

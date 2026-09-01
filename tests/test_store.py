@@ -26,6 +26,12 @@ class StoreTests(unittest.TestCase):
                 "brief": "A baker opens the shutters.",
                 "document": default_document(),
                 "workflow_id": "[PSV] MiniMax.json",
+                "additional_input_selections": {
+                    "[PSV] MiniMax.json\u0000input-1": {
+                        "value": 24,
+                        "schemaFingerprint": '{"type":"INT"}',
+                    },
+                },
                 "generations": [],
                 "created_at": 1,
                 "updated_at": 1,
@@ -47,6 +53,10 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored_project["document"]["resolved_mode"], "t2va")
             self.assertEqual(restored_project["document"]["main_description"], project["brief"])
             self.assertEqual(restored_project["brief"], project["brief"])
+            self.assertEqual(
+                restored_project["additional_input_selections"],
+                project["additional_input_selections"],
+            )
             self.assertEqual(
                 restored_project["document"]["shots"][0]["steps"][0]["text"],
                 project["brief"],
@@ -346,7 +356,7 @@ class StoreTests(unittest.TestCase):
             path = os.path.join(directory, "workflows.json")
             snapshot = {"output": {
                 "6": {"class_type": "PSV_MiniMaxH3Director", "inputs": {"document_json": "{}"}},
-                "19": {"class_type": "SaveVideo", "inputs": {}},
+                "19": {"class_type": "SaveVideo", "inputs": {"frame_rate": 24}},
             }}
             saved = update_workflow_store(path, {
                 "version": 1,
@@ -357,12 +367,27 @@ class StoreTests(unittest.TestCase):
                     "director_node_id": "6",
                     "result_node_ids": ["19"],
                     "result_fields": ["videos"],
+                    "additionalInputs": [{
+                        "id": "input-1",
+                        "targetNodeId": "19",
+                        "targetInputName": "frame_rate",
+                        "label": "Frame rate",
+                        "targetLabel": "frame_rate",
+                        "targetNodeLabel": "Save Video",
+                        "schema": {
+                            "type": "INT", "min": 1, "max": 120, "step": 1,
+                            "multiline": False, "labelOn": "true", "labelOff": "false",
+                            "options": [],
+                        },
+                        "defaultValue": 24,
+                    }],
                     "snapshot": snapshot,
                 }],
             })
             self.assertEqual(saved["revision"], 1)
             restored = read_workflow_store(path)
             self.assertEqual(restored["templates"][0]["director_node_id"], "6")
+            self.assertEqual(restored["templates"][0]["additionalInputs"][0]["defaultValue"], 24)
 
 
 if __name__ == "__main__":

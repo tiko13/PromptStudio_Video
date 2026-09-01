@@ -401,7 +401,7 @@ complete executable workflow snapshot for exact replay.
 
 ```powershell
 C:\EasyDiffusion\ComfyUI\venv\Scripts\python.exe -m unittest discover -s tests -v
-node --check web\js\promptstudio_video_standalone.js
 node --check web\js\promptstudio_video_studio.js
+node --check web\js\promptstudio_video_redirect.js
 git diff --check
 ```
