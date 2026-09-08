@@ -110,7 +110,8 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("updateProgress(id", executing_handler)
 
         state_start = events.index('scope.listen(api, "progress_state"')
-        state_handler = events[state_start:state_start + 450]
+        state_end = events.index('scope.listen(api, "execution_success"', state_start)
+        state_handler = events[state_start:state_end]
         self.assertIn("const progress = runningProgress(event)", state_handler)
         self.assertIn("...(progress || {})", state_handler)
         self.assertIn("renderGenerations()", state_handler)

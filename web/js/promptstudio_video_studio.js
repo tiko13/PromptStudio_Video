@@ -139,6 +139,7 @@ const state = {
   defaultSetupJobId: "",
   selectedShotId: null,
   generationProgress: new Map(),
+  pendingGenerationProgress: new Map(),
   activeGenerationPromptId: "",
   generationPollers: new Map(),
   generationControllers: new Map(),
@@ -4084,9 +4085,12 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
     updated_at: Date.now(),
   });
   if (!existingGeneration) project.generations.unshift(generation);
+  const earlyProgress = state.pendingGenerationProgress.get(String(promptId));
+  state.pendingGenerationProgress.delete(String(promptId));
+  if (earlyProgress) Object.assign(generation, { status: "generating", updated_at: Date.now() });
+  state.generationProgress.set(String(promptId), { phase: "queued", ...(earlyProgress || {}) });
   markProjectChanged({ render: true });
   await persistProjects();
-  state.generationProgress.set(String(promptId), { phase: "queued" });
   touchGeneration(promptId);
   const reportedFailure = state.generationFailures.get(String(promptId));
   if (reportedFailure) {
