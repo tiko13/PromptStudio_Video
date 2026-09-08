@@ -6,12 +6,14 @@ import copy
 from collections import deque
 import json
 import math
+import ntpath
 import os
 import re
 import tempfile
 from fractions import Fraction
 
 from .contracts import FPS, PromptDocumentError, normalize_document
+from .media_budget import (audio_array, iter_audio, checkpoint, geometry as check_geometry, bounded_media, assembly_job, duration as check_duration, MAX_ASSEMBLY_SECONDS, MAX_SAMPLE_RATE)
 
 
 CONTINUATION_CONTEXT_FRAMES = 39
@@ -29,12 +31,12 @@ def normalize_output_descriptor(value, label="Video output"):
     filename = str(value.get("filename") or "").strip()
     subfolder = str(value.get("subfolder") or "").strip().replace("\\", "/")
     output_type = str(value.get("type") or "output").strip().lower()
-    if not filename or filename != os.path.basename(filename) or filename in {".", ".."}:
+    if not filename or filename != ntpath.basename(filename) or ntpath.splitdrive(filename)[0] or filename in {".", ".."}:
         raise ValueError(f"{label} has an invalid filename")
     if output_type not in OUTPUT_TYPES:
         raise ValueError(f"{label} must be a saved ComfyUI output")
     parts = [part for part in subfolder.split("/") if part]
-    if any(part in {".", ".."} for part in parts):
+    if subfolder.startswith("/") or ntpath.splitdrive(subfolder)[0] or any(part in {".", ".."} for part in parts):
         raise ValueError(f"{label} has an invalid subfolder")
     return {
         "filename": filename,
@@ -84,6 +86,11 @@ def probe_video(path):
             duration = float(container.duration / av.time_base)
         else:
             raise ValueError("The source video duration could not be determined")
+        check_duration(duration)
+        check_geometry(stream.width, stream.height)
+        rate = float(stream.average_rate or FPS)
+        if not math.isfinite(rate) or not 0 < rate <= 240:
+            raise ValueError("Video frame rate is outside the decode budget")
         return {
             "duration": duration,
             "width": int(stream.width or 0),
@@ -206,6 +213,59 @@ def _offset_timed_items(items, offset):
             item["end"] = float(item["end"]) + offset
 
 
+def validate_extension_tail_timeline(document, delivered_duration):
+    """Check delivered-tail bounds before ordinary H3 frame-grid normalization."""
+    limit = float(delivered_duration)
+    if not math.isfinite(limit) or limit <= 0:
+        raise PromptDocumentError("Invalid post-trim authored-tail duration")
+    shots = document.get("shots") or []
+    for index, shot in enumerate(shots):
+        start = float(shot.get("start") or 0)
+        end = float(shots[index + 1].get("start") or 0) if index + 1 < len(shots) else limit
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or start >= limit or end > limit or end <= start or (index == 0 and start != 0):
+            raise PromptDocumentError("Shot cut falls outside the post-trim authored-tail timeline")
+        for field in ("steps", "sound_cues", "audio_clips"):
+            for item in shot.get(field) or []:
+                for edge in ("start", "end"):
+                    if item.get(edge) is None:
+                        continue
+                    cue = float(item[edge])
+                    if not math.isfinite(cue) or cue < 0 or start + cue > end + 1e-9 or (edge == "start" and start + cue >= end):
+                        raise PromptDocumentError("Timed cue falls outside the post-trim authored-tail timeline")
+
+
+def continuation_director_context(parent_document, source_effective_duration=0):
+    parent = normalize_document(parent_document)
+    shot = copy.deepcopy(parent["shots"][-1])
+    for key in ("composition", "subjects", "environment", "lighting"):
+        shot[key] = _without_reference_tokens(shot.get(key))
+    shot["steps"] = [step for step in shot.get("steps", []) if not str(step.get("id", "")).startswith("continuation-opening")]
+    return {
+        "type": "native_h3_soft_av_extension", "engine": "native_h3_soft_av_39",
+        "transition_policy": "soft_av", "context_frames": CONTINUATION_CONTEXT_FRAMES,
+        "video_latent_steps": 12, "audio_latent_steps": 65, "audio_feather_steps": 8,
+        "source_effective_duration": max(0, float(source_effective_duration or 0)),
+        "source_final_shot": shot,
+    }
+
+
+def build_extension_authoring_document(parent_document, brief, duration_seconds):
+    """Seed only the new tail; generation alone adds the protected prefix."""
+    parent = normalize_document(parent_document)
+    timing = continuation_frame_plan(duration_seconds)
+    shot = _continuation_shot(parent, "")
+    shot["id"] = "extension-shot-1"
+    shot["steps"] = []
+    shot["sounds"] = []
+    return normalize_document({
+        **copy.deepcopy(parent), "mode": "t2va", "duration_seconds": timing["requested_duration"],
+        "main_description": str(brief or "").strip(), "prompt_override": "",
+        "style": _without_reference_tokens(parent.get("style")), "shots": [shot],
+        "references": [], "task_types": [], "subject_definitions": [], "retention_analysis": [],
+        "canvas_reference_id": "", "summary": "",
+    })
+
+
 def _build_structured_continuation_document(parent, extension_document, timing):
     if not isinstance(extension_document, dict):
         raise PromptDocumentError("Structured extension document must be an object")
@@ -221,6 +281,7 @@ def _build_structured_continuation_document(parent, extension_document, timing):
     # it against the exact native-grid tail so a cut cannot land in the overlap
     # or beyond the frames that survive trimming.
     authored_value["duration_seconds"] = timing["delivered_duration"]
+    validate_extension_tail_timeline(authored_value, timing["delivered_duration"])
     authored = normalize_document(authored_value)
     if authored.get("references"):
         raise PromptDocumentError(
@@ -417,6 +478,8 @@ def _probe_blend_streams(paths, overlaps):
             geometry = (int(stream.width or 0), int(stream.height or 0))
             if not all(geometry):
                 raise ValueError("A continuation source has invalid video dimensions")
+            geometry_check_frames = max(1, CONTINUATION_CONTEXT_FRAMES * 2)
+            check_geometry(*geometry, geometry_check_frames)
             if canvas is None:
                 canvas = geometry
             elif geometry != canvas:
@@ -427,7 +490,8 @@ def _probe_blend_streams(paths, overlaps):
                     frame_count = round(float(stream.duration * stream.time_base) * FPS)
                 elif container.duration is not None:
                     frame_count = round(float(container.duration / av.time_base) * FPS)
-            if frame_count <= int(overlaps[index]):
+            outgoing_overlap = int(overlaps[index + 1]) if index + 1 < len(overlaps) else 0
+            if frame_count <= int(overlaps[index]) + outgoing_overlap:
                 raise ValueError("A continuation source is not longer than its incoming overlap")
             if container.streams.audio:
                 audio = container.streams.audio[0]
@@ -439,6 +503,9 @@ def _probe_blend_streams(paths, overlaps):
                 if current_layout and audio_layout is None:
                     audio_layout = current_layout
             infos.append({"frames": frame_count, "width": geometry[0], "height": geometry[1]})
+    check_duration(sum(item["frames"] for item in infos) / FPS, MAX_ASSEMBLY_SECONDS)
+    if int(sample_rate or 32000) > MAX_SAMPLE_RATE:
+        raise ValueError("Continuation audio sample rate exceeds the budget")
     return infos, int(sample_rate or 32000), str(audio_layout or "stereo")
 
 
@@ -451,37 +518,7 @@ def _resampled_audio_frames(value):
 
 
 def _decode_audio_array(path, sample_rate, layout, wanted_samples):
-    import av
-    import numpy as np
-
-    channels = len(av.AudioLayout(layout).channels)
-    chunks = []
-    with av.open(path, mode="r") as container:
-        if container.streams.audio:
-            resampler = av.AudioResampler(format="fltp", layout=layout, rate=sample_rate)
-            for frame in container.decode(audio=0):
-                for converted in _resampled_audio_frames(resampler.resample(frame)):
-                    value = converted.to_ndarray()
-                    if value.ndim == 1:
-                        value = value.reshape(1, -1)
-                    chunks.append(value.astype(np.float32, copy=False))
-            for converted in _resampled_audio_frames(resampler.resample(None)):
-                value = converted.to_ndarray()
-                if value.ndim == 1:
-                    value = value.reshape(1, -1)
-                chunks.append(value.astype(np.float32, copy=False))
-    if chunks:
-        audio = np.concatenate(chunks, axis=1)
-    else:
-        audio = np.zeros((channels, 0), dtype=np.float32)
-    if audio.shape[0] != channels:
-        raise ValueError("Continuation audio resampling produced an unexpected channel layout")
-    wanted_samples = int(wanted_samples)
-    if audio.shape[1] > wanted_samples:
-        return np.ascontiguousarray(audio[:, :wanted_samples])
-    if audio.shape[1] < wanted_samples:
-        audio = np.pad(audio, ((0, 0), (0, wanted_samples - audio.shape[1])))
-    return np.ascontiguousarray(audio)
+    return audio_array(path, sample_rate, end=int(wanted_samples) / sample_rate, layout=layout)
 
 
 def _iter_crossfaded_video(paths, overlaps, infos):
@@ -497,6 +534,7 @@ def _iter_crossfaded_video(paths, overlaps, infos):
             if incoming:
                 prefix = []
                 for _position in range(incoming):
+                    checkpoint()
                     try:
                         prefix.append(next(frames))
                     except StopIteration as exc:
@@ -515,7 +553,12 @@ def _iter_crossfaded_video(paths, overlaps, infos):
                     ).astype(np.uint8)
                     yield av.VideoFrame.from_ndarray(blended, format="rgb24")
                 pending.clear()
+            decoded_count = incoming
             for frame in frames:
+                checkpoint()
+                decoded_count += 1
+                if decoded_count > int(infos[index]["frames"]) + 1:
+                    raise ValueError("Video exceeds its declared frame count")
                 if (int(frame.width), int(frame.height)) != (
                     int(infos[index]["width"]),
                     int(infos[index]["height"]),
@@ -536,22 +579,16 @@ def _iter_owned_audio(paths, overlaps, infos, sample_rate, layout, wanted_total,
     emitted = 0
     for index, path in enumerate(paths):
         segment_samples = round(int(infos[index]["frames"]) / FPS * sample_rate)
-        audio = _decode_audio_array(path, sample_rate, layout, segment_samples)
-        outgoing = (
-            round(int(overlaps[index + 1]) / FPS * sample_rate)
-            if index + 1 < len(paths)
-            else 0
-        )
-        if outgoing >= audio.shape[1]:
+        outgoing = round(int(overlaps[index + 1]) / FPS * sample_rate) if index + 1 < len(paths) else 0
+        if outgoing >= segment_samples:
             raise ValueError("A continuation audio stream is not longer than its seam window")
-        owned = audio[:, : audio.shape[1] - outgoing if outgoing else audio.shape[1]]
-        available = min(owned.shape[1], max(0, int(wanted_total) - emitted))
-        position = 0
-        while position < available:
-            stop = min(available, position + int(chunk_size))
-            yield np.ascontiguousarray(owned[:, position:stop])
-            emitted += stop - position
-            position = stop
+        available = min(segment_samples - outgoing, max(0, int(wanted_total) - emitted))
+        if available <= 0:
+            continue
+        for value in iter_audio(path, sample_rate, layout, end=available / sample_rate, chunk_size=chunk_size):
+            checkpoint(emitted, wanted_total)
+            yield value
+            emitted += value.shape[-1]
     if emitted < int(wanted_total):
         channels = len(__import__("av").AudioLayout(layout).channels)
         remaining = int(wanted_total) - emitted
@@ -574,6 +611,7 @@ def _blend_media_files(paths, target_path, overlaps, metadata=None):
         dir=os.path.dirname(target_path),
     )
     os.close(descriptor)
+    video_frames = audio_chunks = None
     try:
         with av.open(
             temporary,
@@ -644,20 +682,25 @@ def _blend_media_files(paths, target_path, overlaps, metadata=None):
                 output.mux(packet)
         os.replace(temporary, target_path)
     finally:
+        for iterator in (video_frames, audio_chunks):
+            if iterator is not None:
+                iterator.close()
         if os.path.exists(temporary):
             os.unlink(temporary)
     return target_path
 
+@bounded_media
 def concatenate_media_files(source_paths, target_path, metadata=None, overlap_frames=None):
     """Assemble compatible MP4 segments, blending explicitly retained overlaps."""
     import av
 
-    paths = [os.path.abspath(path) for path in source_paths]
-    if len(paths) < 2 or len(paths) > MAX_CONTINUATION_SOURCES:
+    if not isinstance(source_paths, (list, tuple)) or not 2 <= len(source_paths) <= MAX_CONTINUATION_SOURCES:
         raise ValueError(f"Continuation assembly requires between 2 and {MAX_CONTINUATION_SOURCES} segments")
+    paths = [os.path.abspath(path) for path in source_paths]
     if any(not os.path.isfile(path) for path in paths):
         raise ValueError("A continuation segment no longer exists")
 
+    check_duration(sum(probe_video(path)["duration"] for path in paths), MAX_ASSEMBLY_SECONDS)
     overlaps = _normalize_overlap_frames(overlap_frames, len(paths))
     target_path = os.path.abspath(target_path)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -712,6 +755,7 @@ def concatenate_media_files(source_paths, target_path, metadata=None, overlap_fr
                         segment_duration = _media_duration(source, streams)
                         starts = {}
                         for packet in source.demux(*streams):
+                            checkpoint()
                             if packet.dts is None:
                                 continue
                             key = _stream_key(packet.stream)
@@ -740,12 +784,13 @@ def concatenate_media_files(source_paths, target_path, metadata=None, overlap_fr
     return target_path
 
 
+@assembly_job
 def assemble_generation_outputs(source_descriptors, project_id, generation_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", str(project_id or "")):
         raise ValueError("Project identifier is invalid")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", str(generation_id or "")):
         raise ValueError("Generation identifier is invalid")
-    if not isinstance(source_descriptors, list):
+    if not isinstance(source_descriptors, list) or not 2 <= len(source_descriptors) <= MAX_CONTINUATION_SOURCES:
         raise ValueError("Continuation assembly sources must be a list")
     resolved = []
     overlaps = []

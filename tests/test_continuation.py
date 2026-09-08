@@ -215,8 +215,8 @@ class ContinuationTests(unittest.TestCase):
 
         with patch.object(
             continuation_module,
-            "_decode_audio_array",
-            side_effect=[first, incoming],
+            "iter_audio",
+            side_effect=[iter([first[:, :9]]), iter([incoming])],
         ):
             chunks = list(continuation_module._iter_owned_audio(
                 ["first.mp4", "second.mp4"],

@@ -1,22 +1,12 @@
-:root {
+@import url("/extensions/ComfyUI_PromptStudio/css/studio-tokens.css");
+
+:where(.psvstudio-app, body.psvstudio-popout-body, dialog[class*="psvstudio-"]) {
   color-scheme: dark;
-  --psv-bg: #0c0d12;
-  --psv-panel: #13151d;
-  --psv-panel-soft: #10121a;
-  --psv-border: rgba(255, 255, 255, 0.09);
-  --psv-border-strong: rgba(151, 126, 255, 0.5);
-  --psv-text: #f3f4f8;
-  --psv-muted: #9096a8;
-  --psv-accent: #8d73ff;
-  --psv-accent-strong: #aa96ff;
-  --psv-warn: #f0bc6d;
-  --psv-error: #ff858e;
-  --psv-ok: #78d99a;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: var(--studio-font);
 }
 
-* { box-sizing: border-box; }
-body { margin: 0; color: var(--psv-text); background: var(--psv-bg); }
+:where(.psvstudio-app, .psvstudio-app *, dialog[class*="psvstudio-"], dialog[class*="psvstudio-"] *) { box-sizing: border-box; }
+body.psvstudio-popout-body { margin: 0; color: var(--psv-text); background: var(--psv-bg); }
 body.psvstudio-media-drag-active::after {
   content: "Drop media into this project\A Reorder and assign its role in the Media lane";
   position: fixed;
@@ -37,8 +27,8 @@ body.psvstudio-media-drag-active::after {
   white-space: pre-line;
   pointer-events: none;
 }
-button, input, select, textarea { font: inherit; }
-button { color: inherit; }
+:where(.psvstudio-app, dialog[class*="psvstudio-"]) :is(button, input, select, textarea) { font: inherit; }
+:where(.psvstudio-app, dialog[class*="psvstudio-"]) button { color: inherit; }
 
 .psvstudio-popout-body {
   min-width: 0;
@@ -133,22 +123,22 @@ body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"]
 .psvstudio-inspector-brand > div:nth-child(2) { min-width: 0; }
 .psvstudio-studio-switch { flex: 0 0 auto; display: inline-grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 116px; padding: 3px; background: rgba(255, 255, 255, .045); border: 1px solid var(--psv-border); border-radius: 11px; }
 .psvstudio-studio-switch button { min-height: 28px; padding: 0 9px; color: var(--psv-muted); background: transparent; border: 0; border-radius: 8px; font-size: 10px; font-weight: 750; cursor: pointer; }
-.psvstudio-studio-switch button[aria-pressed="true"] { color: #fff; background: var(--psv-accent); }
+.psvstudio-studio-switch button[aria-pressed="true"] { color: #fff; background: var(--studio-accent-fill); }
 .psvstudio-mobile-studio-switch { display: none; }
 .psvstudio-sidebar-header, .psvstudio-inspector-header { justify-content: space-between; padding: 12px 14px; }
 .psvstudio-sidebar > .psvstudio-sidebar-header { min-height: 66px; border-bottom: 1px solid var(--psv-border); background: rgba(16, 18, 26, .84); backdrop-filter: blur(20px); }
 .psvstudio-sidebar-header h2, .psvstudio-inspector-header h2 { margin: 0; font-size: 13px; }
 
 .psvstudio-button {
-  min-height: 34px;
-  padding: 0 12px;
+  min-height: var(--studio-control-height);
+  padding: 0 var(--studio-space-3);
   color: var(--psv-text);
   background: rgba(255, 255, 255, .055);
   border: 1px solid var(--psv-border);
-  border-radius: 10px;
+  border-radius: var(--studio-radius-control);
   font-weight: 600;
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease, opacity 120ms ease;
+  transition: background var(--studio-motion-control) ease, border-color var(--studio-motion-control) ease, transform var(--studio-motion-control) ease, opacity var(--studio-motion-control) ease;
 }
 .psvstudio-button:hover:not(:disabled) { background: rgba(255, 255, 255, .1); border-color: rgba(255, 255, 255, .17); }
 .psvstudio-button:active:not(:disabled) { transform: translateY(1px); }
@@ -160,9 +150,30 @@ body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"]
   outline: 2px solid var(--psv-accent-strong);
   outline-offset: 2px;
 }
-.psvstudio-button-primary { color: #fff; background: var(--psv-accent); border-color: var(--psv-accent); }
-.psvstudio-button-primary:hover:not(:disabled) { background: var(--psv-accent-strong); border-color: var(--psv-accent-strong); }
+.psvstudio-button-primary { color: #fff; background: var(--studio-accent-fill); border-color: var(--studio-accent-fill); }
+.psvstudio-button-primary:hover:not(:disabled) { background: var(--studio-accent-fill-hover); border-color: var(--studio-accent-fill-hover); }
 .psvstudio-button-danger:not(:disabled) { color: var(--psv-error); border-color: rgba(255, 133, 142, .3); }
+.psvstudio-save-conflict {
+  color: var(--psv-text);
+  background: var(--psv-panel);
+  border: 1px solid var(--psv-border-strong);
+  border-radius: var(--studio-radius-panel);
+  padding: var(--studio-space-4);
+  box-shadow: var(--studio-shadow-panel);
+}
+.psvstudio-save-conflict::backdrop { background: rgba(0, 0, 0, .65); }
+.psvstudio-save-conflict h2 { margin-top: 0; font-size: 17px; }
+.psvstudio-save-conflict details { margin: var(--studio-space-3) 0; }
+.psvstudio-save-conflict summary { color: var(--psv-muted); }
+.psvstudio-save-conflict button {
+  min-height: var(--studio-control-height);
+  padding: 0 var(--studio-space-3);
+  margin: var(--studio-space-1);
+  border: 1px solid var(--psv-border);
+  border-radius: var(--studio-radius-control);
+  background: var(--psv-panel-soft);
+  cursor: pointer;
+}
 .psvstudio-icon-button { display: grid; place-items: center; width: 36px; padding: 0; font-size: 17px; }
 #psvstudio-mobile-projects, #psvstudio-mobile-inspector, #psvstudio-close-inspector, #psvstudio-close-projects { display: none; }
 .psvstudio-drawer-scrim { display: none; position: absolute; z-index: 15; inset: 0; padding: 0; background: rgba(3, 4, 7, .56); border: 0; cursor: pointer; }
@@ -198,14 +209,14 @@ body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"]
 .psvstudio-kobold-popover { position: absolute; z-index: 50; top: calc(100% + 9px); right: 0; width: 270px; display: grid; gap: 8px; padding: 11px; background: rgba(19, 21, 29, .98); border: 1px solid var(--psv-border); border-radius: 12px; box-shadow: 0 18px 44px rgba(0, 0, 0, .52); }
 .psvstudio-kobold-popover strong { font-size: 11px; }
 .psvstudio-system-status-heading { color: var(--psv-text); font-size: 12px !important; }
-.psvstudio-system-status-section { display: grid; gap: 7px; }
+.psvstudio-system-status-section { display: grid; gap: 7px; min-width: 0; }
 .psvstudio-system-status-section + .psvstudio-system-status-section { padding-top: 9px; border-top: 1px solid var(--psv-border); }
 .psvstudio-system-status-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .psvstudio-system-status-row span { text-align: right; }
 .psvstudio-system-status-row span[data-state="idle"] { color: var(--psv-ok); }
 .psvstudio-system-status-row span[data-state="busy"] { color: var(--psv-warn); }
 .psvstudio-system-status-row span[data-state="offline"] { color: var(--psv-error); }
-.psvstudio-kobold-popover span, .psvstudio-kobold-popover small { color: var(--psv-muted); font-size: 9px; line-height: 1.4; }
+.psvstudio-kobold-popover span, .psvstudio-kobold-popover small { color: var(--psv-muted); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
 .psvstudio-kobold-metadata { display: grid; gap: 5px; margin: 0; }
 .psvstudio-kobold-metadata > div { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 7px; }
 .psvstudio-kobold-metadata dt, .psvstudio-kobold-metadata dd { margin: 0; font-size: 9px; line-height: 1.4; }
@@ -320,7 +331,7 @@ body:has(.psvstudio-app[data-api-connected="false"]) dialog[class*="psvstudio-"]
 .psvstudio-shot-block.is-dragging { opacity: .35; }
 .psvstudio-shot-block-header { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
 .psvstudio-shot-block-header strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.psvstudio-shot-duration { color: #c7baff; font-size: 9px; white-space: nowrap; }
+.psvstudio-shot-duration { color: var(--studio-accent-strong); font-size: 9px; white-space: nowrap; }
 .psvstudio-shot-range, .psvstudio-shot-camera { overflow: hidden; color: rgba(231, 226, 255, .65); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .psvstudio-shot-camera { display: none; }
 .psvstudio-shot-summary { overflow: hidden; align-self: start; color: rgba(250, 249, 255, .88); font-size: 9px; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
@@ -653,6 +664,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 
 @media (max-width: 780px) {
   .psvstudio-popout-mount { padding: 0; }
+  body.promptstudio-popout-body[data-studio-mode="video"] .promptstudio-popout-mount { padding: 0; }
   .psvstudio-app { grid-template-columns: 1fr; width: 100vw; height: 100vh; border: 0; border-radius: 0; }
   .psvstudio-inspector { position: absolute; z-index: 20; top: 0; right: 0; bottom: 0; width: min(90vw, 360px); box-shadow: -22px 0 55px rgba(0, 0, 0, .48); transform: translateX(105%); transition: transform 160ms ease; }
   .psvstudio-app[data-drawer="inspector"] .psvstudio-inspector { transform: none; }
@@ -701,6 +713,26 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+@media (forced-colors: active) {
+  .psvstudio-shot-block,
+  .psvstudio-shot-duration,
+  .psvstudio-shot-range,
+  .psvstudio-shot-camera,
+  .psvstudio-shot-summary,
+  .psvstudio-shot-nav-head span,
+  .psvstudio-shot-nav-select p { color: CanvasText; }
+}
+
+@media (forced-colors: active) {
+  .psvstudio-shot-block,
+  .psvstudio-shot-duration,
+  .psvstudio-shot-range,
+  .psvstudio-shot-camera,
+  .psvstudio-shot-summary,
+  .psvstudio-shot-nav-head span,
+  .psvstudio-shot-nav-select p { color: CanvasText; }
 }
 
 @media (max-width: 620px) {

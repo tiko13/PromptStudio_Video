@@ -9,6 +9,7 @@ from pathlib import PurePath
 BASE_MODES = frozenset({"t2va", "i2va", "fl2va", "l2va"})
 SUPPORTED_MODES = frozenset({*BASE_MODES, "ref2va"})
 PROFILE_PRESETS = ("auto_quality", "fast_4step")
+TURBO_POLICY_VERSION = 1
 
 DEFAULT_FL2VA_MIXED_8STEP_LORA = (
     "MiniMax3\\minimax_h3_fl2v_lightx2v_turbo_8step_v1.0_"

@@ -13,7 +13,10 @@ class StructuredExtensionFrontendTests(unittest.TestCase):
     def test_continue_dialog_offers_quick_and_structured_paths(self):
         self.assertIn('submit.textContent = "Quick generate"', self.source)
         self.assertIn('button("Build full extension"', self.source)
-        self.assertIn("createStructuredExtensionProject(project, generation", self.source)
+        self.assertIn("await createStructuredExtensionProject(project, record.source_generation", self.source)
+        self.assertIn('button("Apply extension plan"', self.source)
+        self.assertIn('CONTINUATION_PLAN_ENDPOINT = "/promptstudio-video/continuations/plan"', self.source)
+        self.assertNotIn("function structuredExtensionDocument(", self.source)
 
     def test_structured_generation_sends_authored_document_to_continuation_prepare(self):
         self.assertIn("async function generateStructuredExtension(project)", self.source)

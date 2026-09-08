@@ -97,6 +97,32 @@ def action_text(shot):
     )
 
 
+def silent_director_document():
+    """An action-only fixture for parser/camera tests unrelated to dialogue."""
+    document = director_document()
+    for shot in document["shots"]:
+        shot["steps"] = [step for step in shot["steps"] if step["type"] == "action"]
+    return normalize_document(document)
+
+
+def edit_request(content, *, replacement=False, scope="project", changes=()):
+    """Explicit semantic-router output; this fixture does not simulate an LLM."""
+    return {
+        "scope": scope,
+        "messages": [{"role": "user", "content": content}],
+        "_turn_intent": {
+            "route": "mutate", "confidence": 1.0,
+            "edit_intent": {
+                "scope": scope if replacement else "fields",
+                "replacement": "replace" if replacement else "patch",
+                "replacement_evidence": content if replacement else "",
+                "protected_changes": {kind: content for kind in changes},
+                "preserve": [],
+            },
+        },
+    }
+
+
 def dialogue_steps(shot):
     return [step for step in shot.get("steps") or [] if step.get("type") == "dialogue"]
 
@@ -182,16 +208,13 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("Do not rely on the sounds array's position to imply timing", system_message)
             self.assertIn("Use relative synchronization cues rather than per-event timestamps", system_message)
 
-    def test_complete_rewrite_detection_does_not_expand_field_edits(self):
-        self.assertTrue(_complete_rewrite_requested({
-            "messages": [{"role": "user", "content": "Completely rewrite this as a new production."}],
-        }))
-        self.assertTrue(_complete_rewrite_requested({
-            "messages": [{"role": "user", "content": "Rewrite the full REF2VA production."}],
-        }))
-        self.assertTrue(_complete_rewrite_requested({
-            "messages": [{"role": "user", "content": "Start the selected shot over."}],
-        }))
+    def test_complete_rewrite_authority_does_not_expand_field_edits(self):
+        for content in (
+            "Completely rewrite this as a new production.",
+            "Rewrite the full REF2VA production.",
+            "Start the selected shot over.",
+        ):
+            self.assertTrue(_complete_rewrite_requested(edit_request(content, replacement=True)))
         self.assertFalse(_complete_rewrite_requested({
             "messages": [{"role": "user", "content": "Replace this camera move with a slow push-in."}],
         }))
@@ -871,7 +894,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(relationship, "fully_preserved")
 
     def test_non_reference_proposal_accepts_echoed_empty_reference_arrays(self):
-        document = normalize_document(director_document())
+        document = normalize_document(silent_director_document())
         raw = (
             f"{CHANGESET_BEGIN}\n"
             '{"summary":"Rewrite I2VA shot","operations":['
@@ -923,7 +946,10 @@ class DirectorTests(unittest.TestCase):
         )
 
         parsed = parse_director_response(raw, "", document_fingerprint(document), "project")
-        preview = preview_changeset(document, parsed["proposal"])
+        preview = preview_changeset(document, parsed["proposal"], request_data=edit_request(
+            "Replace the dialogue with sung lyrics and change the visible text.",
+            changes=("dialogue", "lyrics", "visible_text"),
+        ))
         shot = preview["document"]["shots"][0]
         self.assertEqual([step["type"] for step in shot["steps"]], ["action", "dialogue", "action"])
         self.assertEqual(shot["visible_text"], ["LAST TRAIN"])
@@ -1276,7 +1302,7 @@ class DirectorTests(unittest.TestCase):
         )
 
     def test_reference_definition_with_empty_where_is_grounded_into_single_shot(self):
-        value = director_document()
+        value = silent_director_document()
         value["shots"] = [value["shots"][0]]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "woman.png",
@@ -1314,7 +1340,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("<Subject 1>", result["compiled_prompt"])
 
     def test_reference_subject_prose_is_grammatical_and_not_duplicated_in_shot(self):
-        value = director_document()
+        value = silent_director_document()
         value["shots"] = [value["shots"][0]]
         value["references"] = [{
             "id": "reference-1", "kind": "image", "path": "woman.png",
@@ -1558,7 +1584,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("rise and exit frame left", result["resolved_instruction"])
         request_data, messages, images = generate.call_args.args
         self.assertEqual(request_data["thinking_mode"], "Disabled")
-        self.assertEqual(request_data["max_response_tokens"], 320)
+        self.assertEqual(request_data["max_response_tokens"], 900)
         self.assertEqual(request_data["temperature"], 0.0)
         self.assertEqual(request_data["_response_schema"], DIRECTOR_TURN_RESPONSE_SCHEMA)
         self.assertEqual(images, [])
@@ -1696,7 +1722,7 @@ class DirectorTests(unittest.TestCase):
         _validate_protected_sequence_content(
             original,
             result,
-            {"messages": [{"role": "user", "content": "Rewrite the dialogue line in Shot 1."}]},
+            edit_request("Rewrite the dialogue line in Shot 1.", changes=("dialogue",)),
         )
 
     def test_steps_cannot_silently_drop_existing_visible_text(self):
@@ -1805,7 +1831,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(camera["type"], "Pan Right")
 
     def test_project_proposal_repairs_model_structure_and_display_ids(self):
-        document = normalize_document(director_document())
+        document = normalize_document(silent_director_document())
         fingerprint = document_fingerprint(document)
         raw = (
             f"{CHANGESET_BEGIN}\n"
@@ -1941,7 +1967,7 @@ class DirectorTests(unittest.TestCase):
         )
 
     def test_camera_deduplication_preserves_action_in_mixed_sentence(self):
-        document = normalize_document(director_document())
+        document = normalize_document(silent_director_document())
         fingerprint = document_fingerprint(document)
         raw = (
             f"{CHANGESET_BEGIN}\n"
@@ -1957,7 +1983,8 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual(action_text(result["document"]["shots"][0]), "The woman waves")
 
     def test_add_operations_for_display_ids_update_existing_shots(self):
-        document = normalize_document(director_document())
+        document = normalize_document(silent_director_document())
+        document["shots"][0]["visible_text"] = []
         fingerprint = document_fingerprint(document)
         raw = (
             f"{CHANGESET_BEGIN}\n"
@@ -2674,7 +2701,7 @@ class DirectorTests(unittest.TestCase):
         self.assertEqual([item["op"] for item in result["proposal"]["operations"]], ["update_shot"])
 
     def test_conflicting_remove_and_update_keeps_the_content_update(self):
-        document = normalize_document(director_document())
+        document = normalize_document(silent_director_document())
         proposal = {
             "base_document_hash": document_fingerprint(document),
             "scope": {"type": "project"},
@@ -2797,7 +2824,9 @@ class DirectorTests(unittest.TestCase):
             ],
         }
 
-        preview = preview_changeset(document, proposal)
+        preview = preview_changeset(document, proposal, request_data=edit_request(
+            "Remove the visible text from Shot 2.", changes=("visible_text",),
+        ))
         shot = preview["document"]["shots"][1]
 
         self.assertEqual(preview["document"]["style"], "Live-action, cinematic")
@@ -2815,6 +2844,9 @@ class DirectorTests(unittest.TestCase):
         self.assertNotIn("Old blocking note", preview["compiled_prompt"])
 
     def test_explicit_complete_project_rewrite_promotes_updates_to_replacements(self):
+        self.turn_intent.update(edit_request(
+            "Completely rewrite the full production as a bakery opening.", replacement=True,
+        )["_turn_intent"])
         document = normalize_document(director_document())
         document["shots"][0].update({
             "subjects": "An obsolete passenger.",
@@ -2843,7 +2875,11 @@ class DirectorTests(unittest.TestCase):
                         "subjects": "A baker waits beside closed wooden shutters.",
                         "environment": "A small bakery before sunrise.",
                         "lighting": "Warm practical light meets cool dawn light.",
-                        "steps": [{"type": "action", "text": "The baker unlatches the wooden shutters."}],
+                        "steps": [
+                            {"type": "action", "text": "The baker unlatches the wooden shutters."},
+                            *copy.deepcopy(dialogue_steps(document["shots"][0])),
+                        ],
+                        "visible_text": copy.deepcopy(document["shots"][0]["visible_text"]),
                     }},
                     {"op": "update_shot", "shot_id": "shot-2", "fields": {
                         "composition": "A close view of the bakery window.",
@@ -2874,8 +2910,8 @@ class DirectorTests(unittest.TestCase):
         ))
         preview = preview_changeset(document, result["proposal"])
         self.assertNotIn("obsolete", preview["compiled_prompt"].casefold())
-        self.assertNotIn("Do not rewrite this.", preview["compiled_prompt"])
-        self.assertNotIn("Central Station", preview["compiled_prompt"])
+        self.assertIn("Do not rewrite this.", preview["compiled_prompt"])
+        self.assertIn("Central Station", preview["compiled_prompt"])
 
     def test_project_proposal_rejects_an_empty_resulting_timeline(self):
         value = director_document()

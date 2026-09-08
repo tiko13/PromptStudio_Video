@@ -1,4 +1,5 @@
 import unittest
+import copy
 from unittest.mock import patch
 
 from video.contracts import default_document
@@ -10,15 +11,24 @@ from video.director import (
     normalize_project_changeset,
 )
 from video.extension_planner import _planning_instruction, plan_extension
+from video.continuation import build_extension_authoring_document, build_continuation_document, continuation_frame_plan, validate_extension_tail_timeline
 
 
 class ExtensionPlannerTests(unittest.TestCase):
     def test_planner_instruction_triggers_complete_replacement_semantics(self):
         instruction = _planning_instruction("The courier opens the door.")
 
-        self.assertTrue(_complete_rewrite_requested({
+        request = {
+            "scope": "project",
             "messages": [{"role": "user", "content": instruction}],
-        }))
+        }
+        self.assertFalse(_complete_rewrite_requested(request))
+        request["_turn_intent"] = {
+            "route": "mutate", "confidence": 1,
+            "edit_intent": {"scope": "project", "replacement": "replace",
+                            "replacement_evidence": "Completely rewrite the entire production for this extension"},
+        }
+        self.assertTrue(_complete_rewrite_requested(request))
 
     def test_planner_uses_project_continuation_policy_and_exact_tail_limit(self):
         request = {
@@ -144,6 +154,42 @@ class ExtensionPlannerTests(unittest.TestCase):
                 "extension_planning": True,
                 "continuation_context": {"authored_tail_duration": 119 / 24},
             })
+
+    def test_late_timed_cues_are_rejected_before_grid_expansion(self):
+        for field, item in (("steps", {"id": "late", "type": "action", "text": "Late action", "start": 4.9, "end": 5}),
+                            ("sound_cues", {"id": "late", "text": "Late sound", "start": 4.9, "end": 5})):
+            document = default_document()
+            document["shots"][0][field] = [item]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "post-trim authored-tail"):
+                build_continuation_document(default_document(), "Continue", 5, extension_document=document)
+
+    def test_authoring_and_generation_transform_preserve_parent_and_apply_prefix_once(self):
+        parent = default_document()
+        original = copy.deepcopy(parent)
+        authored = build_extension_authoring_document(parent, "Continue the walk", 5)
+        authored["shots"][0]["steps"] = [{"id": "action", "type": "action", "text": "Walk forward", "start": 0.25, "end": 1}]
+        second = copy.deepcopy(authored["shots"][0])
+        second.update(id="shot-two", start=2)
+        authored["shots"].append(second)
+        unchanged = copy.deepcopy(authored)
+        output = build_continuation_document(parent, "Continue the walk", 5, extension_document=authored)
+        self.assertEqual(parent, original)
+        self.assertEqual(authored, unchanged)
+        self.assertEqual(output["shots"][1]["start"], 2 + 39 / 24)
+        self.assertEqual(output["shots"][0]["steps"][1]["start"], 0.25 + 39 / 24)
+        self.assertEqual(output["shots"][1]["steps"][0]["start"], 0.25)
+        self.assertEqual(sum(step["id"].startswith("continuation-opening") for shot in output["shots"] for step in shot["steps"]), 1)
+        with self.assertRaisesRegex(ValueError, "duration does not match"):
+            build_continuation_document(parent, "Continue", 5, extension_document=output)
+
+    def test_exact_tail_end_is_valid_but_cut_at_end_is_not(self):
+        duration = continuation_frame_plan(5)["delivered_duration"]
+        document = default_document()
+        document["shots"][0]["steps"] = [{"id": "timed", "type": "action", "text": "Moves", "start": 0, "end": duration}]
+        validate_extension_tail_timeline(document, duration)
+        document["shots"].append({"id": "late", "start": duration})
+        with self.assertRaisesRegex(ValueError, "post-trim authored-tail"):
+            validate_extension_tail_timeline(document, duration)
 
 
 if __name__ == "__main__":

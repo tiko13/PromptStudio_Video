@@ -2,9 +2,12 @@
 
 ## Boundary
 
-This repository owns all video-specific prompt contracts, UI, nodes, stores,
-workflow adapters, and future standalone pages. `ComfyUI_PromptStudio` should
-only contain companion detection, its enable switch, and navigation.
+This repository owns video-specific prompt contracts, UI, nodes, media handling,
+project storage adapters and H3 workflow semantics. `ComfyUI_PromptStudio` owns
+shared provider dispatch and scheduling, settings, wire contracts, transactional
+storage primitives, asset acquisition, workflow conversion and provenance
+utilities. Video consumes those services through thin adapters. The two Git
+repositories form one product and are tested together.
 
 ## Authoritative state
 
@@ -45,14 +48,28 @@ allowing repeated continuation and branches while every shorter version stays
 playable.
 
 Video Studio instruments queued prompts without changing their durable workflow
-snapshots. Every render writes a compact 22-frame H3 video-latent tail together
-with the aligned audio-latent tail. An extension uses the FL2VA/base model and a
-T2VA prompt, places those parent condition latents on the first 22 frames of the
-new target timeline, and trims the repeated audiovisual head after decode. The
-new raw segment therefore starts immediately after its parent. A saved MP4 is
-decoded only as a compatibility fallback for generations created before latent
-capture existed. The runtime patch is guarded against incompatible third-party
-H3 patches and is owned entirely by this repository.
+snapshots. Each render captures a compact v3 tail containing exactly **39 frames**
+and **65 audio-latent steps**. A continuation uses the FL2VA/base model with a
+T2VA prompt. Native nested denoise masks protect the picture prefix and the first
+57 audio steps; the last eight audio steps use a half-cosine release. Conflicting
+native guides inside the protected prefix are removed. The separately playable
+extension trims the repeated head; cumulative assembly uses the full 39-frame
+visual blend and gives the incoming segment ownership of overlap audio. Saved
+MP4 decoding is a compatibility fallback for older or imported parents. This
+uses native H3 latent/mask support and does not require a third-party motion
+context node pack or a parent ComfyUI runtime patch.
+
+`CONTINUATION_CONTEXT_FRAMES` and the motion-context default are both 39. Lower
+level context utilities retain historical frame-grid options for compatibility,
+but the supported Soft AV continuation entry point requires exactly 39 frames.
+The capability response advertises `native_h3_soft_av_39`.
+
+Quick continuation authors one new tail shot. Full extension planning uses the
+shared cancellable job scheduler, with observable progress, retry and explicit
+Apply. Its timeline covers only the delivered new tail; deterministic assembly
+adds the 39-frame handoff once and offsets authored cuts and first-shot events.
+Applying a successful plan creates one child project; cancellation, failure or
+repeated Apply cannot overwrite the parent or create duplicate children.
 
 The standalone right panel is a compact Shots navigator. Detailed shot setup
 and the ordered performance sequence live in a transactional popup editor. The
@@ -97,12 +114,11 @@ still validated instead of being silently discarded.
 Conversational answers do not mutate project state. Requested edits use a
 video-specific change set whose base-document hash, scope, target IDs, field
 allowlists, camera vocabulary, timing, reference coverage, and normalized
-result are validated on the server. Reference assets and visible text remain
-outside both write scopes. The Director must preserve existing dialogue text and
-speaker IDs when replacing a steps sequence unless the user explicitly requests
-that protected dialogue change. Reference analysis may describe and activate already-committed
-assets but cannot replace them. A project proposal cannot remove a shot that
-contains protected dialogue or visible text. The browser applies the validated
+result are validated on the server. Reference assets cannot be replaced by a
+proposal. Existing dialogue, lyrics, visible text and speaker bindings remain
+protected unless the current user turn explicitly authorizes the corresponding
+content change; protected changes appear in the review. Reference analysis may
+describe and activate already-committed assets. The browser applies the validated
 document only after explicit user approval and rejects proposals made against
 an older document revision.
 
@@ -180,9 +196,24 @@ node and remains an independent fallback.
 
 ## Standalone workflow dispatch
 
-The frontend discovers `[PSV]` workflow files through ComfyUI user data, loads
-each into an isolated graph, and caches the executable `graphToPrompt` snapshot.
+The frontend discovers `[PSV]` workflow files through the shared adapter, loads
+each into an isolated graph, and caches the full `workflow`/`output`
+`graphToPrompt` envelope. Cache identity includes content and capability hashes
+plus adapter, conversion and input-descriptor versions. Image and Video
+serialize temporary subgraph registrations and restore the native graph's
+registry afterwards. Nested nodes retain their prefixed executable IDs.
 Queueing clones that snapshot and changes only the Director's `document_json`
 input plus explicitly requested seed randomization. The queued snapshot is then
 stored with the generation so subsequent project edits cannot change an active
-render and completed work can be replayed exactly.
+render and completed executable inputs can be replayed unchanged. This is an
+input-replay guarantee, not a guarantee of identical pixels after model, node,
+policy or hardware changes. Shared provenance records and drift checks support
+that distinction without modifying saved snapshots.
+
+Default workflows are readable JSON under `workflows/`, loaded directly by
+`video/default_setup.py`. There is no compressed payload to hand-edit. Native
+Director and SaveVideo names/IO remain intact; the Turbo adapter is checked
+against the authoritative Python selector. Host-provided dependencies and the
+tested Python range are documented in the README. Only Python 3.14 was verified
+locally during this audit; broader package installation metadata is not a
+minimum-version test result.

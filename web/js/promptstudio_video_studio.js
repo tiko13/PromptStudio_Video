@@ -1,5 +1,20 @@
+import { downloadJobDiagnostics, fetchJobActivity, jobActivityText, jobRetryText, recoveredJobError } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/job-diagnostics.js";
+import { createVideoWorkflowTemplateBuilder, turboDisplayProfile, discoverWorkflowFiles, workflowResultOutputs } from "./workflow-adapter.js";
 import { app } from "/scripts/app.js";
+import {createPollingScope} from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/polling.js";
+import {readSharedHealth} from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/shared-health.js";
+import { reconcileKeyedHistory } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/keyed-history.js";
+import { createResultComparison, videoComparisonRecord } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/result-comparison.js";
+import { captureRuntimeProvenance, reviewReplay } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/replay-review.js";
+import { createDraftOutbox, createDraftScheduler, draftTabKey, showDraftStorageFailure } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/chat/draft-outbox.js";
+import { createFeatureController, movePanelPreservingFocus } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/feature-controller.js";
+import { createVideoGenerationProgressController } from "./controllers/generation-progress-controller.js";
+import { createVideoDocumentInteractionController } from "./controllers/document-interaction-controller.js";
+import { requireHistoryIndex, prepareHistoryIndex } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/history-maintenance.js";
+import { installDialogFocus } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/dialog-focus.js";
 import { api } from "/scripts/api.js";
+import { loadLlmProfiles } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/settings/llm-profile-store.js";
+import { normalizeLlmProvider as sharedLlmProvider, normalizeProviderSettings, normalizeJobWire, assertObservedJobTransition } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/core/wire-contracts.js";
 import {
   PROMPT_STUDIO_INPUT_PROFILE_VERSION,
   applyPromptStudioInputValues,
@@ -12,6 +27,13 @@ import {
 } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/prompt-studio-input.js";
 
 const EXTENSION_NAME = "PromptStudio.Video.Standalone";
+const videoDraftOutbox = createDraftOutbox();
+let videoDraftPending = Promise.resolve(true);
+const projectDraftScheduler = createDraftScheduler(writeProjectDraft);
+window.addEventListener("pagehide", () => projectDraftScheduler.flush());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") projectDraftScheduler.flush();
+});
 const CHANNEL_NAME = "promptstudio.video.standalone.v1";
 const DIRECTOR_TYPE = "PSV_MiniMaxH3Director";
 const TURBO_PROFILE_TYPE = "PSV_MiniMaxH3TurboProfile";
@@ -23,6 +45,8 @@ const DEFAULT_SETUP_ENDPOINT = "/promptstudio-video/default-setup";
 const DIRECTOR_CHAT_ENDPOINT = "/promptstudio-video/director/chat";
 const DIRECTOR_PREVIEW_ENDPOINT = "/promptstudio-video/director/preview";
 const CONTINUATION_PREPARE_ENDPOINT = "/promptstudio-video/continuations/prepare";
+const CONTINUATION_PLAN_ENDPOINT = "/promptstudio-video/continuations/plan";
+const CONTINUATION_PLANS_KEY = "promptstudio.video.continuation.plans.v1";
 const CONTINUATION_ASSEMBLE_ENDPOINT = "/promptstudio-video/continuations/assemble";
 const EXACT_AUDIO_MIX_ENDPOINT = "/promptstudio-video/audio-mix";
 const AUDIO_PROBE_ENDPOINT = "/promptstudio-video/media/audio-probe";
@@ -38,7 +62,6 @@ const DIRECTOR_SETTINGS_KEY = "promptstudio.video.director.settings.v1";
 const DIRECTOR_SESSIONS_KEY = "promptstudio.video.director.sessions.v1";
 const IMAGE_STUDIO_SETTINGS_KEY = "promptstudio.promptStudio.settings.v1";
 const IMAGE_CONSULT_SETTINGS_KEY = "promptstudio.promptStudio.consult.settings.v1";
-const IMAGE_LLM_PROFILES_KEY = "promptstudio.promptStudio.llmProfiles.v1";
 const CANVAS_MEDIA_ROLES = new Set(["first_frame", "last_frame", "video_edit", "video_continue"]);
 const DIRECTOR_MAX_IMAGES = 4;
 const DIRECTOR_IMAGE_USAGES = Object.freeze([
@@ -106,6 +129,10 @@ const state = {
   projectSavedMutation: 0,
   projectSaveTimer: null,
   projectSaveChain: Promise.resolve(),
+  projectBase: [],
+  projectConflicts: [],
+  projectDraftKey: "",
+  projectDraftError: "",
   workflows: [],
   workflowRevision: 0,
   defaultWorkflowSetupPrompted: false,
@@ -168,6 +195,7 @@ function makeId(prefix) {
 
 function el(tag, className = "", text = "") {
   const element = document.createElement(tag);
+  if (tag === "dialog") installDialogFocus(element);
   if (className) element.className = className;
   if (text) element.textContent = text;
   return element;
@@ -243,8 +271,7 @@ function storedObject(key) {
 }
 
 function primaryLlmProfile(studioSettings) {
-  const store = storedObject(IMAGE_LLM_PROFILES_KEY);
-  const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+  const profiles = loadLlmProfiles();
   const selected = String(studioSettings?.llm_profile || "");
   return profiles.find(profile => String(profile?.id || "") === selected) || {};
 }
@@ -276,7 +303,7 @@ function directorSettings() {
   const responseTokens = !Object.hasOwn(video, "max_response_tokens") || storedResponseTokens === 700
     ? 0
     : Math.max(0, Math.min(131072, Number.isFinite(storedResponseTokens) ? storedResponseTokens : 0));
-  return {
+  const settings = {
     llm_provider: provider,
     kobold_url: studio.kobold_url || video.kobold_url || "http://localhost:5001",
     ollama_url: studio.ollama_url || video.ollama_url || "http://localhost:11434",
@@ -305,6 +332,7 @@ function directorSettings() {
       ? 600
       : Math.max(5, Math.min(3600, Number.isFinite(storedTimeout) ? storedTimeout : 600)),
   };
+  return { ...normalizeProviderSettings(settings), context_budget_chars: settings.context_budget_chars };
 }
 
 function directorControlValue(dialog, id) {
@@ -312,8 +340,7 @@ function directorControlValue(dialog, id) {
 }
 
 function normalizeLlmProvider(value) {
-  const provider = String(value || "").trim().toLowerCase();
-  return ["koboldcpp", "ollama", "llamacpp"].includes(provider) ? provider : "koboldcpp";
+  return sharedLlmProvider(value);
 }
 
 function llmProviderDisplayName(provider) {
@@ -458,13 +485,7 @@ async function refreshKoboldStatus() {
   }
   state.koboldStatusRequest = (async () => {
     try {
-      const response = await api.fetchApi(LLM_STATUS_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `${llmProviderDisplayName(settings.llm_provider)} status failed (${response.status}).`);
+      const data = await readSharedHealth(LLM_STATUS_ENDPOINT,settings);
       renderLlmStatus(data);
       return data;
     } catch (error) {
@@ -533,10 +554,15 @@ async function restartComfyUIFromStatus() {
   }
 }
 
+let videoPollingScope;
+function studioPollingScope() {
+  return videoPollingScope ||= createPollingScope({visible:() => Boolean(state.panel && !state.panel.hidden
+    && !state.panel.closest('.promptstudio-studio-view')?.hidden && !state.panel.ownerDocument.hidden)});
+}
 function startKoboldStatusMonitor() {
   if (state.koboldStatusTimer) return;
-  refreshKoboldStatus();
-  state.koboldStatusTimer = window.setInterval(refreshKoboldStatus, KOBOLD_STATUS_POLL_MS);
+  state.koboldStatusTimer = studioPollingScope().add(refreshKoboldStatus,{interval:KOBOLD_STATUS_POLL_MS,
+    background:() => state.directorBusy || state.generationPollers.size > 0});
 }
 
 function directorSessions() {
@@ -569,14 +595,14 @@ function persistDirectorSessions() {
   const sessions = directorSessions();
   for (const session of Object.values(sessions)) {
     if (!Array.isArray(session?.messages)) continue;
-    session.messages = session.messages.slice(-30).map(message => {
+    session.messages = session.messages.map(message => {
       if (message?.role === "assistant") ensureDirectorVariants(message);
       return {
         ...message,
-        text: String(message?.text || "").slice(0, 4000),
+        text: String(message?.text || ""),
         variants: Array.isArray(message?.variants) ? message.variants.map(variant => ({
           ...variant,
-          text: String(variant?.text || "").slice(0, 4000),
+          text: String(variant?.text || ""),
         })) : undefined,
       };
     });
@@ -584,20 +610,24 @@ function persistDirectorSessions() {
   const retained = Object.fromEntries(
     Object.entries(sessions)
       .sort((a, b) => Number(b[1]?.updated_at || 0) - Number(a[1]?.updated_at || 0))
-      .slice(0, 20)
       .map(([id, session]) => [id, {
         scope: session?.scope === "project" ? "project" : "shot",
         updated_at: Number(session?.updated_at || Date.now()),
         last_context_usage: session?.last_context_usage || null,
         pending_plan: session?.pending_plan || null,
         pending_job: session?.pending_job || null,
+        draft_attachments: session?.draft_attachments || [],
         messages: Array.isArray(session?.messages) ? session.messages : [],
       }]),
   );
+  const archive = {sessions:retained,mutation:Date.now()};
+  videoDraftOutbox.put(draftTabKey("video-director"),archive).catch(error => {
+    showDraftStorageFailure(state.panel?.querySelector(".psvstudio-sidebar"),archive,error.message);
+  });
   try {
     localStorage.setItem(DIRECTOR_SESSIONS_KEY, JSON.stringify(retained));
   } catch (_) {
-    // Chat remains available for the current page when storage is unavailable.
+    // IndexedDB retains the full archive; failures above expose a draft export.
   }
 }
 
@@ -636,6 +666,17 @@ function directorShotLabel(project = activeProject(), shot = selectedShot(projec
 
 function directorProposalFields(proposal) {
   const rows = [];
+  const protectedLabels = {dialogue: "Spoken lines", lyrics: "Lyrics", speaker_ids: "Speaker IDs", visible_text: "Visible text"};
+  for (const change of proposal?.protected_content_changes || []) {
+    const display = value => Array.isArray(value)
+      ? `${value[0]}${value[2] ? ` (${value[2]})` : ""}${value[1] ? ` [${value[1]}]` : ""}`
+      : String(value);
+    for (const [key, label] of [["removed", "Removed"], ["added", "Added"]]) {
+      for (const value of change[key] || []) rows.push({
+        name: `${protectedLabels[change.kind] || change.kind} · ${label}`, value: display(value),
+      });
+    }
+  }
   for (const operation of proposal?.operations || []) {
     if (operation.replace === true) {
       const target = operation.op === "update_project"
@@ -1054,20 +1095,30 @@ function renderDirectorDialog() {
       : "Revise this shot using exact labels such as <Picture 1> and <Picture 2>.";
   }
   const history = dialog.querySelector("#psvstudio-director-history");
-  history.replaceChildren();
+  const namespace = directorSessionId(project.id);
+  const stickToEnd = history.dataset.historySession !== namespace
+    || history.scrollHeight - history.scrollTop - history.clientHeight < 80;
+  history.dataset.historySession = namespace;
+  const rows = [];
+  const addRow = (id, signature, create) => rows.push({id, signature, create});
   const session = directorSession(project.id);
   const directorBusy = Boolean(session.pending_job) || state.directorBusy;
   if (session.pending_plan) {
     input.placeholder = "Answer the Director's clarification to continue the pending plan…";
   }
   if (!session.messages.length) {
-    history.append(el("div", "psvstudio-director-empty", projectScope
+    addRow("empty", String(projectScope), () => el("div", "psvstudio-director-empty", projectScope
       ? "Ask for a full-video critique, alternatives, or a multi-shot composition. Only approved proposals can change the project."
       : "Ask for advice, alternatives, or a concrete revision. Only approved proposals can change the selected shot."));
   }
   for (const [messageIndex, message] of session.messages.entries()) {
     if (message.role === "assistant") ensureDirectorVariants(message);
+    const last = messageIndex === session.messages.length - 1;
+    addRow(`message:${message.id}`, JSON.stringify([message, last,
+      last || message.proposal || message.clarification ? directorBusy : null,
+      message.attachments?.length ? project.document.references : null]), () => {
     const card = el("article", `psvstudio-director-message is-${message.role}`);
+    card.dataset.messageId = message.id;
     card.append(el("small", "", message.role === "user" ? "You" : "Director"), el("div", "psvstudio-director-message-text", message.text));
     if (message.attachments?.length) {
       const attached = el("div", "psvstudio-director-message-attachments");
@@ -1157,9 +1208,11 @@ function renderDirectorDialog() {
       controls.append(next);
       card.append(controls);
     }
-    history.append(card);
+    return card;
+    });
   }
   if (directorBusy && session.pending_job?.progress) {
+    addRow("pending", session.pending_job.progress, () => {
     const pending = el("article", "psvstudio-director-message is-assistant is-pending");
     const pendingText = el("div", "psvstudio-director-message-text", session.pending_job.progress);
     pendingText.dataset.directorPending = "true";
@@ -1168,8 +1221,12 @@ function renderDirectorDialog() {
     const cancel = button("Cancel", () => cancelDirectorSessionJob(project.id, state.directorScope));
     cancel.classList.add("psvstudio-director-cancel");
     pending.append(el("small", "", "Director"), pendingText, cancel);
-    history.append(pending);
+    return pending;
+    });
   }
+  reconcileKeyedHistory(history, rows, {
+    namespace, signature: row => row.signature, create: row => row.create(),
+  });
   const usage = session.last_context_usage;
   const status = dialog.querySelector("#psvstudio-director-status");
   if (!directorBusy && usage) {
@@ -1185,7 +1242,7 @@ function renderDirectorDialog() {
   const clear = dialog.querySelector("#psvstudio-director-clear");
   if (clear) clear.disabled = directorBusy;
   renderDirectorAttachments();
-  history.scrollTop = history.scrollHeight;
+  if (stickToEnd) history.scrollTop = history.scrollHeight;
 }
 
 function clearDirectorSession() {
@@ -1239,7 +1296,7 @@ function ensureDirectorDialog() {
       <div id="psvstudio-director-attachments" class="psvstudio-director-attachments is-empty"></div>
       <textarea id="psvstudio-director-input" rows="3" aria-label="Director message" placeholder="Ask about this shot or request a concrete revision…"></textarea>
       <div class="psvstudio-director-composer-actions"><small id="psvstudio-director-status">Only the selected shot is in write scope.</small><div class="psvstudio-inline"><button id="psvstudio-director-add-image" class="psvstudio-button" type="button">Add image</button><button id="psvstudio-director-send" class="psvstudio-button psvstudio-button-primary" type="button">Ask Director</button></div></div>
-      <input id="psvstudio-director-image-input" class="psvstudio-sr-only" type="file" accept="image/*" multiple />
+      <input id="psvstudio-director-image-input" class="psvstudio-sr-only" type="file" aria-label="Attach images to the Director" accept="image/*" multiple />
       </div>
     </div>
     </div>
@@ -1325,6 +1382,7 @@ function directorRequestPayload(project, shot, scope, attachments, messages, job
     ...saveDirectorSettings(state.directorDialog),
     async: true,
     job_id: jobId,
+    origin: { project_id: project.id, message_id: messages.at(-1)?.id || "" },
     project_name: project.name,
     brief: project.brief,
     document: clone(project.document),
@@ -1364,7 +1422,10 @@ async function requestDirectorResponse(pending, sessionId) {
       continue;
     }
     let data = await response.json().catch(() => ({}));
+    const recovered = recoveredJobError(data);
+    if (recovered) throw recovered;
     if (!response.ok) {
+      if (data.retryable === false) throw new Error(data.error || "Director request failed.");
       if (response.status >= 500) {
         setDirectorProgress("Director service is temporarily unavailable; retrying...", sessionId);
         await waitForDirectorRetry();
@@ -1437,6 +1498,7 @@ function directorJobStatusText(job) {
 
 async function pollDirectorJob(jobId, sessionId) {
   let statusFailures = 0;
+  let previousStatus = null;
   while (true) {
     await new Promise(resolve => setTimeout(resolve, DIRECTOR_JOB_POLL_MS));
     let response;
@@ -1458,9 +1520,13 @@ async function pollDirectorJob(jobId, sessionId) {
       throw new Error(job.error || `Director status check failed (${response.status}).`);
     }
     statusFailures = 0;
-    if (job.status === "complete") return job.result || {};
-    if (job.status === "failed") throw new Error(job.error || "Director request failed.");
-    if (job.status === "cancelled") throw new DOMException("Director request was cancelled.", "AbortError");
+    const checkedJob = normalizeJobWire({ ...job, job_id: jobId });
+    if (previousStatus) assertObservedJobTransition(previousStatus, checkedJob.status);
+    previousStatus = checkedJob.status;
+    if (checkedJob.status === "complete") return checkedJob.result || {};
+    if (checkedJob.status === "failed") throw recoveredJobError(job)
+      || new Error(`${checkedJob.error || "Director request failed."} ${jobRetryText(job.job)}`);
+    if (checkedJob.status === "cancelled") throw new DOMException("Director request was cancelled.", "AbortError");
     setDirectorProgress(directorJobStatusText(job), sessionId);
   }
 }
@@ -2317,45 +2383,11 @@ function clearMediaDrag(doc) {
   doc.body?.classList.remove("psvstudio-media-drag-active");
 }
 
+let videoDocumentInteractionController = null;
 function installMediaDrop(doc) {
-  if (!doc || state.mediaDropDocuments.has(doc)) return;
-  state.mediaDropDocuments.add(doc);
-  const activeHere = () => state.panel?.ownerDocument === doc && !state.panel.hidden;
-  const targetsDirector = event => event.composedPath().some(target =>
-    target?.classList?.contains("psvstudio-director-dialog") && target.open
-  );
-  doc.addEventListener("dragenter", event => {
-    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
-    event.preventDefault();
-    state.mediaDropDepth.set(doc, (state.mediaDropDepth.get(doc) || 0) + 1);
-    doc.body?.classList.add("psvstudio-media-drag-active");
-  }, true);
-  doc.addEventListener("dragover", event => {
-    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-  }, true);
-  doc.addEventListener("dragleave", event => {
-    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
-    const depth = Math.max(0, (state.mediaDropDepth.get(doc) || 0) - 1);
-    state.mediaDropDepth.set(doc, depth);
-    if (!depth || !event.relatedTarget) clearMediaDrag(doc);
-  }, true);
-  doc.addEventListener("drop", event => {
-    if (!activeHere() || !isFileDrag(event) || targetsDirector(event)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    clearMediaDrag(doc);
-    addMediaFiles(event.dataTransfer.files);
-  }, true);
-  doc.addEventListener("paste", event => {
-    if (!activeHere() || targetsDirector(event)) return;
-    const files = clipboardImageFiles(event);
-    if (!files.length) return;
-    event.preventDefault();
-    event.stopPropagation();
-    addMediaFiles(files);
-  }, true);
+  videoDocumentInteractionController ||= createVideoDocumentInteractionController({ state, isFileDrag,
+    clearMediaDrag, addMediaFiles, clipboardImageFiles, closeSystemStatus, closeVideoDrawer });
+  videoDocumentInteractionController.mount(doc);
 }
 
 function activeProject() {
@@ -2548,40 +2580,7 @@ function resolvedTurboProfile(project) {
   const width = Number(project.document.width);
   const height = Number(project.document.height);
   const preset = String(inputs.preset || "auto_quality");
-  let profile;
-  if (mode === "ref2va") {
-    profile = {
-      label: "REF2V v0.1",
-      input: "ref2va_4step_lora",
-      steps: 4,
-      shiftVideo: 12,
-      shiftAudio: 3,
-    };
-  } else if (width === 1344 && height === 768) {
-    profile = {
-      label: "FL2V 768p v1.0",
-      input: "fl2va_768p_4step_lora",
-      steps: 4,
-      shiftVideo: 6,
-      shiftAudio: 3,
-    };
-  } else if (preset === "fast_4step") {
-    profile = {
-      label: "FL2V mixed v0.1",
-      input: "fl2va_mixed_4step_lora",
-      steps: 4,
-      shiftVideo: 12,
-      shiftAudio: 3,
-    };
-  } else {
-    profile = {
-      label: "FL2V mixed v1.0",
-      input: "fl2va_mixed_8step_lora",
-      steps: 8,
-      shiftVideo: 12,
-      shiftAudio: 3,
-    };
-  }
+  const profile = turboDisplayProfile(mode, width, height, preset);
 
   const loraPath = String(inputs[profile.input] || "");
   return {
@@ -2648,27 +2647,7 @@ function closeVideoDrawer({ restoreFocus = false } = {}) {
 }
 
 function installTransientUiDismissal(ownerDocument) {
-  if (!ownerDocument || state.transientUiDocuments.has(ownerDocument)) return;
-  state.transientUiDocuments.add(ownerDocument);
-  ownerDocument.addEventListener("pointerdown", event => {
-    if (!state.panel || state.panel.hidden || state.panel.ownerDocument !== ownerDocument) return;
-    const control = state.panel.querySelector("#psvstudio-kobold-control");
-    if (control?.open && !control.contains(event.target)) closeSystemStatus();
-  }, { capture: true });
-  ownerDocument.addEventListener("keydown", event => {
-    if (
-      event.defaultPrevented
-      || event.key !== "Escape"
-      || !state.panel
-      || state.panel.hidden
-      || state.panel.ownerDocument !== ownerDocument
-      || state.panel.querySelector("dialog[open]")
-    ) return;
-    if (closeSystemStatus({ restoreFocus: true }) || closeVideoDrawer({ restoreFocus: true })) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  }, { capture: true });
+  installMediaDrop(ownerDocument);
 }
 
 function isVideoStudioControl(control) {
@@ -2708,8 +2687,10 @@ function setSaveState(message) {
 }
 
 function markProjectChanged({ render = false, project = activeProject() } = {}) {
+  if (project?.pending_generation_restore && !pendingGenerationRestore(project)) delete project.pending_generation_restore;
   if (project) project.updated_at = Date.now();
   state.projectMutation += 1;
+  projectDraftScheduler.schedule();
   const presence = videoStudioStatus();
   const presenceSignature = JSON.stringify([
     presence.open,
@@ -2723,36 +2704,267 @@ function markProjectChanged({ render = false, project = activeProject() } = {}) 
   if (render) renderAll();
 }
 
+// Arrays with IDs represent records. Shots and existing generations are atomic:
+// a conflict must never assemble a new shot or historical snapshot from two edits.
+function mergeProjectVersions(base, local, remote, conflicts = [], path = "projects", choices = null) {
+  if (choices?.has(path)) return clone(choices.get(path) === "local" ? local : remote);
+  const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  if (equal(local, remote) || equal(remote, base)) return clone(local);
+  if (equal(local, base)) return clone(remote);
+  if (path.endsWith(".updated_at")) return Math.max(Number(local) || 0, Number(remote) || 0);
+  const objects = [base, local, remote].every(value => value && typeof value === "object" && !Array.isArray(value));
+  const atomic = /\.(shots|generations)\[[^\]]+\]$/.test(path);
+  if (objects && !atomic) {
+    const result = {};
+    for (const key of new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])) {
+      const value = mergeProjectVersions(base[key], local[key], remote[key], conflicts, `${path}.${key}`, choices);
+      if (value !== undefined) result[key] = value;
+    }
+    return result;
+  }
+  const records = [base, local, remote].every(value => Array.isArray(value)
+    && value.every(item => item && typeof item.id === "string")
+    && new Set(value.map(item => item.id)).size === value.length);
+  if (records) {
+    const maps = [base, local, remote].map(items => new Map(items.map(item => [item.id, item])));
+    const ids = [...new Set([...local, ...remote, ...base].map(item => item.id))];
+    // Shot order carries timing semantics; divergent reordering needs review.
+    const order = values => values.filter(item => maps[0].has(item.id)).map(item => item.id);
+    if (path.endsWith(".shots") && !equal(order(local), order(base))
+      && !equal(order(remote), order(base)) && !equal(order(local), order(remote))) {
+      conflicts.push({ path, local: clone(local), remote: clone(remote) });
+      return clone(local);
+    }
+    const orderedIds = path.endsWith(".shots") && equal(order(local), order(base))
+      ? [...new Set([...remote, ...local, ...base].map(item => item.id))] : ids;
+    return orderedIds.map(id => mergeProjectVersions(...maps.map(map => map.get(id)), conflicts, `${path}[${id}]`, choices))
+      .filter(value => value !== undefined);
+  }
+  conflicts.push({ path, local: clone(local), remote: clone(remote) });
+  return clone(local);
+}
+
+function projectDraftKey() {
+  if (!state.projectDraftKey) {
+    const key = "promptstudio.video.projects.draft-tab.v1";
+    const id = sessionStorage.getItem(key) || makeId("draft");
+    sessionStorage.setItem(key, id);
+    state.projectDraftKey = `promptstudio.video.projects.draft.v1.${id}`;
+  }
+  return state.projectDraftKey;
+}
+
+function writeProjectDraft() {
+  projectDraftScheduler.cancel();
+  const record = {version:1, mutation:state.projectMutation,
+    base:clone(state.projectBase), projects:clone(state.projects), revision:state.projectRevision,
+    active_project_id:state.activeProjectId, saved_at:Date.now()};
+  videoDraftPending = videoDraftOutbox.put(draftTabKey("video"),record).then(() => {
+    state.projectDraftError = "";
+    return true;
+  }).catch(error => {
+    state.projectDraftError = `Browser draft could not be stored: ${error.message || error}`;
+    showDraftStorageFailure(state.panel?.querySelector(".psvstudio-sidebar"),record,state.projectDraftError);
+    return false;
+  });
+  try {
+    localStorage.setItem(projectDraftKey(), JSON.stringify(record));
+    state.projectDraftError = "";
+    return true;
+  } catch (error) {
+    state.projectDraftError = `Browser draft could not be stored: ${error.message || error}`;
+    return false;
+  }
+}
+
+// Keep objects held by running preparations/pollers attached to the live store.
+function applyProjectMerge(projects) {
+  const reconcile = (current, next) => {
+    if (Array.isArray(next)) {
+      const previous = new Map((Array.isArray(current) ? current : []).filter(item => item?.id).map(item => [item.id, item]));
+      return next.map(item => item?.id ? reconcile(previous.get(item.id), item) : clone(item));
+    }
+    if (next && typeof next === "object") {
+      const target = current && typeof current === "object" && !Array.isArray(current) ? current : {};
+      for (const key of Object.keys(target)) if (!(key in next)) delete target[key];
+      for (const [key, value] of Object.entries(next)) target[key] = reconcile(target[key], value);
+      return target;
+    }
+    return next;
+  };
+  state.projects = reconcile(state.projects, projects);
+  if (!state.projects.some(project => project.id === state.activeProjectId)) state.activeProjectId = state.projects[0]?.id || null;
+}
+
+function showProjectSaveFailure(error) {
+  const durable = writeProjectDraft();
+  setSaveState(state.projectConflicts.length ? "Save conflict" : "Save failed");
+  setStatus(`${error.message || error} ${durable ? "Local draft retained." : state.projectDraftError}`, "error");
+  const status = state.panel?.querySelector("#psvstudio-save-state");
+  if (!status) return;
+  const button = status.ownerDocument.createElement("button");
+  button.textContent = state.projectConflicts.length ? "Review conflicts" : "Retry save";
+  button.addEventListener("click", () => state.projectConflicts.length ? reviewProjectConflicts() : persistProjects());
+  status.append(" ", button);
+}
+
+async function reviewProjectConflicts() {
+  const view = state.panel?.ownerDocument.defaultView;
+  if (!view || !state.projectConflicts.length) return;
+  // Review against a fresh server version. Cancellation leaves the draft/base intact.
+  try {
+    const remote = await fetchProjectStore();
+    const conflicts = [];
+    const reconciled = mergeProjectVersions(state.projectBase, state.projects, remote.projects, conflicts);
+    if (!conflicts.length) {
+      applyProjectMerge(reconciled);
+      state.projectBase = clone(remote.projects);
+      state.projectRevision = Number(remote.revision || 0);
+      state.projectConflicts = [];
+      writeProjectDraft();
+      renderAll();
+      await persistProjects();
+      return;
+    }
+    const choices = new Map();
+    for (const conflict of conflicts) {
+      const display = value => value === undefined ? "(deleted)" : JSON.stringify(value, null, 2);
+      const doc = state.panel.ownerDocument;
+      const dialog = doc.createElement("dialog");
+      dialog.className = "psvstudio-save-conflict";
+      dialog.setAttribute("aria-label", `Conflicting edits: ${conflict.path}`);
+      dialog.style.cssText = "max-width:min(900px,90vw);max-height:90vh;overflow:auto";
+      const heading = doc.createElement("h2");
+      heading.textContent = conflict.path.endsWith(".name") ? "Conflicting project names"
+        : conflict.path.includes(".shots[") ? "Conflicting shot edits"
+          : conflict.path.includes(".generations[") ? "Conflicting generation records" : "Conflicting project edits";
+      dialog.append(heading);
+      for (const [label, value] of [["Your draft", conflict.local], ["Server version", conflict.remote]]) {
+        const details = doc.createElement("details");
+        details.open = true;
+        const summary = doc.createElement("summary");
+        summary.textContent = label;
+        const pre = doc.createElement("pre");
+        pre.textContent = display(value);
+        pre.style.cssText = "white-space:pre-wrap;max-height:35vh;overflow:auto";
+        details.append(summary, pre);
+        dialog.append(details);
+      }
+      const choice = await new Promise(resolve => {
+        for (const [label, value] of [["Keep my version", "local"], ["Use server version", "remote"], ["Cancel", "cancel"]]) {
+          const button = doc.createElement("button");
+          button.textContent = label;
+          button.addEventListener("click", () => { resolve(value); dialog.close(); });
+          dialog.append(button);
+        }
+        dialog.addEventListener("cancel", () => resolve("cancel"), { once: true });
+        doc.body.append(dialog);
+        dialog.showModal();
+      });
+      dialog.remove();
+      if (choice === "cancel") return;
+      choices.set(conflict.path, choice);
+    }
+    // Only resolve the exact values reviewed; editing during review requires a fresh review.
+    const current = [];
+    mergeProjectVersions(state.projectBase, state.projects, remote.projects, current);
+    if (JSON.stringify(current) !== JSON.stringify(conflicts)) throw new Error("Projects changed during review. Review conflicts again.");
+    applyProjectMerge(mergeProjectVersions(state.projectBase, state.projects, remote.projects, [], "projects", choices));
+    state.projectBase = clone(remote.projects);
+    state.projectRevision = Number(remote.revision || 0);
+    state.projectConflicts = [];
+    state.projectMutation += 1;
+    writeProjectDraft();
+    renderAll();
+    await persistProjects();
+  } catch (error) { showProjectSaveFailure(error); }
+}
+
+async function fetchProjectStore({ page = false, cursor = null } = {}) {
+  const params = new URLSearchParams();
+  if (page) {
+    params.set("limit", "20");
+    params.set("include_active", "1");
+    params.set("include_pending", "1");
+    if (cursor) {
+      params.set("before_updated", String(cursor.updated_at));
+      params.set("before_created", String(cursor.created_at));
+      params.set("before_id", cursor.id);
+    }
+  }
+  const url = `${PROJECTS_ENDPOINT}${params.size ? `?${params}` : ""}`;
+  let response = await api.fetchApi(url);
+  let data = await response.json().catch(() => ({}));
+  if (!response.ok || !Array.isArray(data.projects)) throw new Error(data.error || "Video projects could not be loaded.");
+  if (await prepareHistoryIndex(data, state.panel?.querySelector('.psvstudio-sidebar'), PROJECTS_ENDPOINT,
+      async () => { await loadProjects(); renderAll(); resumeGenerationPolling(); })) {
+    response = await api.fetchApi(url);
+    data = await response.json().catch(() => ({}));
+    if (!response.ok || !Array.isArray(data.projects)) throw new Error(data.error || "Video projects could not be loaded.");
+  }
+  requireHistoryIndex(data, state.panel?.querySelector('.psvstudio-sidebar'), PROJECTS_ENDPOINT, async () => { await loadProjects(); renderAll(); resumeGenerationPolling(); });
+  return data;
+}
+
 async function persistProjects({ immediate = false } = {}) {
   if (state.projectSaveTimer) clearTimeout(state.projectSaveTimer);
   state.projectSaveTimer = null;
-  const mutation = state.projectMutation;
-  if (!immediate && mutation === state.projectSavedMutation) return;
+  if (!immediate && state.projectMutation === state.projectSavedMutation) return { ok: true };
+  writeProjectDraft();
   const operation = state.projectSaveChain.catch(() => {}).then(async () => {
-    const payload = {
-      version: 2,
-      revision: state.projectRevision,
-      active_project_id: state.activeProjectId,
-      projects: clone(state.projects),
-    };
-    const response = await api.fetchApi(PROJECTS_ENDPOINT, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `Projects could not be saved (${response.status}).`);
-    state.projectRevision = Number(data.revision || state.projectRevision);
-    state.projectSavedMutation = Math.max(state.projectSavedMutation, mutation);
-    setSaveState(state.projectSavedMutation === state.projectMutation ? "Saved" : "Saving…");
-    if (state.projectSavedMutation !== state.projectMutation) persistProjects();
+    if (state.projectConflicts.length) throw new Error("Review competing project edits before saving.");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const mutation = state.projectMutation;
+      const savedSnapshot = clone(state.projects);
+      const baseline = new Map(state.projectBase.map(project => [project.id, JSON.stringify(project)]));
+      const payload = {
+        version: 2,
+        revision: state.projectRevision,
+        active_project_id: state.activeProjectId,
+        partial: true,
+        projects: savedSnapshot.filter(project => baseline.get(project.id) !== JSON.stringify(project)),
+        deletedProjectIds: state.projectBase.filter(project => !savedSnapshot.some(item => item.id === project.id)).map(project => project.id),
+      };
+      const response = await api.fetchApi(PROJECTS_ENDPOINT, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.status === 409) {
+        const remote = await fetchProjectStore();
+        const conflicts = [];
+        const merged = mergeProjectVersions(state.projectBase, state.projects, remote.projects, conflicts);
+        state.projectConflicts = conflicts;
+        if (conflicts.length) throw new Error(`Competing edits at ${conflicts.map(item => item.path).join(", ")}. Review conflicts before saving.`);
+        applyProjectMerge(merged);
+        state.projectBase = clone(remote.projects);
+        state.projectRevision = Number(remote.revision || 0);
+        writeProjectDraft();
+        renderAll();
+        continue;
+      }
+      if (!response.ok) throw new Error(data.error || `Projects could not be saved (${response.status}).`);
+      state.projectRevision = Number(data.revision || state.projectRevision);
+      state.projectBase = savedSnapshot;
+      state.projectConflicts = [];
+      state.projectSavedMutation = Math.max(state.projectSavedMutation, mutation);
+      await videoDraftPending;
+      await videoDraftOutbox.acknowledge(draftTabKey("video"),mutation).catch(() => {});
+      setSaveState(state.projectSavedMutation === state.projectMutation ? "Saved" : "Saving…");
+      if (state.projectSavedMutation !== state.projectMutation) { writeProjectDraft(); persistProjects(); }
+      else { try { localStorage.removeItem(projectDraftKey()); } catch (_) { /* Saving succeeded; an old draft is safe to reconcile. */ } }
+      return { ok: true, revision: state.projectRevision };
+    }
+    throw new Error("Projects kept changing in another browser. Retry save.");
   });
   state.projectSaveChain = operation;
   try {
-    await operation;
+    return await operation;
   } catch (error) {
-    setSaveState("Save failed");
-    setStatus(error.message || String(error), "error");
+    showProjectSaveFailure(error);
+    if (immediate) throw error;
+    return { ok: false, error };
   }
 }
 
@@ -2764,14 +2976,63 @@ async function loadConfig() {
 }
 
 async function loadProjects() {
-  const response = await api.fetchApi(PROJECTS_ENDPOINT);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "Video projects could not be loaded.");
+  try {
+    const archive = await videoDraftOutbox.get(draftTabKey("video-director"));
+    if (archive?.sessions) state.directorSessions = archive.sessions;
+  } catch (_) { /* The existing local archive remains available. */ }
+  const data = await fetchProjectStore({page: true});
+  state.projectPageCursor = data.nextCursor || null;
+  state.projectHasMore = Boolean(data.hasMore);
   state.projects = Array.isArray(data.projects) ? data.projects : [];
+  state.projectBase = clone(state.projects);
   state.projectRevision = Number(data.revision || 0);
   state.activeProjectId = data.active_project_id || state.projects[0]?.id || null;
   state.selectedShotId = activeProject()?.document?.shots?.[0]?.id || null;
   state.projectMutation = state.projectSavedMutation = 0;
+  let draft;
+  try { draft = await videoDraftOutbox.get(draftTabKey("video")); }
+  catch (error) { showDraftStorageFailure(state.panel?.querySelector(".psvstudio-sidebar"),{},error.message); }
+  try { draft ||= JSON.parse(localStorage.getItem(projectDraftKey()) || "null"); } catch (_) { /* Keep unreadable drafts intact. */ }
+  if (draft?.version === 1 && Array.isArray(draft.base) && Array.isArray(draft.projects)) {
+    const conflicts = [];
+    const remote = await fetchProjectStore();
+    state.projectBase = clone(remote.projects);
+    state.projectRevision = Number(remote.revision || 0);
+    const merged = mergeProjectVersions(draft.base, draft.projects, remote.projects, conflicts);
+    applyProjectMerge(merged);
+    state.activeProjectId = state.projects.some(project => project.id === draft.active_project_id) ? draft.active_project_id : state.activeProjectId;
+    state.selectedShotId = activeProject()?.document?.shots?.[0]?.id || null;
+    state.projectConflicts = conflicts;
+    if (conflicts.length) state.projectBase = clone(draft.base);
+    state.projectMutation = 1;
+    // A draft may have been saved immediately before a queue response was lost.
+    // Never resubmit recovered preparations automatically.
+    for (const project of state.projects) for (const generation of project.generations || []) {
+      if (!generation.prompt_id && ["validating", "compiling", "queueing"].includes(generation.status)) {
+        generation.status = "error";
+        generation.error = "Recovered unsaved preparation. Check the ComfyUI queue before generating again.";
+      }
+    }
+    showProjectSaveFailure(new Error(conflicts.length ? "Recovered draft has competing server edits." : "Recovered unsaved video draft. Retry save to store it."));
+  }
+}
+
+async function loadOlderProjects() {
+  if (state.projectPageLoading || !state.projectHasMore) return;
+  state.projectPageLoading = true;
+  renderProjectList();
+  try {
+    const data = await fetchProjectStore({page: true, cursor: state.projectPageCursor});
+    for (const project of data.projects) {
+      if (state.projects.some(item => item.id === project.id) || state.projectBase.some(item => item.id === project.id)) continue;
+      state.projects.push(project);
+      state.projectBase.push(clone(project));
+    }
+    state.projectPageCursor = data.nextCursor || null;
+    state.projectHasMore = Boolean(data.hasMore);
+    resumeGenerationPolling();
+  } catch (error) { setStatus(error.message, "warning"); }
+  finally { state.projectPageLoading = false; renderProjectList(); }
 }
 
 function createProjectRecord() {
@@ -2846,7 +3107,7 @@ function deleteProject(projectId) {
   state.projectMutation += 1;
   setSaveState("Saving...");
   renderAll();
-  persistProjects({ immediate: true });
+  persistProjects();
   setStatus(`Deleted video session "${project.name || "Untitled video"}".`, "ready");
 }
 
@@ -2979,42 +3240,7 @@ function isVideoWorkflowPath(path) {
   return filename.startsWith(WORKFLOW_PREFIX) && filename.toLowerCase().endsWith(".json");
 }
 
-async function buildWorkflowTemplate(file, workflowData) {
-  const Graph = app.rootGraph?.constructor || app.graph?.constructor;
-  if (typeof Graph !== "function") throw new Error("ComfyUI's workflow graph is not ready.");
-  const graph = new Graph();
-  const configureErrors = graph.configure(clone(workflowData));
-  if (Array.isArray(configureErrors) && configureErrors.length) {
-    throw new Error(`ComfyUI could not configure ${configureErrors.length} workflow node${configureErrors.length === 1 ? "" : "s"}.`);
-  }
-  const snapshot = clone(await app.graphToPrompt(graph));
-  const output = snapshot.output || {};
-  const directors = Object.entries(output).filter(([, node]) => node?.class_type === DIRECTOR_TYPE);
-  if (directors.length !== 1) {
-    throw new Error(`Workflow needs exactly one executable Prompt Studio MiniMax H3 Director; found ${directors.length}.`);
-  }
-  const saveVideoNodes = Object.entries(output).filter(([, node]) => node?.class_type === "SaveVideo");
-  if (saveVideoNodes.length !== 1) {
-    throw new Error(`Workflow needs exactly one executable native Save Video node; found ${saveVideoNodes.length}.`);
-  }
-  const additionalInputs = extractPromptStudioInputs(graph, snapshot, workflowData);
-  return {
-    id: file.path,
-    path: file.path,
-    name: workflowNameFromPath(file.path),
-    adapter: "minimax_h3",
-    director_node_id: String(directors[0][0]),
-    result_node_ids: [String(saveVideoNodes[0][0])],
-    result_fields: ["videos", "gifs", "images"],
-    additionalInputs,
-    promptStudioInputVersion: PROMPT_STUDIO_INPUT_PROFILE_VERSION,
-    snapshot,
-    source_modified: Number(file.modified || 0),
-    updated_at: Date.now(),
-    stale: false,
-    error: "",
-  };
-}
+const buildWorkflowTemplate = createVideoWorkflowTemplateBuilder({ app });
 
 async function loadWorkflowCache() {
   const response = await api.fetchApi(WORKFLOWS_ENDPOINT);
@@ -3123,7 +3349,9 @@ async function pollDefaultSetup(jobId) {
       const completed = formatSetupBytes(job.downloaded_bytes);
       const total = formatSetupBytes(job.total_bytes);
       const current = job.current_model ? ` · ${job.current_model}` : "";
-      setStatus(`Installing default workflow models: ${completed} / ${total}${current}`, "busy");
+      setStatus(job.stage === "verifying"
+        ? `Verifying downloaded model integrity${current}…`
+        : `Installing default workflow models: ${completed} / ${total}${current}`, "busy");
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   } catch (error) {
@@ -3189,26 +3417,16 @@ async function refreshWorkflows({ announce = true } = {}) {
   try {
     const response = await api.fetchApi("/userdata?dir=workflows&recurse=true&full_info=true");
     if (!response.ok) throw new Error(`ComfyUI workflows could not be listed (${response.status}).`);
-    const files = (await response.json())
-      .filter(file => file && typeof file.path === "string" && isVideoWorkflowPath(file.path))
-      .sort((left, right) => left.path.localeCompare(right.path));
+    const files = discoverWorkflowFiles(await response.json(), "[PSV]");
     for (const file of files) {
       const old = cached.get(file.path);
-      if (
-        old && !old.stale
-        && Number(old.source_modified || 0) === Number(file.modified || 0)
-        && Number(old.promptStudioInputVersion || 0) === PROMPT_STUDIO_INPUT_PROFILE_VERSION
-      ) {
-        next.push(old);
-        continue;
-      }
-      try {
+try {
         const userDataPath = `workflows/${file.path}`;
         const workflowResponse = typeof api.getUserData === "function"
           ? await api.getUserData(userDataPath)
           : await api.fetchApi(`/userdata/${encodeURIComponent(userDataPath)}`);
         if (!workflowResponse.ok) throw new Error(`ComfyUI could not read the workflow (${workflowResponse.status}).`);
-        next.push(await buildWorkflowTemplate(file, await workflowResponse.json()));
+        next.push(await buildWorkflowTemplate(file, await workflowResponse.json(), old));
       } catch (error) {
         const message = error.message || String(error);
         issues.push(`${workflowNameFromPath(file.path)}: ${message}`);
@@ -3218,7 +3436,7 @@ async function refreshWorkflows({ announce = true } = {}) {
     state.workflows = next;
     if (JSON.stringify(previous) !== JSON.stringify(next)) await saveWorkflowCache();
     for (const project of state.projects) {
-      if (!state.workflows.some(workflow => workflow.id === project.workflow_id)) {
+      if (!pendingGenerationRestore(project) && !state.workflows.some(workflow => workflow.id === project.workflow_id)) {
         project.workflow_id = state.workflows[0]?.id || "";
       }
     }
@@ -3468,21 +3686,7 @@ function instrumentGenerationSnapshot(snapshot, workflow, project, generationId,
 }
 
 function collectHistoryOutputs(historyItem, resultNodeIds = [], resultFields = []) {
-  const outputs = [];
-  const selected = new Set(resultNodeIds.map(String));
-  for (const [nodeId, value] of Object.entries(historyItem?.outputs || {})) {
-    if (selected.size && !selected.has(String(nodeId))) continue;
-    const fields = resultFields.length ? resultFields : Object.keys(value || {});
-    for (const name of fields) {
-      const records = value?.[name];
-      if (Array.isArray(records)) {
-        for (const record of records) if (record && typeof record === "object" && record.filename) outputs.push(record);
-      } else if (records && typeof records === "object" && records.filename) {
-        outputs.push(records);
-      }
-    }
-  }
-  return outputs;
+  return workflowResultOutputs(historyItem, resultNodeIds, resultFields);
 }
 
 function historyError(historyItem) {
@@ -3818,11 +4022,21 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
     );
   }
   const savedSnapshot = clone(snapshot);
+  const provenance = await captureRuntimeProvenance(savedSnapshot, "video", {
+    projectId:project.id, generationId, parentGenerationId:metadata.parent_generation_id || "",
+  });
+  if (existingGeneration?.status === "cancelled") return;
   const queuedSnapshot = clone(snapshot);
   const instrumentation = instrumentGenerationSnapshot(
     queuedSnapshot, workflow, project, generationId, metadata,
   );
   const { contextPath: contextLatentPath, assemblyResultNodeId } = instrumentation;
+  await persistProjects({ immediate: true });
+  // Retain queue intent even after its prerequisite save. If the queue response
+  // is lost, reloading must not automatically submit this preparation again.
+  writeProjectDraft();
+  if (!(await videoDraftPending)) throw new Error(state.projectDraftError);
+  if (existingGeneration?.status === "cancelled") return;
   const queued = await api.queuePrompt(-1, queuedSnapshot);
   const promptId = queued?.prompt_id;
   if (!promptId) throw new Error("ComfyUI did not return a prompt ID.");
@@ -3852,6 +4066,7 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
     workflow_id: workflow.id,
     workflow_name: workflow.name,
     workflow_snapshot: savedSnapshot,
+    provenance,
     context_latent_path: contextLatentPath,
     assembly_result_node_id: assemblyResultNodeId,
     result_node_ids: clone(workflow.result_node_ids),
@@ -3869,9 +4084,8 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
     updated_at: Date.now(),
   });
   if (!existingGeneration) project.generations.unshift(generation);
-  project.generations = project.generations.slice(0, 200);
   markProjectChanged({ render: true });
-  await persistProjects({ immediate: true });
+  await persistProjects();
   state.generationProgress.set(String(promptId), { phase: "queued" });
   touchGeneration(promptId);
   const reportedFailure = state.generationFailures.get(String(promptId));
@@ -3891,9 +4105,13 @@ async function generateProject() {
   const project = activeProject();
   if (!project) return;
   if (isStructuredExtensionProject(project)) {
+    // An explicitly restored snapshot takes precedence over extension preparation.
+    if (pendingGenerationRestore(project)) return generateRestoredComparison(project);
     await generateStructuredExtension(project);
     return;
   }
+  if (pendingGenerationRestore(project)) return generateRestoredComparison(project);
+  if (project.pending_generation_restore) { delete project.pending_generation_restore; persistProjects(); }
   const workflow = state.workflows.find(item => item.id === project.workflow_id);
   if (!workflow) {
     setStatus("Select a compatible [PSV] workflow before generating.", "error");
@@ -3907,14 +4125,13 @@ async function generateProject() {
     created_at: Date.now(), updated_at: Date.now(),
   };
   project.generations.unshift(operation);
-  project.generations = project.generations.slice(0, 200);
   const controller = new AbortController();
   state.generationControllers.set(operation.id, controller);
   markProjectChanged({ project, render: true });
-  await persistProjects({ immediate: true });
   const generate = state.panel.querySelector("#psvstudio-generate");
   generate.disabled = true;
   try {
+    await persistProjects({ immediate: true });
     const response = await api.fetchApi("/promptstudio-video/document/compile", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3944,7 +4161,7 @@ async function generateProject() {
       updated_at: Date.now(),
     });
     markProjectChanged({ project, render: true });
-    await persistProjects({ immediate: true });
+    await persistProjects();
   } finally {
     state.generationControllers.delete(operation.id);
     generate.disabled = false;
@@ -3953,13 +4170,16 @@ async function generateProject() {
 
 async function replayGeneration(generation) {
   const project = activeProject();
-  const workflow = state.workflows.find(item => item.id === generation.workflow_id) || {
+  const workflow = {
     id: generation.workflow_id,
     name: generation.workflow_name,
+    director_node_id: Object.entries(generation.workflow_snapshot?.output || {})
+      .find(([, node]) => node?.class_type === DIRECTOR_TYPE)?.[0],
     result_node_ids: generation.result_node_ids,
     result_fields: generation.result_fields,
   };
   if (!project || !generation.workflow_snapshot) return;
+  if (!(await reviewReplay(state.panel, generation.workflow_snapshot, generation.provenance, "video"))) return;
   const operation = {
     id: makeId("generation"), prompt_id: "", status: "queueing", error: "",
     workflow_id: workflow.id, workflow_name: workflow.name,
@@ -3975,11 +4195,10 @@ async function replayGeneration(generation) {
     kind: generation.kind || "base", created_at: Date.now(), updated_at: Date.now(),
   };
   project.generations.unshift(operation);
-  project.generations = project.generations.slice(0, 200);
   state.generationControllers.set(operation.id, new AbortController());
   markProjectChanged({ project, render: true });
-  await persistProjects({ immediate: true });
   try {
+    await persistProjects({ immediate: true });
     await queueSnapshot(project, workflow, clone(generation.workflow_snapshot), {
       document: generation.document,
       compiled_prompt: generation.compiled_prompt,
@@ -4001,7 +4220,7 @@ async function replayGeneration(generation) {
       updated_at: Date.now(),
     });
     markProjectChanged({ project, render: true });
-    await persistProjects({ immediate: true });
+    await persistProjects();
   } finally {
     state.generationControllers.delete(operation.id);
   }
@@ -4063,44 +4282,16 @@ function continuationDirectorContext(generation) {
   };
 }
 
-function structuredExtensionDocument(parentDocument, brief, durationSeconds) {
-  const previous = clone(parentDocument?.shots?.at(-1) || {});
-  const clean = value => String(value || "").replace(/<\s*(?:Picture|Video|Audio|Subject)\s+\d+\s*>/gi, "the established source");
-  const action = String(brief || "").trim() || "Continue the visible action directly from the source ending.";
-  return {
-    version: Number(parentDocument?.version || 1),
-    mode: "t2va",
-    duration_seconds: durationSeconds,
-    width: Number(parentDocument?.width || 1344),
-    height: Number(parentDocument?.height || 768),
-    target_megapixels: parentDocument?.target_megapixels,
-    canvas_reference_id: "",
-    ref_image_size: parentDocument?.ref_image_size || "match",
-    main_description: action,
-    prompt_override: "",
-    style: clean(parentDocument?.style || "Live-action, cinematic"),
-    shots: [{
-      id: makeId("extension-shot"), start: 0,
-      transition: "The same shot continues across the clip boundary without a cut or temporal reset.",
-      composition: clean(previous.composition), subjects: clean(previous.subjects),
-      environment: clean(previous.environment), lighting: clean(previous.lighting),
-      camera: {
-        type: previous.camera?.type || "Static Shot",
-        amplitude: previous.camera?.amplitude || "default",
-        speed: previous.camera?.speed || "default",
-        target: clean(previous.camera?.target),
-      },
-      steps: [newActionStep(action)], visible_text: [], sounds: [], sound_cues: [], audio_clips: [], notes: "",
-    }],
-    references: [],
-    overall_soundscape: clean(parentDocument?.overall_soundscape),
-    non_diegetic_music: clean(parentDocument?.non_diegetic_music || "N/A"),
-    complete_silence: Boolean(parentDocument?.complete_silence),
-    task_types: [], subject_definitions: [], summary: "", retention_analysis: [],
-  };
-}
-
-function createStructuredExtensionProject(parentProject, generation, brief, durationSeconds, dialog) {
+async function createStructuredExtensionProject(parentProject, generation, brief, durationSeconds, dialog, plan) {
+  if (!plan?.result?.valid || !plan.result.document?.shots?.length || plan.status !== "complete") throw new Error("Build and validate the full extension plan before applying it.");
+  const projectId = `project-${plan.job_id}`;
+  const existing = state.projects.find(item => item.id === projectId);
+  if (existing) {
+    await persistProjects({ immediate: true });
+    selectProject(existing.id);
+    dialog?.close();
+    return existing;
+  }
   if (!parentProject || !generation) return null;
   const duration = Number(durationSeconds);
   if (!Number.isFinite(duration) || duration < 5 || duration > 15) {
@@ -4113,10 +4304,10 @@ function createStructuredExtensionProject(parentProject, generation, brief, dura
   const { workflow, snapshot } = savedGenerationWorkflow(generation);
   const now = Date.now();
   const project = {
-    id: makeId("project"),
+    id: projectId,
     name: `${parentProject.name || "Untitled video"} · Extension ${Number(generation.depth || 0) + 1}`,
     brief: String(brief || "").trim(),
-    document: structuredExtensionDocument(generation.document, brief, duration),
+    document: clone(plan.result.document),
     workflow_id: workflow.id,
     generations: [],
     extension_source: {
@@ -4133,16 +4324,17 @@ function createStructuredExtensionProject(parentProject, generation, brief, dura
       workflow_id: workflow.id, workflow_name: workflow.name,
       workflow_snapshot: clone(snapshot), workflow_director_node_id: workflow.director_node_id,
       result_node_ids: clone(workflow.result_node_ids || []), result_fields: clone(workflow.result_fields || []),
-      director_context: continuationDirectorContext(generation),
+      director_context: clone(plan.result.continuation_context),
     },
     created_at: now, updated_at: now,
   };
   state.projects.unshift(project);
   state.activeProjectId = project.id;
   state.selectedShotId = project.document.shots[0].id;
-  dialog?.close();
   markProjectChanged({ project, render: true });
-  setStatus("Structured extension created. Build its shots, then generate the extension.", "ready");
+  await persistProjects({ immediate: true });
+  dialog?.close();
+  setStatus("Validated extension plan saved. Review its shots, then generate the extension.", "ready");
   return project;
 }
 
@@ -4181,14 +4373,13 @@ async function generateStructuredExtension(project) {
     created_at: Date.now(), updated_at: Date.now(),
   };
   project.generations.unshift(operation);
-  project.generations = project.generations.slice(0, 200);
   const controller = new AbortController();
   state.generationControllers.set(operation.id, controller);
   markProjectChanged({ project, render: true });
-  await persistProjects({ immediate: true });
   const generate = state.panel.querySelector("#psvstudio-generate");
   generate.disabled = true;
   try {
+    await persistProjects({ immediate: true });
     const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
       method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
       body: JSON.stringify({
@@ -4227,7 +4418,7 @@ async function generateStructuredExtension(project) {
       error: cancelled ? "Cancelled." : (error.message || String(error)), updated_at: Date.now(),
     });
     markProjectChanged({ project, render: true });
-    await persistProjects({ immediate: true });
+    await persistProjects();
   } finally {
     state.generationControllers.delete(operation.id);
     generate.disabled = false;
@@ -4261,13 +4452,12 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
     created_at: Date.now(), updated_at: Date.now(),
   };
   project.generations.unshift(operation);
-  project.generations = project.generations.slice(0, 200);
   const controller = new AbortController();
   state.generationControllers.set(operation.id, controller);
   markProjectChanged({ project, render: true });
-  await persistProjects({ immediate: true });
   submit.disabled = true;
   try {
+    await persistProjects({ immediate: true });
     const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4315,7 +4505,7 @@ async function queueContinuation(project, parent, brief, durationSeconds, dialog
       updated_at: Date.now(),
     });
     markProjectChanged({ project, render: true });
-    await persistProjects({ immediate: true });
+    await persistProjects();
     if (!cancelled) throw error;
   } finally {
     state.generationControllers.delete(operation.id);
@@ -4392,13 +4582,12 @@ async function regenerateExtension(project, generation, request, dialog, submit)
     created_at: Date.now(), updated_at: Date.now(),
   };
   project.generations.unshift(operation);
-  project.generations = project.generations.slice(0, 200);
   const controller = new AbortController();
   state.generationControllers.set(operation.id, controller);
   markProjectChanged({ project, render: true });
-  await persistProjects({ immediate: true });
   submit.disabled = true;
   try {
+    await persistProjects({ immediate: true });
     const response = await api.fetchApi(CONTINUATION_PREPARE_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4448,7 +4637,7 @@ async function regenerateExtension(project, generation, request, dialog, submit)
       updated_at: Date.now(),
     });
     markProjectChanged({ project, render: true });
-    await persistProjects({ immediate: true });
+    await persistProjects();
     if (!cancelled) throw error;
   } finally {
     state.generationControllers.delete(operation.id);
@@ -4524,61 +4713,169 @@ function showRegenerateExtension(generation) {
   dialog.showModal();
 }
 
+function saveContinuationPlan(key, record) {
+  const plans = storedObject(CONTINUATION_PLANS_KEY);
+  plans[key] = { ...record, updated_at: Date.now() };
+  const retained = Object.fromEntries(Object.entries(plans)
+    .sort(([, left], [, right]) => Number(right.updated_at) - Number(left.updated_at)).slice(0, 20));
+  // Starting/applying requires a durable request ID; storage failure is actionable.
+  localStorage.setItem(CONTINUATION_PLANS_KEY, JSON.stringify(retained));
+}
+
 function showContinueVideo(generation) {
   const project = activeProject();
   if (!project || generation.status !== "complete" || !continuationSourceOutput(generation)) return;
+  const key = [project.id, generation.id].join(":");
+  let record = storedObject(CONTINUATION_PLANS_KEY)[key] || null;
   const dialog = el("dialog", "psvstudio-continuation-dialog");
   dialog.setAttribute("aria-label", "Continue video");
   const heading = el("div", "psvstudio-continuation-heading");
-  heading.append(
-    el("h2", "", "Continue video"),
-    el("small", "", `Extend this ${Number(generation.total_effective_duration || generation.effective_duration || 0).toFixed(2)}s version using its final ${CONTINUATION_CONTEXT_FRAMES} audiovisual frames.`),
-  );
-  let brief = "Continue the action naturally from the exact ending, preserving the established subjects, environment, camera motion, lighting, and sound.";
-  let duration = 5;
+  heading.append(el("h2", "", "Continue video"), el("small", "", "Plan only the new tail after the selected render's exact ending."));
+  let brief = record?.request?.brief || "Continue the action naturally from the exact ending, preserving the established subjects, environment, camera motion, lighting, and sound.";
+  let duration = Number(record?.request?.duration_seconds || 5);
+  let controller = null;
+  let busy = false;
   const body = el("div", "psvstudio-continuation-body");
-  const briefInput = textArea(brief, value => { brief = value; }, 7, "Describe only what should happen next.");
-  const durationInput = textInput(duration, value => { duration = value; }, "number");
-  durationInput.min = "5";
-  durationInput.max = "15";
-  durationInput.step = "0.1";
+  const briefInput = textArea(brief, value => { brief = value; refresh(); }, 7, "Describe only what should happen next.");
+  const durationInput = textInput(duration, value => { duration = Number(value); refresh(); }, "number");
+  durationInput.min = "5"; durationInput.max = "15"; durationInput.step = "0.1";
+  const progress = el("p", "psvstudio-continuation-progress", "");
+  progress.setAttribute("role", "status");
+  progress.setAttribute("aria-live", "polite");
+  const preview = el("pre", "psvstudio-continuation-preview", "");
+  preview.style.cssText = "white-space:pre-wrap;max-height:35vh;overflow:auto";
   body.append(
-    field("What happens next?", briefInput, "The continuation starts from the selected render's actual ending. Describe new action rather than repeating the previous video."),
-    field("Added duration (seconds)", durationInput, "MiniMax snaps the result to its native frame grid."),
-    el("div", "psvstudio-continuation-note", "Quick Continue uses this text directly. Build full extension creates a saved extension project with its own shots, structured dialogue, camera, and generated sounds. Both use native Soft AV: 39 exact carried video frames / 65 audio steps with an eight-tick half-cosine release."),
+    field("What happens next?", briefInput, "Describe new action and exact spoken words after the source ending."),
+    field("Added duration (seconds)", durationInput, "The plan is checked against the exact delivered tail after native frame-grid alignment."),
+    el("div", "psvstudio-continuation-note", "Quick generate uses the brief directly. Build full extension asks the Director for structured shots, dialogue, camera, and sounds, then lets you review and apply. Both use the native 39-frame Soft AV handoff."),
+    progress, preview,
   );
   const footer = el("footer", "psvstudio-continuation-actions");
-  const cancel = button("Cancel", () => dialog.close());
-  const submit = button("Generate extension", async () => {
+  const close = button("Close", () => dialog.close());
+  const submit = button("Quick generate", async () => {
     try {
-      if (!brief.trim()) throw new Error("Describe what should happen in the extension.");
-      if (!Number.isFinite(duration) || duration < 5 || duration > 15) {
-        throw new Error("Continuation duration must be between 5 and 15 seconds.");
-      }
+      validateInputs();
       await queueContinuation(project, generation, brief.trim(), duration, dialog, submit);
-    } catch (error) {
-      setStatus(error.message || String(error), "error");
-    }
-  }, "psvstudio-button psvstudio-button-primary");
-  const build = button("Build full extension", () => {
-    try {
-      createStructuredExtensionProject(project, generation, brief.trim(), duration, dialog);
-    } catch (error) {
-      setStatus(error.message || String(error), "error");
-    }
+    } catch (error) { progress.textContent = error.message || String(error); }
   }, "psvstudio-button psvstudio-button-primary");
   submit.textContent = "Quick generate";
-  footer.append(cancel, submit, build);
+  const build = button("Build full extension", () => runPlan(), "psvstudio-button psvstudio-button-primary");
+  const cancel = button("Cancel planning", () => cancelPlan());
+  const apply = button("Apply extension plan", async () => {
+    try {
+      if (!matches() || record.status !== "complete") throw new Error("Build a current plan before applying.");
+      busy = true; refresh();
+      const child = await createStructuredExtensionProject(project, record.source_generation, brief.trim(), duration, dialog, record);
+      record.applied_project_id = child.id;
+      saveContinuationPlan(key, record);
+    } catch (error) { progress.textContent = error.message || String(error); }
+    finally { busy = false; refresh(); }
+  }, "psvstudio-button psvstudio-button-primary");
+  footer.append(close, submit, build, cancel, apply);
   dialog.append(heading, body, footer);
-  dialog.addEventListener("cancel", event => {
-    event.preventDefault();
-    if (!submit.disabled) dialog.close();
-  });
-  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  const matches = () => record?.request?.brief === brief.trim() && Number(record?.request?.duration_seconds) === duration;
+  function validateInputs() {
+    if (!brief.trim()) throw new Error("Describe what should happen in the extension.");
+    if (!Number.isFinite(duration) || duration < 5 || duration > 15) throw new Error("Extension duration must be between 5 and 15 seconds.");
+  }
+  function refresh() {
+    const cancelling = record?.status === "cancelling";
+    briefInput.disabled = busy || cancelling;
+    durationInput.disabled = busy || cancelling;
+    build.disabled = busy || cancelling;
+    submit.disabled = busy || cancelling;
+    build.textContent = ["failed", "interrupted", "cancelled"].includes(record?.status) && matches() ? "Retry full extension" : "Build full extension";
+    build.title = jobRetryText({ retry_action: "replan" });
+    cancel.hidden = !(busy && ["queued", "running", "interrupted"].includes(record?.status)) && !cancelling;
+    cancel.disabled = false;
+    cancel.textContent = cancelling ? "Retry cancel" : "Cancel planning";
+    apply.hidden = !matches() || record?.status !== "complete";
+    apply.disabled = busy;
+    preview.hidden = apply.hidden;
+    preview.textContent = apply.hidden ? "" : String(record.result.compiled_prompt || "");
+  }
+  async function cancelPlan() {
+    if (!record || ["complete", "failed", "cancelled"].includes(record.status)) return;
+    controller?.abort();
+    record.status = "cancelling";
+    try {
+      saveContinuationPlan(key, record);
+      refresh();
+      const response = await api.fetchApi(CONTINUATION_PLAN_ENDPOINT + "/" + encodeURIComponent(record.job_id) + "/cancel", { method: "POST" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 404) throw new Error(data.error || "Cancellation could not be confirmed. Retry cancel.");
+      record.status = "cancelled";
+      record.result = null;
+      saveContinuationPlan(key, record);
+      progress.textContent = "Planning cancelled. Your request is retained for retry.";
+    } catch (error) { progress.textContent = error.message || String(error); }
+    finally { busy = false; refresh(); }
+  }
+  async function runPlan() {
+    if (busy) return;
+    const active = new AbortController();
+    controller = active;
+    try {
+      validateInputs();
+      // Transport retries reuse the exact request; failed/cancelled work gets a new job.
+      if (!matches() || !["queued", "running", "interrupted"].includes(record?.status)) {
+        const jobId = makeId("extension-plan");
+        record = {
+          job_id: jobId, status: "queued", source_generation: clone(generation),
+          request: { ...saveDirectorSettings(), job_id: jobId, origin: { project_id: project.id, message_id: generation.id || "" }, brief: brief.trim(), duration_seconds: duration,
+            document: clone(generation.document), source_effective_duration: generation.effective_duration },
+          result: null,
+        };
+      }
+      saveContinuationPlan(key, record);
+      busy = true; refresh();
+      progress.textContent = "Extension plan is queued…";
+      let response = await api.fetchApi(CONTINUATION_PLAN_ENDPOINT, {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: active.signal,
+        body: JSON.stringify(record.request),
+      });
+      let data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        record.status = response.status < 500 ? "failed" : "interrupted";
+        throw new Error(data.error || "The extension plan could not be started.");
+      }
+      while (!active.signal.aborted) {
+        response = await api.fetchApi(CONTINUATION_PLAN_ENDPOINT + "/" + encodeURIComponent(record.job_id), { signal: active.signal });
+        data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || "Plan status was interrupted. Retry to reconnect.");
+        const job = normalizeJobWire({ ...data, job_id: record.job_id });
+        record.status = job.status;
+        if (job.status === "complete") {
+          if (!job.result?.valid || !job.result.document?.shots?.length) throw new Error("The planner returned an invalid document.");
+          record.result = clone(job.result);
+          saveContinuationPlan(key, record);
+          progress.textContent = "Plan ready. Review the compiled prompt, then apply the extension project.";
+          break;
+        }
+        if (job.status === "failed") throw recoveredJobError(data)
+          || new Error(`${job.error || "Extension planning failed."} ${jobRetryText({ retry_action: "replan" })}`);
+        if (job.status === "cancelled") throw new Error("Extension planning was cancelled. Your request is retained.");
+        saveContinuationPlan(key, record);
+        progress.textContent = job.status === "queued" ? "Extension plan is queued…" : directorJobStatusText(data);
+        await new Promise(resolve => setTimeout(resolve, DIRECTOR_JOB_POLL_MS));
+      }
+    } catch (error) {
+      if (!active.signal.aborted) {
+        if (record && !["failed", "cancelled"].includes(record.status)) record.status = "interrupted";
+        try { if (record) saveContinuationPlan(key, record); } catch (_) { /* Surface original storage/transport error. */ }
+        progress.textContent = error.message || String(error);
+      }
+    } finally { if (controller === active) { busy = false; refresh(); } }
+  }
+  dialog.addEventListener("close", () => { controller?.abort(); dialog.remove(); }, { once: true });
   state.panel.ownerDocument.body.append(dialog);
   dialog.showModal();
+  refresh();
+  if (record?.status === "complete") progress.textContent = "Recovered completed plan. Apply it to open the extension project.";
+  else if (["queued", "running"].includes(record?.status)) runPlan();
+  else if (record?.status === "cancelling") progress.textContent = "Cancellation was interrupted. Retry cancel to confirm.";
+  else if (record) progress.textContent = "Previous request retained. Retry full extension when ready.";
   briefInput.focus();
-  briefInput.select();
 }
 
 function showGenerationOutput(output, title) {
@@ -4633,6 +4930,11 @@ function renderProjectList() {
     remove.addEventListener("click", () => deleteProject(project.id));
     row.append(control, remove);
     list.append(row);
+  }
+  if (state.projectHasMore) {
+    const older = button(state.projectPageLoading ? "Loading…" : "Load older projects", loadOlderProjects);
+    older.disabled = Boolean(state.projectPageLoading);
+    list.append(older);
   }
 }
 
@@ -5297,6 +5599,12 @@ function trimHandle(project, index, edge, track, scale) {
   const boundaryIndex = edge === "left" ? index : index + 1;
   const handle = el("div", `psvstudio-trim-handle psvstudio-trim-${edge}${boundaryIndex ? "" : " is-disabled"}`);
   handle.role = "separator";
+  handle.setAttribute("aria-orientation", "vertical");
+  handle.setAttribute("aria-valuemin", "0");
+  handle.setAttribute("aria-valuemax", String(documentDuration(project)));
+  handle.setAttribute("aria-valuenow", String(currentBoundary(project, boundaryIndex)));
+  handle.setAttribute("aria-valuetext", `${currentBoundary(project, boundaryIndex).toFixed(2)} seconds`);
+  handle.setAttribute("aria-disabled", String(!boundaryIndex));
   handle.tabIndex = boundaryIndex ? 0 : -1;
   handle.ariaLabel = edge === "left" ? `Resize the start of shot ${index + 1}` : `Resize the end of shot ${index + 1}`;
   handle.title = boundaryIndex ? "Drag to resize. Hold Alt for sub-frame precision." : "The production starts at 0 seconds.";
@@ -6193,8 +6501,10 @@ function renderShotDetailTimeline(shot, duration) {
     value: reference.id, label: reference.name || reference.path,
   })), exactReferences[0]?.id || "", () => {});
   audioSelect.disabled = !exactReferences.length;
+  audioSelect.setAttribute("aria-label", "Exact audio reference");
   const fileInput = el("input", "psvstudio-sr-only");
   fileInput.type = "file";
+  fileInput.setAttribute("aria-label", "Import exact audio");
   fileInput.accept = "audio/*,.wav,.wave,.mp3,.flac,.ogg,.oga,.opus,.m4a,.aac,.aif,.aiff,.wma,.caf,.au";
   fileInput.addEventListener("change", async () => {
     const file = fileInput.files?.[0];
@@ -6640,6 +6950,66 @@ function renderInspector() {
   }, "psvstudio-button"));
 }
 
+async function generateRestoredComparison(project) {
+  const restored = pendingGenerationRestore(project);
+  if (!restored) return;
+  const generate = state.panel?.querySelector("#psvstudio-generate");
+  if (generate) generate.disabled = true;
+  const previousIds = new Set(project.generations.map(item => item.id));
+  try {
+    await replayGeneration(clone(restored.generation));
+    if (project.pending_generation_restore === restored && project.generations.some(item => !previousIds.has(item.id))) {
+      delete project.pending_generation_restore;
+      markProjectChanged({project,render:true});
+      await persistProjects({immediate:true});
+    }
+  } finally { renderHeader(); }
+}
+
+function savedGenerationRestoreState(project) {
+  return { document: clone(project.document), workflow_id: project.workflow_id || "",
+    additional_input_selections: clone(project.additional_input_selections || {}) };
+}
+
+function pendingGenerationRestore(project) {
+  const pending = project?.pending_generation_restore;
+  if (!pending?.generation?.workflow_snapshot?.output || !pending.fingerprint) return null;
+  const canonical = value => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+  return JSON.stringify(canonical(pending.fingerprint)) === JSON.stringify(canonical(savedGenerationRestoreState(project))) ? pending : null;
+}
+
+async function restoreVideoComparisonInputs(project, record) {
+  if (activeProject()?.id !== project.id) throw new Error("Return to the original project before restoring its inputs.");
+  if (projectPendingGenerationCount(project)) throw new Error("Wait for this project's active generation before restoring inputs.");
+  const saved = record.saved;
+  if (!saved.document || !saved.workflow_snapshot?.output) throw new Error("This result has no complete saved inputs.");
+  if (!closeShotEditor()) throw new Error("The shot editor still has unsaved changes.");
+  project.document = clone(saved.document);
+  project.brief = project.document.main_description || "";
+  project.workflow_id = saved.workflow_id || "";
+  project.additional_input_selections = {};
+  state.selectedShotId = project.document.shots?.[0]?.id || null;
+  project.pending_generation_restore = {version:1,generation:clone(saved),fingerprint:savedGenerationRestoreState(project)};
+  markProjectChanged({project,render:true});
+  await persistProjects({immediate:true});
+  setStatus("Saved inputs restored. Generate will review and use the saved workflow and seed.", "ready");
+}
+
+function openVideoResultComparison(generation, trigger) {
+  const project = activeProject();
+  if (!project) return;
+  const comparison = createResultComparison({
+    container: state.panel,
+    getItems: () => project.generations.filter(item => item.workflow_snapshot).map(videoComparisonRecord),
+    mediaUrl: outputUrl,
+    onRestore: record => restoreVideoComparisonInputs(project, record),
+  });
+  comparison.open(generation.id, () => trigger?.isConnected ? trigger
+    : [...state.panel.querySelectorAll("[data-generation-id]")].find(card => card.dataset.generationId === generation.id)
+      ?.querySelector("[data-result-compare]"));
+}
+
 function renderGenerations() {
   const list = state.panel?.querySelector("#psvstudio-generation-list");
   const project = activeProject();
@@ -6757,6 +7127,11 @@ function renderGenerations() {
       actions.append(button("Regenerate extension", () => showRegenerateExtension(generation), "psvstudio-button psvstudio-button-primary"));
     }
     actions.append(button("Replay exact", () => replayGeneration(generation)));
+    if (generation.workflow_snapshot) {
+      const compare = button("Compare saved inputs", () => openVideoResultComparison(generation, compare));
+      compare.dataset.resultCompare = "true";
+      actions.append(compare);
+    }
     if (generation.compiled_prompt) actions.append(button("View prompt", () => showCompiledPrompt(generation.compiled_prompt)));
     body.append(actions);
     const currentBody = card.querySelector(":scope > .psvstudio-generation-body");
@@ -6925,7 +7300,7 @@ function renderHeader() {
     title.value = project?.name || "Prompt Studio Video";
   }
   if (generate) {
-    generate.disabled = !project || (!structuredExtension && !state.workflows.length);
+    generate.disabled = !project || (!structuredExtension && !state.workflows.length && !pendingGenerationRestore(project));
     generate.textContent = structuredExtension ? "Generate extension" : "Generate";
   }
   if (duplicate) duplicate.disabled = !project;
@@ -6948,6 +7323,26 @@ function renderHeader() {
     preview.dataset.override = overridden ? "true" : "false";
   }
   renderWorkflowSelect();
+  renderRunSummary();
+}
+
+function renderRunSummary() {
+  const summary = state.panel?.querySelector("#psvstudio-run-summary");
+  if (!summary) return;
+  const project = activeProject();
+  if (!project) { summary.textContent = "Create a project, author its shots, then choose a workflow to generate."; return; }
+  const restored = pendingGenerationRestore(project);
+  if (restored) {
+    summary.textContent = `Next generation uses saved inputs from ${restored.generation.workflow_name || restored.generation.id}: saved workflow, prompts and seeds. Generate reviews replay dependencies first. Editing shots, workflow or custom inputs returns to current settings.`;
+    return;
+  }
+  const extension = isStructuredExtensionProject(project);
+  const workflow = selectedWorkflow(project);
+  const prompt = project.document.prompt_override ? "Manual compiled prompt override" : "Compiled from authored shots";
+  const seed = state.panel.querySelector("#psvstudio-new-seed")?.checked !== false ? "New seed" : "Workflow seed";
+  const pending = projectPendingGenerationCount(project);
+  const inputs = Object.keys(project.additional_input_selections || {}).length;
+  summary.textContent = `${pending ? `${pending} generation${pending === 1 ? "" : "s"} pending` : "Ready"} · Generate ${extension ? "queues this extension using the source workflow" : "queues this video"}. ${extension ? "Source render snapshot" : workflow?.name || "Choose a workflow"} · ${seed} · ${prompt}${inputs ? ` · ${inputs} custom workflow inputs` : ""}. The synopsis guides planning; shot edits apply only when saved.`;
 }
 
 function renderAll() {
@@ -7011,6 +7406,13 @@ function buildPanel() {
             <section class="psvstudio-system-status-section">
               <div class="psvstudio-system-status-row"><strong>ComfyUI</strong><span id="psvstudio-comfy-status-detail" data-state="busy" role="status" aria-live="polite">Checking…</span></div>
               <button id="psvstudio-comfy-restart" class="psvstudio-button" type="button">Restart ComfyUI</button>
+            </section>
+            <section class="psvstudio-system-status-section">
+              <strong>Recent jobs</strong>
+              <div id="psvstudio-job-activity">Open activity to check job stages.</div>
+              <button id="psvstudio-job-refresh" class="psvstudio-button" type="button">Refresh activity</button>
+              <button id="psvstudio-job-diagnostics" class="psvstudio-button" type="button">Export diagnostics</button>
+              <small>Local metadata only; prompts, results and credentials are excluded.</small>
               <small>Requires ComfyUI Manager. Running work will be interrupted.</small>
             </section>
           </div>
@@ -7054,11 +7456,14 @@ function buildPanel() {
               <div id="psvstudio-media-lane" class="psvstudio-media-lane" aria-label="Project media"></div>
             </section>
           </div>
-          <input id="psvstudio-media-input" class="psvstudio-sr-only" type="file" accept="image/*,video/*,audio/*" multiple />
+          <input id="psvstudio-media-input" class="psvstudio-sr-only" type="file" aria-label="Add image, video, or audio references" accept="image/*,video/*,audio/*" multiple />
         </section>
       </div>
       <footer class="psvstudio-action-footer">
+        <div class="psvstudio-action-copy">
         <div id="psvstudio-status" class="psvstudio-status" role="status" aria-live="polite">Loading Video Studio…</div>
+        <div id="psvstudio-run-summary" class="studio-run-summary" aria-label="What will run"></div>
+        </div>
         <button id="psvstudio-generate" class="psvstudio-button psvstudio-button-primary" type="button">Generate</button>
       </footer>
     </main>
@@ -7093,12 +7498,31 @@ function buildPanel() {
     renderTimeline();
   });
   panel.querySelector("#psvstudio-generate").addEventListener("click", generateProject);
+  panel.addEventListener("change", renderRunSummary);
   panel.querySelector("#psvstudio-duplicate").addEventListener("click", duplicateProject);
   panel.querySelector("#psvstudio-reset").addEventListener("click", resetProject);
   panel.querySelector("#psvstudio-compile-preview").addEventListener("click", compilePreview);
   panel.querySelector("#psvstudio-refresh-workflows").addEventListener("click", () => refreshWorkflows());
   panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopLlmGeneration);
   panel.querySelector("#psvstudio-comfy-restart").addEventListener("click", restartComfyUIFromStatus);
+  panel.querySelector("#psvstudio-job-refresh").addEventListener("click", async () => {
+    const target = panel.querySelector("#psvstudio-job-activity");
+    try {
+      const snapshot = await fetchJobActivity((...args) => api.fetchApi(...args));
+      target.replaceChildren();
+      for (const job of snapshot.jobs.slice(0, 8)) {
+        const item = el("p", "", jobActivityText(job, { projects: state.projects }));
+        if (["failed", "cancelled", "interrupted"].includes(job.state)) item.append(el("small", "", ` ${jobRetryText(job)}`));
+        target.append(item);
+      }
+      if (!snapshot.jobs.length) target.textContent = "No recorded jobs.";
+      if (!snapshot.durable) target.append(el("p", "", "Job metadata could not be saved locally; restart recovery is unavailable."));
+    } catch (error) { target.textContent = error.message; }
+  });
+  panel.querySelector("#psvstudio-job-diagnostics").addEventListener("click", async () => {
+    try { await downloadJobDiagnostics({ fetchApi: (...args) => api.fetchApi(...args), document: panel.ownerDocument }); }
+    catch (error) { panel.querySelector("#psvstudio-job-activity").textContent = error.message; }
+  });
   panel.querySelector("#psvstudio-workflow").addEventListener("change", event => {
     const project = activeProject();
     if (!project) return;
@@ -7137,109 +7561,12 @@ function buildPanel() {
   return panel;
 }
 
+let videoGenerationProgressController = null;
 function setupProgressEvents() {
-  const promptId = event => String(
-    event?.detail?.prompt_id || event?.detail?.promptId || state.activeGenerationPromptId || "",
-  );
-  const updateProgress = (id, changes) => {
-    const current = state.generationProgress.get(id) || {};
-    state.generationProgress.set(id, { ...current, ...changes });
-  };
-  const runningProgress = event => {
-    const nodes = event?.detail?.nodes;
-    if (!nodes || typeof nodes !== "object") return null;
-    const running = Object.values(nodes).find(node => node?.state === "running");
-    if (!running) return null;
-    const value = Number(running.value);
-    const max = Number(running.max);
-    return Number.isFinite(value) && Number.isFinite(max) && max > 0 ? { value, max } : null;
-  };
-  api.addEventListener("execution_start", event => {
-    const id = promptId(event);
-    if (!markGenerationExecuting(id)) return;
-    updateProgress(id, { phase: "generating" });
-  });
-  api.addEventListener("progress", event => {
-    const id = promptId(event);
-    if (!markGenerationExecuting(id)) return;
-    if (state.generationProgress.get(id)?.phase === "finalizing") {
-      renderGenerations();
-      return;
-    }
-    updateProgress(id, {
-      phase: "generating",
-      value: Number(event.detail?.value),
-      max: Number(event.detail?.max),
-    });
-    renderGenerations();
-  });
-  for (const eventName of ["execution_error", "execution_interrupted"]) {
-    api.addEventListener(eventName, event => {
-      const id = promptId(event);
-      failGeneration(id, executionFailureMessage(eventName, event?.detail));
-    });
-  }
-  api.addEventListener("executing", event => {
-    const id = promptId(event);
-    if (!markGenerationExecuting(id)) return;
-    const current = state.generationProgress.get(id) || {};
-    const samplerComplete = Number.isFinite(current.value) && Number.isFinite(current.max)
-      && current.max > 0 && current.value >= current.max;
-    const node = event?.detail && typeof event.detail === "object" ? event.detail.node : event?.detail;
-    updateProgress(id, { phase: node == null || samplerComplete ? "finalizing" : "generating" });
-    renderGenerations();
-  });
-  api.addEventListener("progress_state", event => {
-    const id = promptId(event);
-    if (!markGenerationExecuting(id)) return;
-    const progress = runningProgress(event);
-    const current = state.generationProgress.get(id) || {};
-    if (current.phase !== "finalizing") {
-      updateProgress(id, { phase: progress ? "generating" : current.phase || "generating", ...(progress || {}) });
-    }
-    renderGenerations();
-  });
-  api.addEventListener("execution_success", event => {
-    const id = promptId(event);
-    if (!markGenerationExecuting(id)) return;
-    updateProgress(id, { phase: "finalizing" });
-    renderGenerations();
-  });
-  api.addEventListener("reconnecting", () => setApiConnected(false));
-  api.addEventListener("reconnected", () => setApiConnected(true));
-  api.addEventListener("status", event => {
-    const queueRemaining = Number(event.detail?.exec_info?.queue_remaining);
-    if (Number.isFinite(queueRemaining)) state.comfyQueueRemaining = Math.max(0, queueRemaining);
-    setApiConnected(event.detail !== null);
-    renderSystemStatusSummary();
-  });
-
-  state.disconnectedControlObserver?.disconnect();
-  state.disconnectedControlObserver = new MutationObserver(mutations => {
-    if (state.apiConnected) return;
-    for (const mutation of mutations) {
-      if (mutation.type === "childList") {
-        mutation.addedNodes.forEach(node => {
-          if (node.nodeType === Node.ELEMENT_NODE) freezeDisconnectedControls(node);
-        });
-      } else if (
-        mutation.type === "attributes"
-        && isVideoStudioControl(mutation.target)
-        && !mutation.target.disabled
-        && !isDisconnectedAllowedControl(mutation.target)
-      ) {
-        state.disconnectedControls.set(mutation.target, false);
-        mutation.target.disabled = true;
-      }
-    }
-  });
-  state.disconnectedControlObserver.observe(state.panel, {
-    attributes: true,
-    attributeFilter: ["disabled"],
-    childList: true,
-    subtree: true,
-  });
-  setApiConnected(api.socket ? api.socket.readyState === WebSocket.OPEN : true);
+  videoGenerationProgressController ||= createVideoGenerationProgressController({ state, markGenerationExecuting,
+    renderGenerations, failGeneration, executionFailureMessage, setApiConnected,
+    renderSystemStatusSummary, freezeDisconnectedControls, isVideoStudioControl, isDisconnectedAllowedControl });
+  videoGenerationProgressController.mount(api);
 }
 
 function setStandaloneVisibility(visible) {
@@ -7254,6 +7581,30 @@ function setStandaloneVisibility(visible) {
   postVideoStudioPresence();
 }
 
+const videoPopupController = createFeatureController({
+  mount(popup, scope) {
+    const ownerDocument = popup.document;
+    const onPageHide = () => {
+      if (state.popup !== popup) return;
+      if (state.panel?.ownerDocument !== document) movePanelPreservingFocus(state.panel, document.body, { visible: false });
+      state.panel.hidden = true;
+      state.standaloneAttached = false;
+      state.standaloneVisible = false;
+      state.studioOpenedAt = 0;
+      clearMediaDrag(ownerDocument);
+      state.popup = null;
+      videoPopupController.dispose();
+      installMediaDrop(document);
+      postVideoStudioPresence();
+      persistProjects();
+    };
+    // Only committed navigation ends attachment, never cancelled beforeunload.
+    popup.addEventListener("pagehide", onPageHide, { once: true });
+    scope.own(() => popup.removeEventListener("pagehide", onPageHide));
+    scope.interval(() => { if (state.popup === popup && popup.closed) onPageHide(); }, 250);
+  },
+});
+
 async function attachStandalone(popup, { unified = false } = {}) {
   if (!popup || popup.closed) return false;
   try {
@@ -7264,28 +7615,16 @@ async function attachStandalone(popup, { unified = false } = {}) {
   const mount = popup.document.querySelector("#promptstudio-video-mount");
   if (!mount || !state.panel) return false;
   state.popup = popup;
-  mount.replaceChildren(state.panel);
+  movePanelPreservingFocus(state.panel, mount, { visible: !unified });
   state.standaloneAttached = true;
   state.standaloneVisible = !unified;
   state.panel.hidden = !state.standaloneVisible;
   state.studioOpenedAt = Date.now();
   installMediaDrop(popup.document);
   installTransientUiDismissal(popup.document);
-  renderAll();
+  // Adopt the current editor and media nodes without resetting focus/playback.
   postVideoStudioPresence();
-  // Wait until navigation is committed. beforeunload can be cancelled after it
-  // fires, and detaching the panel at that point leaves the live popup empty.
-  popup.addEventListener("pagehide", () => {
-    if (state.panel?.ownerDocument !== document) document.body.append(state.panel);
-    state.panel.hidden = true;
-    state.standaloneAttached = false;
-    state.standaloneVisible = false;
-    state.studioOpenedAt = 0;
-    clearMediaDrag(popup.document);
-    state.popup = null;
-    postVideoStudioPresence();
-    persistProjects({ immediate: true });
-  }, { once: true });
+  videoPopupController.mount(popup);
   return true;
 }
 
@@ -7316,9 +7655,8 @@ function setupStandaloneBridge() {
       channel.postMessage({ type: "handoff-result", requestId: data.requestId, ok: false, error: message });
     }
   });
-  if (state.bridgePresenceTimer) window.clearInterval(state.bridgePresenceTimer);
-  state.bridgePresenceTimer = window.setInterval(postVideoStudioPresence, 2500);
-  postVideoStudioPresence();
+  state.bridgePresenceTimer?.();
+  state.bridgePresenceTimer = studioPollingScope().add(postVideoStudioPresence,{interval:2500,hiddenInterval:2500});
 }
 
 function resumeGenerationPolling() {
@@ -7330,6 +7668,7 @@ function resumeGenerationPolling() {
 }
 
 function resumeVideoPreparations() {
+  if (state.projectConflicts.length) return;
   for (const project of state.projects) {
     for (const operation of project.generations || []) {
       if (!operation.id || operation.prompt_id || !["validating", "compiling", "queueing"].includes(operation.status)) continue;
@@ -7350,7 +7689,7 @@ function resumeVideoPreparations() {
           updated_at: Date.now(),
         });
         markProjectChanged({ project, render: project.id === state.activeProjectId });
-        persistProjects({ immediate: true });
+        persistProjects();
         continue;
       }
       if (state.generationControllers.has(operation.id)) continue;
@@ -7463,7 +7802,7 @@ function resumeVideoPreparations() {
             updated_at: Date.now(),
           });
           markProjectChanged({ project, render: project.id === state.activeProjectId });
-          await persistProjects({ immediate: true });
+          await persistProjects();
         } finally {
           state.generationControllers.delete(operation.id);
         }

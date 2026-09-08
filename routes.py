@@ -1,6 +1,7 @@
 """Versioned API and standalone-page routes for Prompt Studio Video."""
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -50,15 +51,18 @@ from .video.media import (
     MIN_REFERENCE_SECONDS,
 )
 from .video.director import director_chat, preview_changeset
+from .video.extension_planner import plan_extension
 from .video.default_setup import (
     default_model_setup_status,
     start_default_model_setup,
     workflow_setup_plan,
 )
-from .video.llm_provider import abort_generation, generation_status
+from .video.llm_provider import abort_generation, generation_status, run_operation, check_admission, job_ledger, job_status
 from .video.store import (
     StoreConflictError,
     read_project_store,
+    read_project_query,
+    maintain_project_store,
     read_workflow_store,
     update_project_store,
     update_workflow_store,
@@ -78,7 +82,6 @@ MAX_DIRECTOR_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CONTINUATION_REQUEST_BYTES = 256 * 1024
 PROJECT_LOCK = asyncio.Lock()
 WORKFLOW_LOCK = asyncio.Lock()
-DIRECTOR_LLM_LOCK = asyncio.Lock()
 CONTINUATION_ASSEMBLY_LOCK = asyncio.Lock()
 EXACT_AUDIO_ASSEMBLY_LOCK = asyncio.Lock()
 DIRECTOR_JOBS = {}
@@ -481,11 +484,15 @@ async def promptstudio_video_audio_probe(request):
         return web.json_response({"ok": False, "error": str(exc), "code": "audio_probe_failed"}, status=500)
 
 
-async def promptstudio_video_projects_get(_request):
+async def promptstudio_video_projects_get(request):
     try:
         async with PROJECT_LOCK:
-            data = await asyncio.to_thread(read_project_store, PROJECT_STORE_PATH, PROJECT_STORE_DIR)
-        return web.json_response(data)
+            data, status = await asyncio.to_thread(read_project_query, PROJECT_STORE_PATH, PROJECT_STORE_DIR, request.query)
+        if status == 204:
+            return web.Response(status=204, headers={"X-PromptStudio-Revision": str(data["revision"])})
+        return web.json_response(data, status=status)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -501,6 +508,21 @@ async def promptstudio_video_projects_put(request):
     except StoreConflictError as exc:
         return web.json_response({"error": str(exc)}, status=409)
     except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def promptstudio_video_projects_maintenance(request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("Maintenance request must be an object")
+        async with PROJECT_LOCK:
+            result = await asyncio.to_thread(maintain_project_store, PROJECT_STORE_PATH, PROJECT_STORE_DIR,
+                                             data.get("offset", 0), data.get("limit", 100))
+        return web.json_response(result)
+    except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
@@ -578,31 +600,44 @@ def _prune_director_jobs():
 
 async def _run_director_job(job_id, data):
     job = DIRECTOR_JOBS[job_id]
+    failure = None
 
     def update_progress(progress):
         job["director_progress"] = dict(progress)
+        job_ledger().update(job_id, studio="video", phase=progress.get("phase"))
+
+    def run_director(value):
+        if job.get("cancelled"):
+            raise asyncio.CancelledError()
+        job["status"] = "running"
+        job["started_at"] = time.time()
+        job_ledger().update(job_id, studio="video", phase="prompt_processing")
+        operation = plan_extension if job.get("kind") == "extension_plan" else director_chat
+        return operation(value, update_progress)
 
     try:
-        async with DIRECTOR_LLM_LOCK:
-            if job.get("cancelled"):
-                raise asyncio.CancelledError()
-            job["status"] = "running"
-            job["started_at"] = time.time()
-            result = await asyncio.to_thread(director_chat, data, update_progress)
+        result = await run_operation(
+            data, run_director, cancellation_check=lambda: bool(job.get("cancelled")),
+            job_context={"studio": "video", "job_id": job_id},
+        )
         if not job.get("cancelled"):
             job["result"] = result
             job["status"] = "complete"
     except asyncio.CancelledError:
         job["status"] = "cancelled"
     except Exception as exc:
+        failure = exc
         if not job.get("cancelled"):
             job["status"] = "failed"
             job["error"] = str(exc) or exc.__class__.__name__
     finally:
         job["finished_at"] = time.time()
+        job_ledger().update(job_id, studio="video", state=job["status"], error=failure,
+                            cancellation_requested=bool(job.get("cancelled")))
 
 
-def _start_director_job(data):
+def _start_director_job(data, *, kind="director"):
+    fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     requested_job_id = str(data.get("job_id") or "").strip()
     if requested_job_id:
         if len(requested_job_id) > 128 or not all(
@@ -611,10 +646,17 @@ def _start_director_job(data):
         ):
             raise ValueError("Director job ID is invalid")
         if requested_job_id in DIRECTOR_JOBS:
+            existing = DIRECTOR_JOBS[requested_job_id]
+            if existing.get("kind", "director") != kind or (kind == "extension_plan" and existing.get("request_fingerprint") != fingerprint):
+                raise ValueError("This job ID already belongs to a different request")
             return requested_job_id
     _prune_director_jobs()
+    check_admission(local_full=len(DIRECTOR_JOBS) >= MAX_DIRECTOR_JOBS)
     job_id = requested_job_id or str(uuid.uuid4())
+    job_ledger().start(job_id, studio="video", kind=kind, data=data)
     DIRECTOR_JOBS[job_id] = {
+        "kind": kind,
+        "request_fingerprint": fingerprint,
         "status": "queued",
         "created_at": time.time(),
         "provider_settings": {
@@ -638,21 +680,33 @@ async def _cancel_director_job(job_id):
     job = DIRECTOR_JOBS.get(job_id)
     if job is None:
         raise ValueError("Director job was not found")
-    previous_status = job.get("status", "queued")
     job["cancelled"] = True
     job["status"] = "cancelled"
     job["finished_at"] = time.time()
+    job_ledger().update(job_id, studio="video", state="cancelled", cancellation_requested=True)
     task = job.get("task")
-    if previous_status == "queued" and task and not task.done():
+    if task and not task.done():
         task.cancel()
-    if previous_status == "running" and str(
-        job.get("provider_settings", {}).get("llm_provider") or "koboldcpp"
-    ).casefold() in {"koboldcpp", "llamacpp"}:
-        try:
-            await asyncio.to_thread(abort_generation, job["provider_settings"])
-        except Exception:
-            pass
-    return {"job_id": job_id, "status": "cancelled"}
+    return {"job_id": job_id, "status": "cancelled", "provider_aborted": False}
+
+
+def _llm_error_response(exc):
+    payload = {"error": str(exc)}
+    if getattr(exc, "code", None):
+        payload.update(code=exc.code, retryable=bool(getattr(exc, "retryable", False)))
+    return web.json_response(payload, status=getattr(exc, "status", 502))
+
+
+async def _shutdown_director_jobs(_application):
+    for job_id, job in DIRECTOR_JOBS.items():
+        if job.get("status") in {"queued", "running"}:
+            job["cancelled"] = True
+            job["status"] = "cancelled"
+            job_ledger().update(job_id, studio="video", state="interrupted", code="server_restarted")
+    tasks = tuple(DIRECTOR_TASKS)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def promptstudio_video_director_chat(request):
@@ -661,20 +715,53 @@ async def promptstudio_video_director_chat(request):
         if data.get("async") is True:
             job_id = _start_director_job(data)
             return web.json_response({"job_id": job_id, "status": "queued"}, status=202)
-        async with DIRECTOR_LLM_LOCK:
-            result = await asyncio.to_thread(director_chat, data)
+        result = await run_operation(data, director_chat)
         return web.json_response(result)
     except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=502)
+        return _llm_error_response(exc)
+
+
+async def promptstudio_video_extension_plan(request):
+    try:
+        data = await _director_body(request)
+        if not str(data.get("brief") or "").strip():
+            raise ValueError("Describe what should happen in the extension")
+        continuation_frame_plan(data.get("duration_seconds", 5))
+        normalize_document(data.get("document"))
+        job_id = _start_director_job(data, kind="extension_plan")
+        return web.json_response({"job_id": job_id, "status": DIRECTOR_JOBS[job_id]["status"]}, status=202)
+    except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return _llm_error_response(exc)
+
+
+async def promptstudio_video_extension_plan_status(request):
+    recovered = job_status(request.match_info.get("job_id", ""))
+    if recovered and recovered["job"]["kind"] == "extension_plan" and request.match_info.get("job_id", "") not in DIRECTOR_JOBS:
+        return web.json_response(recovered)
+    if DIRECTOR_JOBS.get(request.match_info.get("job_id", ""), {}).get("kind") != "extension_plan":
+        return web.json_response({"error": "Extension plan was not found"}, status=404)
+    return await promptstudio_video_director_status(request)
+
+
+async def promptstudio_video_extension_plan_cancel(request):
+    if DIRECTOR_JOBS.get(request.match_info.get("job_id", ""), {}).get("kind") != "extension_plan":
+        return web.json_response({"error": "Extension plan was not found"}, status=404)
+    return await promptstudio_video_director_cancel(request)
 
 
 async def promptstudio_video_director_status(request):
-    job = DIRECTOR_JOBS.get(request.match_info.get("job_id", ""))
+    job_id = request.match_info.get("job_id", "")
+    job = DIRECTOR_JOBS.get(job_id)
     if job is None:
+        recovered = job_status(job_id)
+        if recovered:
+            return web.json_response(recovered)
         return web.json_response({"error": "Director job was not found"}, status=404)
-    response = {"status": job["status"]}
+    response = {"status": job["status"], "job": job_ledger().get(job_id, studio="video")}
     if job["status"] == "running":
         if job.get("director_progress"):
             response["director_progress"] = dict(job["director_progress"])
@@ -720,7 +807,7 @@ async def promptstudio_video_kobold_status(request):
     except (ValueError, json.JSONDecodeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=502)
+        return _llm_error_response(exc)
 
 
 async def promptstudio_video_llm_status(request):
@@ -730,7 +817,7 @@ async def promptstudio_video_llm_status(request):
     except (ValueError, json.JSONDecodeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=502)
+        return _llm_error_response(exc)
 
 
 async def promptstudio_video_kobold_abort(request):
@@ -740,7 +827,7 @@ async def promptstudio_video_kobold_abort(request):
     except (ValueError, json.JSONDecodeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=502)
+        return _llm_error_response(exc)
 
 
 async def promptstudio_video_llm_abort(request):
@@ -750,7 +837,7 @@ async def promptstudio_video_llm_abort(request):
     except (ValueError, json.JSONDecodeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=502)
+        return _llm_error_response(exc)
 
 
 def register_routes():
@@ -759,6 +846,9 @@ def register_routes():
     if server is None:
         return False
     routes = server.routes
+    shutdown = getattr(getattr(server, "app", None), "on_shutdown", None)
+    if shutdown is not None and _shutdown_director_jobs not in shutdown:
+        shutdown.append(_shutdown_director_jobs)
     routes.get("/promptstudio-video/capabilities")(promptstudio_video_capabilities)
     routes.post("/promptstudio-video/studio-presence")(promptstudio_video_presence)
     routes.post("/promptstudio-video/studio-handoff")(promptstudio_video_handoff_create)
@@ -775,12 +865,16 @@ def register_routes():
     routes.post("/promptstudio-video/media/audio-probe")(promptstudio_video_audio_probe)
     routes.get("/promptstudio-video/projects")(promptstudio_video_projects_get)
     routes.put("/promptstudio-video/projects")(promptstudio_video_projects_put)
+    routes.post("/promptstudio-video/projects/maintenance")(promptstudio_video_projects_maintenance)
     routes.get("/promptstudio-video/workflows")(promptstudio_video_workflows_get)
     routes.put("/promptstudio-video/workflows")(promptstudio_video_workflows_put)
     routes.get("/promptstudio-video/default-workflows")(promptstudio_video_default_workflows_get)
     routes.get("/promptstudio-video/default-setup")(promptstudio_video_default_setup_get)
     routes.post("/promptstudio-video/default-setup")(promptstudio_video_default_setup_post)
     routes.post("/promptstudio-video/director/chat")(promptstudio_video_director_chat)
+    routes.post("/promptstudio-video/continuations/plan")(promptstudio_video_extension_plan)
+    routes.get("/promptstudio-video/continuations/plan/{job_id}")(promptstudio_video_extension_plan_status)
+    routes.post("/promptstudio-video/continuations/plan/{job_id}/cancel")(promptstudio_video_extension_plan_cancel)
     routes.get("/promptstudio-video/director/chat/{job_id}")(promptstudio_video_director_status)
     routes.post("/promptstudio-video/director/chat/{job_id}/cancel")(promptstudio_video_director_cancel)
     routes.post("/promptstudio-video/director/preview")(promptstudio_video_director_preview)

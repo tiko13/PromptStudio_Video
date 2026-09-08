@@ -69,7 +69,7 @@ class StoreTests(unittest.TestCase):
                     "projects": [project],
                 })
 
-    def test_project_store_uses_one_json_file_per_session_and_archives_deleted_session(self):
+    def test_project_store_uses_immutable_records_and_retains_deleted_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "projects.json")
             project_directory = Path(directory, "projects")
@@ -103,8 +103,8 @@ class StoreTests(unittest.TestCase):
                 "projects": [projects[0]],
             })
             self.assertEqual(saved["revision"], 2)
-            self.assertEqual(len(list(project_directory.glob("project_*.json"))), 1)
-            self.assertEqual(len(list((project_directory / "_backups").glob("project_*.bak"))), 1)
+            self.assertEqual(len(list(project_directory.glob("project_*.json"))), 2)
+            self.assertTrue((project_directory / "_backups" / "index.bak").is_file())
             self.assertEqual([project["id"] for project in read_project_store(path)["projects"]], ["project-one"])
 
     def test_project_store_migrates_legacy_monolith(self):
@@ -132,7 +132,7 @@ class StoreTests(unittest.TestCase):
             project_directory = Path(directory, "projects")
             self.assertEqual(restored["version"], 2)
             self.assertEqual(restored["revision"], 7)
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
             self.assertTrue((project_directory / "index.json").is_file())
             self.assertEqual(len(list(project_directory.glob("project_*.json"))), 1)
             self.assertTrue((project_directory / "_backups" / "legacy_store.bak").is_file())

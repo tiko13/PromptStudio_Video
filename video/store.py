@@ -4,20 +4,41 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import tempfile
 import time
+import sys
+from pathlib import Path
 
 from .contracts import PromptDocumentError, normalize_document
+
+
+def shared_transactional_store():
+    """Consume the primary pure persistence service without ComfyUI startup."""
+    name = "_promptstudio_shared_transactional_store"
+    if name not in sys.modules:
+        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "transactional_store.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Prompt Studio shared persistence service is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+    return sys.modules[name]
+
+
+# Import initialization is serialized by Python; eager resolution keeps nested
+# cross-thread store calls on the same shared module and reentrant lock registry.
+_TRANSACTIONAL_STORE = shared_transactional_store()
 
 
 STORE_VERSION = 1
 PROJECT_STORE_VERSION = 2
 MAX_PROJECTS = 500
-MAX_GENERATIONS_PER_PROJECT = 200
 MAX_PROJECT_NAME_CHARS = 200
 MAX_PROJECT_BRIEF_CHARS = 32 * 1024
 MAX_PROJECT_STORE_BYTES = 100 * 1024 * 1024
@@ -251,6 +272,35 @@ def _normalize_extension_source(value, project_index):
     }
 
 
+def _normalize_pending_generation_restore(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("Saved generation restore has an unsupported format")
+    generation = _normalize_generation(value.get("generation"), 0)
+    snapshot = generation.get("workflow_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("output"), dict):
+        raise ValueError("Saved generation restore requires executable workflow inputs")
+    if "workflow" in snapshot and not isinstance(snapshot["workflow"], dict):
+        raise ValueError("Saved generation restore workflow envelope is invalid")
+    if not isinstance(generation.get("document"), dict):
+        raise ValueError("Saved generation restore requires an authored document")
+    fingerprint = value.get("fingerprint")
+    if not isinstance(fingerprint, dict) or not isinstance(fingerprint.get("document"), dict):
+        raise ValueError("Saved generation restore requires its authoring fingerprint")
+    return {
+        "version": 1,
+        "generation": generation,
+        "fingerprint": {
+            "document": normalize_document(fingerprint["document"]),
+            "workflow_id": str(fingerprint.get("workflow_id") or "").strip()[:1024],
+            "additional_input_selections": _normalize_additional_input_selections(
+                fingerprint.get("additional_input_selections")
+            ),
+        },
+    }
+
+
 def _normalize_project(value, index):
     if not isinstance(value, dict):
         raise ValueError(f"Project {index + 1} must be an object")
@@ -258,7 +308,8 @@ def _normalize_project(value, index):
     generations = value.get("generations") or []
     if not isinstance(generations, list):
         raise ValueError(f"Project {index + 1} generations must be a list")
-    generations = generations[-MAX_GENERATIONS_PER_PROJECT:]
+    # Retain complete history. The store byte bound rejects an oversized save
+    # explicitly; normalization must never silently remove historical renders.
     created_at = _timestamp(value.get("created_at"))
     brief = _text(value.get("brief"), MAX_PROJECT_BRIEF_CHARS, "Project brief")
     document_value = copy.deepcopy(value.get("document") or {})
@@ -292,6 +343,9 @@ def _normalize_project(value, index):
         "updated_at": _timestamp(value.get("updated_at") or created_at),
     }
     extension_source = _normalize_extension_source(value.get("extension_source"), index)
+    pending_restore = _normalize_pending_generation_restore(value.get("pending_generation_restore"))
+    if pending_restore is not None:
+        result["pending_generation_restore"] = pending_restore
     if extension_source is not None:
         # Keep persisted authoring state lossless. Continuation execution owns
         # capability validation, including the current restriction on adding
@@ -373,91 +427,120 @@ def _project_backup_path(directory, project_id):
 
 
 def _read_project_index(directory):
-    try:
-        with open(_project_index_path(directory), "r", encoding="utf-8") as file:
-            index = json.load(file)
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid Video Studio project index: {exc}") from exc
-    if (
-        not isinstance(index, dict)
-        or index.get("version") != PROJECT_STORE_VERSION
-        or not isinstance(index.get("projectFiles"), list)
-    ):
-        raise RuntimeError("Video Studio project index must contain a projectFiles list")
-    return index
+    return shared_transactional_store().read_manifest(directory, "projectFiles", "project")
 
 
 def _read_split_project_store(directory, index):
-    projects = []
-    seen_ids = set()
-    for position, entry in enumerate(index["projectFiles"]):
-        if not isinstance(entry, dict):
-            raise RuntimeError(f"Video Studio project index entry {position + 1} must be an object")
-        project_id = str(entry.get("id") or "").strip()
-        expected_file = _project_file_name(project_id) if project_id else ""
-        if not project_id or entry.get("file") != expected_file or project_id in seen_ids:
-            raise RuntimeError(f"Invalid Video Studio project index entry {position + 1}")
-        seen_ids.add(project_id)
-        path = os.path.join(directory, expected_file)
-        try:
-            with open(path, "r", encoding="utf-8") as file:
-                project = json.load(file)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Video Studio project file is missing: {expected_file}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Invalid Video Studio project file {expected_file}: {exc}") from exc
-        if not isinstance(project, dict) or str(project.get("id") or "").strip() != project_id:
-            raise RuntimeError(f"Video Studio project file does not match index id {project_id!r}")
-        projects.append(project)
-    return normalize_project_store({
+    index, projects = shared_transactional_store().read_snapshot(directory, "projectFiles", "project", index)
+    result = normalize_project_store({
         "version": PROJECT_STORE_VERSION,
         "revision": index.get("revision"),
         "active_project_id": index.get("active_project_id"),
         "projects": projects,
     })
+    if index.get("_recovery"):
+        result["recovery"] = index["_recovery"]
+    return result
 
 
 def _write_split_project_store(directory, data):
-    previous_index = _read_project_index(directory)
-    previous_entries = previous_index.get("projectFiles", []) if previous_index else []
-    os.makedirs(directory, exist_ok=True)
-    entries = []
-    for project in data["projects"]:
-        project_id = project["id"]
-        filename = _project_file_name(project_id)
-        entries.append({"id": project_id, "file": filename})
-        _atomic_write(
-            _project_file_path(directory, project_id),
-            project,
-            MAX_PROJECT_STORE_BYTES,
-            backup_path=_project_backup_path(directory, project_id),
-            skip_unchanged=True,
-        )
-    index = {
-        "version": PROJECT_STORE_VERSION,
-        "revision": _revision(data.get("revision")),
-        "active_project_id": data.get("active_project_id"),
-        "projectFiles": entries,
-    }
-    _atomic_write(
-        _project_index_path(directory),
-        index,
-        MAX_PROJECT_STORE_BYTES,
-        backup_path=os.path.join(_project_backups_directory(directory), "index.bak"),
+    metadata = {key: value for key, value in data.items() if key not in {"projects", "recovery"}}
+    shared_transactional_store().commit_records(
+        directory, metadata, data["projects"], "projectFiles", "project",
+        maximum_bytes=MAX_PROJECT_STORE_BYTES, summary_builder=_project_summary,
     )
-    retained_files = {entry["file"] for entry in entries}
-    for entry in previous_entries:
-        project_id = str(entry.get("id") or "").strip() if isinstance(entry, dict) else ""
-        filename = entry.get("file") if isinstance(entry, dict) else None
-        if not project_id or filename != _project_file_name(project_id) or filename in retained_files:
-            continue
-        project_path = os.path.join(directory, filename)
-        if os.path.isfile(project_path):
-            os.makedirs(_project_backups_directory(directory), exist_ok=True)
-            os.replace(project_path, _project_backup_path(directory, project_id))
     return data
+
+
+def _project_summary(project):
+    generations = project.get("generations") or []
+    return {"id": project["id"], "name": str(project.get("name") or "Untitled video")[:200],
+            "brief": str(project.get("brief") or "")[:200], "workflow_id": project.get("workflow_id", ""),
+            "created_at": project.get("created_at", 0), "updated_at": project.get("updated_at", 0),
+            "generation_count": len(generations),
+            "pending_count": sum(generation.get("status") in {"validating", "compiling", "queueing", "queued", "generating"} for generation in generations),
+            "last_generation_status": generations[-1].get("status") if generations else None}
+
+
+def read_project_query(path, directory, query, _index=None):
+    service = shared_transactional_store()
+    index = _read_project_index(directory) if _index is None else _index
+    if index is None:
+        if (query.get("summaries") == "1" or query.get("limit") is not None) and os.path.isfile(path):
+            return {"maintenance_required": True, "projects": [], "summaries": []}, 202
+        data = read_project_store(path, directory)
+        if query.get("revision") is not None and _revision(query.get("revision")) == data["revision"]:
+            return {"revision": data["revision"]}, 204
+        return data, 200
+    revision = _revision(index.get("revision"))
+    if not index.get("_recovery") and query.get("revision") is not None and _revision(query.get("revision")) == revision:
+        return {"revision": revision}, 204
+    entries = index["projectFiles"]
+    base = {"version": PROJECT_STORE_VERSION, "revision": revision, "active_project_id": index.get("active_project_id"), "total": len(entries)}
+    if index.get("_recovery"):
+        base["recovery"] = index["_recovery"]
+    project_id = query.get("project_id")
+    if project_id is not None:
+        selected_index, records = service.read_selected_snapshot(directory, index, "projectFiles", "project", [project_id])
+        if selected_index is not index:
+            return read_project_query(path, directory, query, selected_index)
+        return ({**base, "projects": [_normalize_project(value, 0) for value in records], "partial": True}, 200) if records else ({"error": "Project was not found"}, 404)
+    if query.get("limit") is None and query.get("summaries") != "1":
+        return _read_split_project_store(directory, index), 200
+    limit, offset = int(query.get("limit", 20)), int(query.get("offset", 0))
+    if not 1 <= limit <= 100 or offset < 0:
+        raise ValueError("Project page offset or limit is invalid")
+    missing = sum(not isinstance(entry.get("summary"), dict) for entry in entries)
+    if missing:
+        return {**base, "projects": [], "summaries": [], "maintenance_required": True, "summary_records_remaining": missing}, 202
+    ordered = sorted((entry["summary"] for entry in entries), key=lambda item: (-float(item["updated_at"]), -float(item["created_at"]), item["id"]))
+    cursor = [query.get(key) for key in ("before_updated", "before_created", "before_id")]
+    if any(value is not None for value in cursor):
+        if any(value is None for value in cursor):
+            raise ValueError("Project page cursor is incomplete")
+        boundary = (-float(cursor[0]), -float(cursor[1]), cursor[2])
+        ordered = [item for item in ordered if (-float(item["updated_at"]), -float(item["created_at"]), item["id"]) > boundary]
+        offset = 0
+    page = ordered[offset:offset + limit]
+    selected = list(page)
+    active = index.get("active_project_id")
+    if query.get("include_active") == "1" and offset == 0 and active and all(item["id"] != active for item in selected):
+        selected.extend(entry["summary"] for entry in entries if entry["id"] == active)
+    if query.get("include_pending") == "1" and offset == 0:
+        selected_ids = {item["id"] for item in selected}
+        selected.extend(entry["summary"] for entry in entries if entry["id"] not in selected_ids and entry["summary"].get("pending_count", 0) > 0)
+    result = {**base, "offset": offset, "nextOffset": offset + len(page), "hasMore": offset + len(page) < len(ordered),
+              "nextCursor": ({"updated_at": page[-1]["updated_at"], "created_at": page[-1]["created_at"], "id": page[-1]["id"]} if page else None)}
+    if query.get("summaries") == "1":
+        result.update({"summaries": selected, "projects": []})
+    else:
+        selected_index, loaded = service.read_selected_snapshot(directory, index, "projectFiles", "project", [item["id"] for item in selected])
+        if selected_index is not index:
+            return read_project_query(path, directory, query, selected_index)
+        by_id = {project["id"]: project for project in loaded}
+        result["projects"] = [_normalize_project(by_id[item["id"]], position) for position, item in enumerate(selected)]
+    return result, 200
+
+
+def maintain_project_store(path, directory, offset=0, limit=100):
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("Maintenance requires a nonnegative offset and a limit between 1 and 100")
+    service = shared_transactional_store()
+    with service.store_lock(directory):
+        index = _read_project_index(directory)
+        if index is None:
+            read_project_store(path, directory)
+            index = _read_project_index(directory)
+        if index is None:
+            return {"revision": 0, "processed": 0, "hasMore": False, "nextOffset": 0}
+        if index.get("_recovery"):
+            raise service.RecoveryRequiredError(index["_recovery"]["message"])
+        entries = index["projectFiles"][offset:offset + limit]
+        records = service.read_records(directory, index, "projectFiles", "project", [entry["id"] for entry in entries])
+        saved = service.commit_record_updates(directory, {"revision": index["revision"] + 1}, records,
+                                              "projectFiles", "project", expected_revision=index["revision"], summary_builder=_project_summary)
+        return {"revision": saved["revision"], "processed": len(records), "nextOffset": offset + len(records),
+                "hasMore": offset + len(records) < len(index["projectFiles"])}
 
 
 def _read_legacy_project_store(path):
@@ -477,14 +560,19 @@ def _archive_legacy_project_store(path, directory):
     backups = _project_backups_directory(directory)
     os.makedirs(backups, exist_ok=True)
     if os.path.isfile(path):
-        os.replace(path, os.path.join(backups, "legacy_store.bak"))
+        shutil.copy2(path, os.path.join(backups, "legacy_store.bak"))
     legacy_backup = f"{path}.bak"
     if os.path.isfile(legacy_backup):
-        os.replace(legacy_backup, os.path.join(backups, "legacy_previous_store.bak"))
+        shutil.copy2(legacy_backup, os.path.join(backups, "legacy_previous_store.bak"))
 
 
 def read_project_store(path, directory=None):
     directory = _project_store_directory(path, directory)
+    with shared_transactional_store().store_lock(directory):
+        return _read_project_store_unlocked(path, directory)
+
+
+def _read_project_store_unlocked(path, directory):
     try:
         index = _read_project_index(directory)
         if index is not None:
@@ -502,12 +590,48 @@ def read_project_store(path, directory=None):
 
 def update_project_store(path, value, directory=None):
     directory = _project_store_directory(path, directory)
+    with shared_transactional_store().store_lock(directory):
+        return _update_project_store_unlocked(path, value, directory)
+
+
+def _update_project_store_unlocked(path, value, directory):
+    if isinstance(value, dict) and value.get("partial") is True:
+        index = _read_project_index(directory)
+        if index is not None:
+            return _update_project_records(directory, value, index)
     current = read_project_store(path, directory)
+    if current.get("recovery"):
+        raise shared_transactional_store().RecoveryRequiredError(current["recovery"]["message"])
     if _revision(value.get("revision") if isinstance(value, dict) else None) != current["revision"]:
         raise StoreConflictError("Video projects changed in another browser. Reload before saving again.")
     normalized = normalize_project_store(value)
     normalized["revision"] = current["revision"] + 1
     return _write_split_project_store(directory, normalized)
+
+
+def _update_project_records(directory, value, index):
+    service = shared_transactional_store()
+    if index.get("_recovery"):
+        raise service.RecoveryRequiredError(index["_recovery"]["message"])
+    if _revision(value.get("revision")) != index["revision"]:
+        raise StoreConflictError("Video projects changed in another browser. Reload before saving again.")
+    deleted = value.get("deletedProjectIds", [])
+    if not isinstance(deleted, list) or any(not isinstance(item, str) for item in deleted):
+        raise ValueError("deletedProjectIds must be a list of project ids")
+    deleted = {item.strip() for item in deleted if item.strip()}
+    normalized = normalize_project_store(value)
+    records = [project for project in normalized["projects"] if project["id"] not in deleted]
+    retained = ({entry["id"] for entry in index["projectFiles"]} | {project["id"] for project in records}) - deleted
+    if len(retained) > MAX_PROJECTS:
+        raise ValueError(f"Project store may contain at most {MAX_PROJECTS} projects")
+    active = value.get("active_project_id", index.get("active_project_id"))
+    if active not in retained:
+        active = next((entry["id"] for entry in index["projectFiles"] if entry["id"] in retained), next(iter(sorted(retained)), None))
+    saved = service.commit_record_updates(directory, {"revision": index["revision"] + 1, "active_project_id": active,
+                                                      "deletedProjectIds": sorted(set(index.get("deletedProjectIds", [])) | deleted)},
+                                         records, "projectFiles", "project", expected_revision=index["revision"], deleted_ids=deleted,
+                                         maximum_bytes=MAX_PROJECT_STORE_BYTES, summary_builder=_project_summary)
+    return {"version": PROJECT_STORE_VERSION, "revision": saved["revision"], "active_project_id": active, "projects": records, "partial": True}
 
 
 def empty_workflow_store():
@@ -563,6 +687,16 @@ def _normalize_workflow(value, index):
         if default_value is not None and not isinstance(default_value, (str, int, float, bool)):
             raise ValueError(f"Workflow {index + 1} has an invalid Additional Input default")
         seen_additional_ids.add(source_id)
+    cache_identity = value.get("cacheIdentity")
+    cache_fields = ("version", "adapterId", "adapterVersion", "conversionVersion", "inputVersion", "contentHash", "capabilityHash")
+    valid_cache = (
+        isinstance(cache_identity, dict) and cache_identity.get("version") == 1
+        and cache_identity.get("adapterId") in {"image", "minimax_h3"}
+        and all(isinstance(cache_identity.get(key), int) and not isinstance(cache_identity[key], bool) and cache_identity[key] > 0
+                for key in ("version", "adapterVersion", "conversionVersion", "inputVersion"))
+        and all(isinstance(cache_identity.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", cache_identity[key])
+                for key in ("contentHash", "capabilityHash"))
+    )
     return {
         "id": path,
         "path": path,
@@ -574,6 +708,7 @@ def _normalize_workflow(value, index):
         "additionalInputs": additional_inputs,
         "promptStudioInputVersion": max(0, int(value.get("promptStudioInputVersion") or 0)),
         "snapshot": copy.deepcopy(snapshot),
+        **({"cacheIdentity": {key: cache_identity[key] for key in cache_fields}} if valid_cache else {}),
         "source_modified": _timestamp(value.get("source_modified")),
         "updated_at": _timestamp(value.get("updated_at")),
         "stale": bool(value.get("stale", False)),

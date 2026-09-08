@@ -15,8 +15,8 @@ import re
 import tempfile
 
 import torch
-from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open, SafetensorError
+from safetensors.torch import save_file
 
 
 FPS = 24.0
@@ -292,38 +292,65 @@ def soft_av_masks(latent, video_steps, audio_steps):
 
 def _load_saved_tail(relative_path):
     path = _output_path(relative_path, must_exist=True)
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        metadata = dict(handle.metadata() or {})
-    values = load_file(path)
-    if "video" not in values or "audio" not in values:
-        raise ValueError("Saved Prompt Studio context is missing its video or audio stream")
+    if os.path.getsize(path) > 128 * 1024 * 1024:
+        raise ValueError("Saved context exceeds the 128 MiB file budget")
+    try:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            metadata = dict(handle.metadata() or {})
+            if set(handle.keys()) != {"video", "audio"}:
+                raise ValueError("Saved context must contain only its video and audio streams")
+            if metadata.get("format") not in {"promptstudio_h3_av_tail_v2", SOFT_AV_FORMAT}:
+                raise ValueError("Saved context has an unsupported format")
+            shapes = {key: handle.get_slice(key).get_shape() for key in ("video", "audio")}
+            video_shape, audio_shape = shapes["video"], shapes["audio"]
+            if (len(video_shape) != 5 or len(audio_shape) != 4 or
+                any(int(n) <= 0 for shape in shapes.values() for n in shape) or
+                video_shape[0] != 1 or audio_shape[0] != 1 or video_shape[1] != 24 or
+                audio_shape[1:3] != [32, 2] or video_shape[2] > 17 or audio_shape[-1] > 94):
+                raise ValueError("Saved context exceeds the compact H3 AV shape budget")
+            import math
+            if sum(math.prod(shape) * 4 for shape in shapes.values()) > 128 * 1024 * 1024:
+                raise ValueError("Saved context exceeds the 128 MiB latent budget")
+            frames = int(metadata.get("context_frames", 0))
+            if (frames not in CONTEXT_FRAME_OPTIONS or steps_for_frames(frames) != video_shape[2] or
+                round(frames / FPS * AUDIO_LATENT_HZ) != audio_shape[-1]):
+                raise ValueError("Saved context metadata does not match its tensor clock")
+            source_frames = int(metadata.get("source_video_frames", 0))
+            source_audio = int(metadata.get("source_audio_steps", 0))
+            overhang = float(metadata.get("audio_overhang_steps", "nan"))
+            if (not 0 < source_frames <= 86400 or source_audio <= 0 or
+                not math.isfinite(overhang) or abs(overhang) >= .500001 or
+                abs(source_audio - source_frames * FRAME_RESCALE - overhang) > 1e-6):
+                raise ValueError("Saved context source-clock metadata is inconsistent")
+            for key, shape in shapes.items():
+                if metadata.get(key + "_shape") != "x".join(str(n) for n in shape):
+                    raise ValueError("Saved context shape metadata is inconsistent")
+                if handle.get_slice(key).get_dtype() not in {"F16", "BF16", "F32"}:
+                    raise ValueError("Saved context must use a supported floating-point dtype")
+            # Header checks precede tensor materialization; load through the same handle.
+            values = {key: handle.get_tensor(key) for key in shapes}
+    except SafetensorError as exc:
+        raise ValueError("Saved context has an invalid safetensors header") from exc
     return {"samples": [values["video"], values["audio"]], "metadata": metadata}
 
 
 def _fallback_tail(video_path, video_vae, audio_vae, target_video, frame_count):
-    from comfy_extras.nodes_video import LoadVideo
-
+    import folder_paths
     try:
-        result = LoadVideo.execute(file=video_path).result
-    except TypeError:
-        result = LoadVideo.execute(video=video_path).result
-    if not result:
-        raise ValueError("ComfyUI could not load the parent video for continuation")
-    components = result[0].get_components()
-    images = components.images
-    source_fps = float(components.frame_rate)
-    if images is None or len(images) < frame_count or source_fps <= 0:
+        from ..video.media_budget import video_range, audio_array, geometry
+        from ..video.continuation import probe_video
+    except ImportError:
+        from video.media_budget import video_range, audio_array, geometry
+        from video.continuation import probe_video
+    path = folder_paths.get_annotated_filepath(video_path)
+    info = probe_video(path)
+    start = info["duration"] - frame_count / FPS
+    if start < 0:
         raise ValueError("The parent video is too short for continuation context")
-    source_duration = len(images) / source_fps
-    start = source_duration - frame_count / FPS
-    indices = torch.clamp(
-        ((start + torch.arange(frame_count, dtype=torch.float64) / FPS) * source_fps).round().long(),
-        0,
-        len(images) - 1,
-    )
-    tail = images[indices]
+    tail, _, _ = video_range(path, start, info["duration"], FPS)
     target_height = int(target_video.shape[3]) * 16
     target_width = int(target_video.shape[4]) * 16
+    geometry(target_width, target_height, frame_count)
     if int(tail.shape[1]) != target_height or int(tail.shape[2]) != target_width:
         import comfy.utils
 
@@ -331,21 +358,8 @@ def _fallback_tail(video_path, video_vae, audio_vae, target_video, frame_count):
             tail[..., :3].movedim(-1, 1), target_width, target_height, "lanczos", "center"
         ).movedim(1, -1)
     video = video_vae.encode(tail)
-    audio_value = components.audio
     target_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
-    samples = max(1, round(frame_count / FPS * target_rate))
-    if not audio_value:
-        waveform = torch.zeros((1, 2, samples), dtype=torch.float32)
-    else:
-        waveform = audio_value["waveform"]
-        sample_rate = int(audio_value["sample_rate"])
-        if sample_rate != target_rate:
-            import torchaudio
-
-            waveform = torchaudio.functional.resample(waveform, sample_rate, target_rate)
-        waveform = waveform[..., -samples:]
-        if waveform.shape[-1] < samples:
-            waveform = torch.nn.functional.pad(waveform, (samples - waveform.shape[-1], 0))
+    waveform = torch.from_numpy(audio_array(path, target_rate, start, info["duration"]))[None]
     if waveform.shape[1] == 1:
         waveform = waveform.repeat(1, 2, 1)
     elif waveform.shape[1] > 2:

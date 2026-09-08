@@ -69,6 +69,10 @@ extension** creates a durable extension project linked to the immutable source
 render and workflow snapshot. The extension uses the normal timeline and Shot
 Editor, so it may contain multiple cuts, ordered action and verbatim dialogue
 steps, camera changes, visible text, generated sound cues, ambience, and music.
+Full planning runs as a background job with progress, cancellation, retry and an
+explicit **Apply extension plan** step. Applying a plan creates one child project and
+preserves the parent; a failed or cancelled plan is not silently applied. The
+same provider scheduler used by Image and the Video Directors owns planning.
 Its authored timeline describes only the new 5–15 second tail; Video Studio
 injects the 39-frame Soft AV handoff, offsets authored cuts and first-shot event timing,
 then removes the overlap automatically. **Shot director** works on every
@@ -112,6 +116,27 @@ This repository is under active development. The sections below cover requiremen
 
 No additional pip package is currently required. ComfyUI supplies PyTorch,
 PyAV, torchaudio, Pillow, and its native media loaders.
+
+The installation metadata retains Python `>=3.9`. Only Python **3.14** through
+the ComfyUI VENV was verified locally for this audit; Python 3.9–3.13 remain
+unverified. The companion's quality workflow targets 3.14, and its
+[release checklist](https://github.com/tiko13/ComfyUI_PromptStudio/blob/master/docs/release-checklist.md)
+separates unit/browser-fixture evidence from native GPU and media validation.
+There is no unconditional startup installer for host-provided packages.
+
+Runtime compatibility is capability-based: the host must provide native
+`MiniMaxH3ImageToVideo`, `MiniMaxH3ReferenceToVideo`, `SaveVideo`, H3 nested latent
+and denoise-mask support, the required media codecs, and isolated `graphToPrompt`
+conversion with serialized subgraphs. `/promptstudio-video/capabilities`
+advertises `native_h3_soft_av_39`; this is the supported 39-frame continuation
+contract, not proof that a model or GPU render has been exercised on that host.
+
+The two default workflows are maintained as readable source JSON in
+[`workflows/`](workflows/). `video/default_setup.py` loads those files directly
+with the standard library; there are no opaque compressed workflow strings to
+regenerate. Source serialization is deterministic, and packaging tests check the
+normal/Turbo node contracts and round-trip data. Keep this directory in source
+and registry distribution archives.
 
 ## Installation
 

@@ -7,6 +7,9 @@ import math
 import torch
 
 from .contracts import PromptDocumentError, model_references
+from .media_budget import video_range, audio_array, trim_range, geometry, MAX_TENSOR_BYTES, bounded_media
+from .audio_mix import _input_path, probe_input_audio
+from .continuation import probe_video
 
 
 TARGET_FPS = 24
@@ -18,27 +21,23 @@ MAX_REFERENCE_TOTAL_SECONDS = 15.0
 def _load_image(path):
     if not path:
         raise PromptDocumentError("Image reference has no uploaded input path")
-    import nodes
+    import numpy as np
+    from PIL import Image, ImageOps
+    with Image.open(_input_path(path)) as source:
+        geometry(source.width, source.height)
+        # References consume one still, including animated image containers.
+        value = ImageOps.exif_transpose(source).convert("RGB")
+        return torch.from_numpy(np.asarray(value).astype(np.float32) / np.float32(255))[None]
 
-    image, _mask = nodes.LoadImage().load_image(path)
-    return image[:1]
 
 
-def _video_components(path):
-    if not path:
-        raise PromptDocumentError("Video reference has no uploaded input path")
-    from comfy_extras.nodes_video import LoadVideo
-
-    try:
-        output = LoadVideo.execute(file=path).result
-    except TypeError:
-        # Compatibility with ComfyUI builds whose legacy LoadVideo input was
-        # still named `video` rather than `file`.
-        output = LoadVideo.execute(video=path).result
-    if not output:
-        raise PromptDocumentError(f"ComfyUI could not load video reference '{path}'")
-    components = output[0].get_components()
-    return components.images, components.audio, float(components.frame_rate)
+def _video_components(path, trim_start=0, trim_end=None, embedded_audio=True):
+    path = _input_path(path)
+    frames, start, end = video_range(path, trim_start, trim_end, minimum=2)
+    audio = None
+    if embedded_audio and probe_video(path)["has_audio"]:
+        audio = {"waveform": torch.from_numpy(audio_array(path, 48000, start, end))[None], "sample_rate": 48000}
+    return frames, audio, TARGET_FPS
 
 
 def _trim_and_resample_video(frames, source_fps, trim_start=0.0, trim_end=None):
@@ -78,15 +77,11 @@ def _trim_audio(audio, trim_start=0.0, trim_end=None):
     }
 
 
-def _load_audio(path):
-    if not path:
-        raise PromptDocumentError("Audio reference has no uploaded input path")
-    from comfy_extras.nodes_audio import LoadAudio
-
-    output = LoadAudio.execute(audio=path).result
-    if not output:
-        raise PromptDocumentError(f"ComfyUI could not load audio reference '{path}'")
-    return output[0]
+def _load_audio(path, trim_start=0, trim_end=None):
+    metadata = probe_input_audio(path)
+    start, end = trim_range(metadata["duration_seconds"], trim_start, trim_end, 15, 2)
+    rate = int(metadata["sample_rate"])
+    return {"waveform": torch.from_numpy(audio_array(_input_path(path), rate, start, end))[None], "sample_rate": rate}
 
 
 def anchor_images(document):
@@ -106,6 +101,7 @@ def anchor_images(document):
     return first, last
 
 
+@bounded_media
 def reference_inputs(document):
     """Return native MiniMax ref dictionaries in deterministic presentation order."""
     images = {}
@@ -115,32 +111,54 @@ def reference_inputs(document):
     video_total = 0.0
     audio_total = 0.0
 
-    for reference in model_references(document):
+    references = model_references(document)
+    counts = {kind: sum(ref["kind"] == kind for ref in references) for kind in ("image", "video", "audio")}
+    audio_count = counts["audio"] + sum(ref["kind"] == "video" and ref["use_embedded_audio"] for ref in references)
+    if counts["image"] > 9 or counts["video"] > 3 or audio_count > 3 or sum(counts.values()) + audio_count - counts["audio"] > 12:
+        raise PromptDocumentError("REF2VA supports at most 9 images, 3 videos, 3 audio tracks and 12 items")
+    if audio_count and not counts["image"] and not counts["video"]:
+        raise PromptDocumentError("REF2VA audio requires an image or video reference")
+    # Probe every trim and aggregate footprint before decoding any reference.
+    video_seconds = audio_seconds = tensor_bytes = 0
+    for ref in references:
+        if ref["kind"] == "image":
+            from PIL import Image
+            with Image.open(_input_path(ref["path"])) as image:
+                geometry(image.width, image.height)
+                tensor_bytes += image.width * image.height * 12
+            continue
+        info = probe_video(_input_path(ref["path"])) if ref["kind"] == "video" else probe_input_audio(ref["path"])
+        start, end = trim_range(info.get("duration", info.get("duration_seconds")), ref["trim_start"], ref["trim_end"], 15, 2)
+        seconds = end - start
+        if ref["kind"] == "video":
+            frame_count = int(seconds * TARGET_FPS)
+            geometry(info["width"], info["height"], frame_count)
+            tensor_bytes += info["width"] * info["height"] * frame_count * 12
+            video_seconds += seconds
+            if ref["use_embedded_audio"] and info["has_audio"]:
+                audio_seconds += seconds
+        else:
+            audio_seconds += seconds
+    if video_seconds > 15 or audio_seconds > 15 or tensor_bytes > MAX_TENSOR_BYTES:
+        raise PromptDocumentError("Reference totals exceed the 15-second or 512 MiB decode budget")
+
+    for reference in references:
         kind = reference["kind"]
         if kind == "image":
             images[f"ref_image_{len(images) + 1}"] = _load_image(reference["path"])
             continue
         if kind == "video":
-            frames, embedded_audio, source_fps = _video_components(reference["path"])
-            frames, duration, start, end = _trim_and_resample_video(
-                frames,
-                source_fps,
-                reference["trim_start"],
-                reference["trim_end"],
-            )
+            frames, embedded_audio, source_fps = _video_components(reference["path"], reference["trim_start"], reference["trim_end"], reference["use_embedded_audio"])
+            duration = len(frames) / TARGET_FPS
             video_total += duration
             key = f"ref_video_{len(videos) + 1}"
             videos[key] = frames
             if reference["use_embedded_audio"] and embedded_audio:
-                trimmed = _trim_audio(embedded_audio, start, end)
+                trimmed = embedded_audio
                 video_audios[f"ref_video_audio_{len(videos)}"] = trimmed
                 audio_total += trimmed["waveform"].shape[-1] / trimmed["sample_rate"]
             continue
-        audio = _trim_audio(
-            _load_audio(reference["path"]),
-            reference["trim_start"],
-            reference["trim_end"],
-        )
+        audio = _load_audio(reference["path"], reference["trim_start"], reference["trim_end"])
         duration = audio["waveform"].shape[-1] / audio["sample_rate"]
         if duration < MIN_REFERENCE_SECONDS or duration > MAX_REFERENCE_SECONDS:
             raise PromptDocumentError(

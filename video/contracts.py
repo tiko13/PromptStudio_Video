@@ -7,6 +7,40 @@ import json
 import math
 import re
 import uuid
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Literal, TypedDict
+
+
+class VideoDocumentWire(TypedDict):
+    wire_version: Literal[1]
+    kind: Literal["video_document"]
+    document: dict
+
+
+def shared_wire_contracts():
+    """Load the pure shared contract module without importing ComfyUI startup code."""
+    name = "_promptstudio_shared_wire_contracts"
+    if name not in sys.modules:
+        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "wire_contracts.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Prompt Studio shared wire contracts are unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+    return sys.modules[name]
+
+
+def normalize_document_wire(value) -> VideoDocumentWire:
+    """Migrate legacy raw documents into the explicit Video-owned wire variant."""
+    shared_wire_contracts().require_wire_version(value)
+    if value.get("wire_version") == 1:
+        if value.get("kind") != "video_document":
+            raise PromptDocumentError("Invalid video document wire kind")
+        value = value.get("document")
+    return {"wire_version": 1, "kind": "video_document", "document": normalize_document(value)}
 
 
 DOCUMENT_VERSION = 1
@@ -550,6 +584,8 @@ def normalize_document(value):
             raise PromptDocumentError(f"Video document contains invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise PromptDocumentError("Video document must be an object")
+    if "wire_version" in value:
+        return normalize_document_wire(value)["document"]
     value = copy.deepcopy(value)
     version = int(_number(value.get("version"), DOCUMENT_VERSION))
     if version != DOCUMENT_VERSION:

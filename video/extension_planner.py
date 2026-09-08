@@ -10,7 +10,7 @@ from .continuation import (
     continuation_frame_plan,
 )
 from .contracts import PromptDocumentError, normalize_document
-from .director import director_chat, preview_changeset
+from .director import director_chat, preview_changeset, _validate_extension_plan_timeline
 
 
 def _planning_instruction(brief):
@@ -37,6 +37,8 @@ def plan_extension(data, progress_callback=None):
     if not isinstance(data, dict):
         raise ValueError("Extension planning request must be an object")
     brief = str(data.get("brief") or "").strip()
+    if not brief:
+        raise ValueError("Describe what should happen in the extension")
     parent = normalize_document(data.get("document") or {})
     authored = build_extension_authoring_document(
         parent,
@@ -72,7 +74,8 @@ def plan_extension(data, progress_callback=None):
             or result.get("message")
             or "The Director did not return a valid extension plan"
         )
-    planned = preview_changeset(authored, proposal)["document"]
+    planned = preview_changeset(authored, proposal, request_data=request)["document"]
+    _validate_extension_plan_timeline(planned, request)
     if planned.get("resolved_mode") != "t2va" or planned.get("references"):
         raise PromptDocumentError(
             "A latent-only extension plan cannot introduce media references"
@@ -92,5 +95,6 @@ def plan_extension(data, progress_callback=None):
         "compiled_prompt": compile_prompt(planned),
         "message": str(result.get("message") or "Extension plan prepared."),
         "continuation_context": continuation_context,
+        "timing": timing,
         "context_usage": result.get("context_usage"),
     }

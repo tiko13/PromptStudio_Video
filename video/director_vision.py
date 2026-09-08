@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import mimetypes
+import ntpath
 import os
 
 from PIL import Image, ImageOps
@@ -64,7 +65,8 @@ def normalize_attachments(value):
 def _input_path(relative_path):
     import folder_paths
 
-    if os.path.isabs(relative_path) or os.path.splitdrive(relative_path)[0]:
+    relative_path = str(relative_path or "").replace("\\", "/")
+    if relative_path.startswith("/") or ntpath.splitdrive(relative_path)[0]:
         raise ValueError("Director attachment path must be relative to ComfyUI input storage")
     normalized = os.path.normpath(relative_path.replace("/", os.sep))
     if normalized == ".." or normalized.startswith(".." + os.sep):

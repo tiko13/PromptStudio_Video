@@ -9,6 +9,8 @@ class UnifiedStudioContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = (ROOT / "web" / "js" / "promptstudio_video_studio.js").read_text(encoding="utf-8")
+        cls.progress_controller = (ROOT / "web/js/controllers/generation-progress-controller.js").read_text(encoding="utf-8")
+        cls.interaction_controller = (ROOT / "web/js/controllers/document-interaction-controller.js").read_text(encoding="utf-8")
         cls.redirect = (ROOT / "web" / "js" / "promptstudio_video_redirect.js").read_text(encoding="utf-8")
         cls.page = (ROOT / "web" / "prompt_studio_video.html").read_text(encoding="utf-8")
         cls.routes = (ROOT / "routes.py").read_text(encoding="utf-8")
@@ -88,30 +90,26 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn('record.generation.status === "queued"', helper)
         self.assertIn('updateGeneration(id, { status: "generating" })', helper)
 
-        events_start = self.source.index("function setupProgressEvents")
-        events_end = self.source.index("function setStandaloneVisibility", events_start)
-        events = self.source[events_start:events_end]
+        events = self.progress_controller
         for event_name in ("execution_start", "progress", "executing", "progress_state"):
-            handler_start = events.index(f'api.addEventListener("{event_name}"')
+            handler_start = events.index(f'scope.listen(api, "{event_name}"')
             handler = events[handler_start:handler_start + 500]
             self.assertIn("markGenerationExecuting(id)", handler)
 
     def test_live_progress_is_restored_after_returning_to_video_project(self):
-        events_start = self.source.index("function setupProgressEvents")
-        events_end = self.source.index("function setStandaloneVisibility", events_start)
-        events = self.source[events_start:events_end]
+        events = self.progress_controller
 
         self.assertIn('node?.state === "running"', events)
         self.assertIn("Number(running.value)", events)
         self.assertIn("Number(running.max)", events)
 
-        executing_start = events.index('api.addEventListener("executing"')
+        executing_start = events.index('scope.listen(api, "executing"')
         executing_handler = events[executing_start:executing_start + 700]
         self.assertIn("samplerComplete", executing_handler)
         self.assertIn('node == null || samplerComplete ? "finalizing" : "generating"', executing_handler)
         self.assertIn("updateProgress(id", executing_handler)
 
-        state_start = events.index('api.addEventListener("progress_state"')
+        state_start = events.index('scope.listen(api, "progress_state"')
         state_handler = events[state_start:state_start + 450]
         self.assertIn("const progress = runningProgress(event)", state_handler)
         self.assertIn("...(progress || {})", state_handler)
@@ -121,13 +119,11 @@ class UnifiedStudioContractTests(unittest.TestCase):
         render_start = self.source.index("function renderGenerations")
         render_end = self.source.index("function showCompiledPrompt", render_start)
         render = self.source[render_start:render_end]
-        events_start = self.source.index("function setupProgressEvents")
-        events_end = self.source.index("function setStandaloneVisibility", events_start)
-        events = self.source[events_start:events_end]
+        events = self.progress_controller
 
         self.assertIn('{ ...current, ...changes }', events)
         self.assertIn("state.activeGenerationPromptId", events)
-        self.assertIn('api.addEventListener("execution_success"', events)
+        self.assertIn('scope.listen(api, "execution_success"', events)
         self.assertIn('phase: "finalizing"', events)
         self.assertIn('?.phase === "finalizing"', events)
         self.assertIn('current.phase !== "finalizing"', events)
@@ -138,6 +134,8 @@ class UnifiedStudioContractTests(unittest.TestCase):
         helper_start = self.source.index("function resolvedTurboProfile")
         helper_end = self.source.index("function renderTurboProfileIndicator", helper_start)
         helper = self.source[helper_start:helper_end]
+        self.assertIn("turboDisplayProfile(mode, width, height, preset)", helper)
+        helper = (ROOT / "web/js/workflow-adapter.js").read_text(encoding="utf-8")
         self.assertIn('mode === "ref2va"', helper)
         self.assertIn("width === 1344 && height === 768", helper)
         self.assertIn('preset === "fast_4step"', helper)
@@ -149,7 +147,8 @@ class UnifiedStudioContractTests(unittest.TestCase):
 
     def test_llamacpp_piggybacks_primary_settings_and_management(self):
         self.assertIn('const LLM_STATUS_ENDPOINT = "/promptstudio/prompt-studio/llm/status"', self.source)
-        self.assertIn('const IMAGE_LLM_PROFILES_KEY = "promptstudio.promptStudio.llmProfiles.v1"', self.source)
+        self.assertIn('loadLlmProfiles', self.source)
+        self.assertIn('/extensions/ComfyUI_PromptStudio/js/prompt-studio/settings/llm-profile-store.js', self.source)
         self.assertIn("studio.llamacpp_url", self.source)
         self.assertIn("studio.llamacpp_model", self.source)
         self.assertIn("studio.llamacpp_config_profile", self.source)
@@ -160,6 +159,13 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn("return { ...shared, ...overrides, sampler_seed: -1 }", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/server", self.source)
         self.assertNotIn("/promptstudio-video/llamacpp/config-builder", self.routes)
+
+    def test_system_status_content_stays_within_the_popover(self):
+        section = self.styles.split(".psvstudio-system-status-section {", 1)[1].split("}", 1)[0]
+        copy = self.styles.split(".psvstudio-kobold-popover span,", 1)[1].split("}", 1)[0]
+
+        self.assertIn("min-width: 0", section)
+        self.assertIn("overflow-wrap: anywhere", copy)
 
     def test_restart_uses_manager_v4_with_a_legacy_fallback(self):
         self.assertIn('["/v2/manager/reboot", "/manager/reboot"]', self.source)
@@ -176,7 +182,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn('panel.dataset.apiConnected = connected ? "true" : "false"', self.source)
         self.assertIn('setStatus("ComfyUI disconnected — Video Studio is frozen.", "error")', self.source)
         self.assertIn('id="psvstudio-api-connection"', self.source)
-        self.assertIn("state.disconnectedControlObserver.observe", self.source)
+        self.assertIn("observer.observe(state.panel", self.progress_controller)
         self.assertIn('.psvstudio-app[data-api-connected="false"]', self.styles)
 
     def test_empty_video_studio_offers_complete_default_workflow_setup(self):
@@ -196,7 +202,9 @@ class UnifiedStudioContractTests(unittest.TestCase):
             'from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/prompt-studio-input.js"',
             self.source,
         )
-        self.assertIn("extractPromptStudioInputs(graph, snapshot, workflowData)", self.source)
+        self.assertIn("createVideoWorkflowTemplateBuilder({ app })", self.source)
+        shared = (ROOT.parent / "ComfyUI_PromptStudio/web/js/prompt-studio/generation/workflow-adapter.js").read_text(encoding="utf-8")
+        self.assertIn("extractPromptStudioInputs(graph, snapshot, workflowData)", shared)
         self.assertIn("PROMPT_STUDIO_INPUT_PROFILE_VERSION", self.source)
         self.assertIn('inspectorDetails("Additional Inputs", true)', self.source)
         self.assertIn("project.additional_input_selections", self.source)
@@ -246,13 +254,9 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertNotIn("state.directorDialog.close()", failure)
 
     def test_status_popover_dismisses_and_live_queue_status_rerenders(self):
-        transient_start = self.source.index("function installTransientUiDismissal")
-        transient_end = self.source.index("function isVideoStudioControl", transient_start)
-        transient = self.source[transient_start:transient_end]
-        events_start = self.source.index("function setupProgressEvents")
-        events_end = self.source.index("function setStandaloneVisibility", events_start)
-        events = self.source[events_start:events_end]
-        status_handler = events[events.index('api.addEventListener("status"'):]
+        transient = self.interaction_controller
+        events = self.progress_controller
+        status_handler = events[events.index('scope.listen(api, "status"'):]
 
         self.assertIn('control?.open && !control.contains(event.target)', transient)
         self.assertIn('closeSystemStatus({ restoreFocus: true })', transient)
@@ -264,7 +268,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn('aria-controls="psvstudio-projects-drawer"', self.source)
         self.assertIn('aria-controls="psvstudio-shots-drawer"', self.source)
         self.assertIn("function closeVideoDrawer", self.source)
-        self.assertIn("closeVideoDrawer({ restoreFocus: true })", self.source)
+        self.assertIn("closeVideoDrawer({ restoreFocus: true })", self.interaction_controller)
         self.assertIn('.psvstudio-app[data-drawer="projects"] .psvstudio-drawer-scrim', self.styles)
         self.assertIn('.psvstudio-app[data-drawer="inspector"] .psvstudio-drawer-scrim', self.styles)
 
