@@ -28,7 +28,7 @@ jobs:
           node-version: '24'
       - name: Install isolated test dependencies
         run: |
-          python -m pip install numpy Pillow av aiohttp
+          python -m pip install numpy Pillow av aiohttp safetensors
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           cd ComfyUI_PromptStudio
           npm ci --ignore-scripts
