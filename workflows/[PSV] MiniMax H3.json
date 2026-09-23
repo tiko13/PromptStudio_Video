@@ -737,7 +737,7 @@
         "Node name for S&R": "SaveVideo"
       },
       "widgets_values": [
-        "video/PromptStudio_Video/MiniMaxPSVTest",
+        "video/PromptStudio_Video/MiniMaxH3",
         "mp4",
         "auto"
       ]
@@ -1238,7 +1238,7 @@
         "Node name for S&R": "PSV_MiniMaxH3Director"
       },
       "widgets_values": [
-        "{\"version\":1,\"mode\":\"auto\",\"duration_seconds\":11,\"width\":1344,\"height\":768,\"ref_image_size\":\"match\",\"style\":\"Live-action, cinematic\",\"shots\":[{\"id\":\"shot-1\",\"start\":0,\"transition\":\"the camera cuts to\",\"composition\":\"A medium-wide establishing shot with a clear subject and readable depth.\",\"subjects\":\"\",\"environment\":\"\",\"lighting\":\"Cinematic, motivated lighting with natural contrast.\",\"action\":\"\",\"camera\":{\"type\":\"Static Shot\",\"amplitude\":\"default\",\"speed\":\"default\",\"target\":\"\"},\"dialogue\":[],\"visible_text\":[],\"sounds\":[],\"notes\":\"Open the Director Canvas to define the production before queueing.\"}],\"references\":[],\"overall_soundscape\":\"Natural location ambience synchronized to visible action.\",\"non_diegetic_music\":\"N/A\",\"complete_silence\":false,\"task_types\":[],\"subject_definitions\":[],\"summary\":\"\",\"retention_analysis\":[]}"
+        "{\"version\":1,\"mode\":\"auto\",\"duration_seconds\":11,\"width\":1344,\"height\":768,\"ref_image_size\":\"match\",\"style\":\"\",\"shots\":[{\"id\":\"shot-1\",\"start\":0,\"transition\":\"the camera cuts to\",\"composition\":\"\",\"subjects\":\"\",\"environment\":\"\",\"lighting\":\"\",\"action\":\"\",\"camera\":{\"type\":\"Static Shot\",\"amplitude\":\"default\",\"speed\":\"default\",\"target\":\"\"},\"dialogue\":[],\"visible_text\":[],\"sounds\":[],\"notes\":\"\"}],\"references\":[],\"overall_soundscape\":\"\",\"non_diegetic_music\":\"N/A\",\"complete_silence\":false,\"task_types\":[],\"subject_definitions\":[],\"summary\":\"\",\"retention_analysis\":[]}"
       ],
       "color": "#243447",
       "bgcolor": "#31465f"
@@ -1491,14 +1491,7 @@
   "config": {},
   "extra": {
     "workflowRendererVersion": "LG",
-    "frontendVersion": "1.47.12",
-    "ds": {
-      "scale": 0.9583200000000006,
-      "offset": [
-        399.1306952510283,
-        451.79749748004355
-      ]
-    }
+    "frontendVersion": "1.47.12"
   },
   "version": 0.4
 }

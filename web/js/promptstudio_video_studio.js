@@ -1,3 +1,8 @@
+import { thinkingModeEnablesReasoning } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/llm/status.js";
+import { workflowHelpFacts } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/help-context.js";
+import { createEditReferenceController } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/edit-reference.js";
+import { applyWorkflowReferences, workflowReferenceValues } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/reference-inputs.js";
+let workflowReferenceController = null;
 import { downloadJobDiagnostics, fetchJobActivity, jobActivityText, jobRetryText, recoveredJobError } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/job-diagnostics.js";
 import { createVideoWorkflowTemplateBuilder, turboDisplayProfile, discoverWorkflowFiles, workflowResultOutputs } from "./workflow-adapter.js";
 import { app } from "/scripts/app.js";
@@ -348,10 +353,6 @@ function llmProviderDisplayName(provider) {
   return { koboldcpp: "KoboldCpp", ollama: "Ollama", llamacpp: "Llama.cpp" }[
     normalizeLlmProvider(provider)
   ];
-}
-
-function thinkingModeEnablesReasoning(mode) {
-  return !["disabled", "none"].includes(String(mode || "").trim().toLowerCase());
 }
 
 function llmActivityLabel(status = {}, thinkingEnabled = false) {
@@ -1385,6 +1386,12 @@ function directorRequestPayload(project, shot, scope, attachments, messages, job
     job_id: jobId,
     origin: { project_id: project.id, message_id: messages.at(-1)?.id || "" },
     project_name: project.name,
+    help_context: {
+      ...workflowHelpFacts(isStructuredExtensionProject(project) ? null : selectedWorkflow(project), project, project.document?.resolved_mode || project.document?.mode),
+      studio: "video", surface: normalizedScope,
+      media_limit: state.config?.reference_limits?.active_items ?? "unknown",
+      workflow_label: state.panel?.querySelector("#psvstudio-workflow")?.getAttribute("aria-label") || "Video workflow",
+    },
     brief: project.brief,
     document: clone(project.document),
     scope: normalizedScope,
@@ -4016,6 +4023,11 @@ function pollGeneration(promptId) {
 async function queueSnapshot(project, workflow, snapshot, metadata, existingGeneration = null) {
   const generationId = existingGeneration?.id || makeId("generation");
   if (existingGeneration?.preparation_kind !== "replay") {
+    if (workflowReferenceController?.uploading(project.id)) throw new Error("Wait for workflow image uploads to finish.");
+    // Base submissions capture before compilation yields. Continuations retain
+    // the reference nodes already frozen in their source snapshot.
+    if (existingGeneration?.preparation_kind === "base") applyWorkflowReferences(snapshot,
+      existingGeneration.workflowReferenceInputs || workflowReferenceValues(project, workflow));
     applyPromptStudioInputValues(
       snapshot,
       workflow,
@@ -4103,6 +4115,7 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
 }
 
 async function generateProject() {
+  if (workflowReferenceController?.uploading(activeProject()?.id)) return setStatus("Wait for workflow image uploads to finish.", "warning");
   if (!state.apiConnected) {
     setStatus("ComfyUI disconnected — Video Studio is frozen.", "error");
     return;
@@ -4126,6 +4139,7 @@ async function generateProject() {
     id: makeId("generation"), prompt_id: "", status: "validating", error: "",
     workflow_id: workflow.id, workflow_name: workflow.name, outputs: [], segment_outputs: [],
     kind: "base", preparation_kind: "base", document: clone(project.document),
+    workflowReferenceInputs: workflowReferenceValues(project, workflow),
     new_seed: state.panel.querySelector("#psvstudio-new-seed")?.checked !== false,
     created_at: Date.now(), updated_at: Date.now(),
   };
@@ -6973,6 +6987,7 @@ async function generateRestoredComparison(project) {
 
 function savedGenerationRestoreState(project) {
   return { document: clone(project.document), workflow_id: project.workflow_id || "",
+    workflowReferences: clone(project.workflowReferences || {}),
     additional_input_selections: clone(project.additional_input_selections || {}) };
 }
 
@@ -7290,6 +7305,7 @@ async function compilePreview() {
 }
 
 function renderHeader() {
+  workflowReferenceController?.render();
   const project = activeProject();
   const title = state.panel?.querySelector("#psvstudio-project-title");
   const generate = state.panel?.querySelector("#psvstudio-generate");
@@ -7305,7 +7321,7 @@ function renderHeader() {
     title.value = project?.name || "Prompt Studio Video";
   }
   if (generate) {
-    generate.disabled = !project || (!structuredExtension && !state.workflows.length && !pendingGenerationRestore(project));
+    generate.disabled = !project || workflowReferenceController?.uploading(project?.id) || (!structuredExtension && !state.workflows.length && !pendingGenerationRestore(project));
     generate.textContent = structuredExtension ? "Generate extension" : "Generate";
   }
   if (duplicate) duplicate.disabled = !project;
@@ -7465,6 +7481,11 @@ function buildPanel() {
         </section>
       </div>
       <footer class="psvstudio-action-footer">
+        <div class="psvstudio-workflow-reference" hidden>
+          <input type="file" accept="image/*" aria-label="Workflow reference image file" hidden />
+          <button type="button" class="promptstudio-edit-reference-choose"><img alt="" hidden /><small>Reference</small></button>
+          <button type="button" class="promptstudio-edit-reference-remove" aria-label="Remove edit reference image" hidden>×</button>
+        </div>
         <div class="psvstudio-action-copy">
         <div id="psvstudio-status" class="psvstudio-status" role="status" aria-live="polite">Loading Video Studio…</div>
         <div id="psvstudio-run-summary" class="studio-run-summary" aria-label="What will run"></div>
@@ -7560,6 +7581,16 @@ function buildPanel() {
   panel.querySelector("#psvstudio-close-projects").addEventListener("click", () => closeVideoDrawer());
   panel.querySelector(".psvstudio-drawer-scrim").addEventListener("click", () => closeVideoDrawer());
   state.panel = panel;
+  workflowReferenceController = createEditReferenceController({panel, tile: panel.querySelector(".psvstudio-workflow-reference"),
+    activeChat: activeProject, findChat: id => state.projects.find(project => project.id === id),
+    selectedProfile: () => isStructuredExtensionProject(activeProject()) ? null : selectedWorkflow(activeProject()),
+    upload: async file => {
+      const path = String(await uploadMediaFile(file)).replaceAll("\\", "/");
+      const parts = path.split("/"); return {filename: parts.pop(), subfolder: parts.join("/"), type: "input"};
+    },
+    imageUrl: image => api.apiURL("/view?" + new URLSearchParams({filename: image.filename, subfolder: image.subfolder || "", type: image.type || "input"})),
+    changed: project => markProjectChanged({project}), refresh: renderHeader, report: setStatus,
+  });
   document.body.append(panel);
   installMediaDrop(document);
   installTransientUiDismissal(document);

@@ -292,6 +292,7 @@ def _normalize_pending_generation_restore(value):
         "version": 1,
         "generation": generation,
         "fingerprint": {
+            "workflowReferences": _normalize_workflow_references(fingerprint.get("workflowReferences")),
             "document": normalize_document(fingerprint["document"]),
             "workflow_id": str(fingerprint.get("workflow_id") or "").strip()[:1024],
             "additional_input_selections": _normalize_additional_input_selections(
@@ -335,6 +336,7 @@ def _normalize_project(value, index):
         "brief": document["main_description"],
         "document": document,
         "workflow_id": str(value.get("workflow_id") or "").strip()[:1024],
+        "workflowReferences": _normalize_workflow_references(value.get("workflowReferences")),
         "additional_input_selections": _normalize_additional_input_selections(
             value.get("additional_input_selections")
         ),
@@ -353,6 +355,23 @@ def _normalize_project(value, index):
         # would make one incompatible session prevent the entire store from
         # loading, leaving every otherwise-valid session inaccessible.
         result["extension_source"] = extension_source
+    return result
+
+
+def _normalize_workflow_references(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Workflow image inputs must be an object")
+    result = {}
+    for workflow, slots in value.items():
+        if not isinstance(slots, dict):
+            raise ValueError("Workflow image slots must be an object")
+        result[workflow] = {}
+        for node_id, image in slots.items():
+            if image is not None and (not isinstance(image, dict) or not isinstance(image.get("filename"), str)):
+                raise ValueError("Workflow image input must be an image reference")
+            result[workflow][node_id] = copy.deepcopy(image)
     return result
 
 

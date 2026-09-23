@@ -9,11 +9,37 @@ import zipfile
 
 from video import default_setup
 from video.continuation import CONTINUATION_CONTEXT_FRAMES
+from video.contracts import normalize_document
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkflowPackagingTests(unittest.TestCase):
+    def test_bundled_director_documents_have_no_example_content_or_media(self):
+        for name in default_setup.DEFAULT_WORKFLOW_NAMES:
+            workflow = default_setup.load_bundled_workflow(name)
+            director = next(n for n in workflow["nodes"] if n["type"] == "PSV_MiniMaxH3Director")
+            values = [director["widgets_values"][0]]
+            if "widgets_values_named" in director:
+                values.append(director["widgets_values_named"]["document_json"])
+            for value in values:
+                with self.subTest(name=name):
+                    document = json.loads(value)
+                    normalized = normalize_document(document)
+                    self.assertEqual(normalized["duration_seconds"], document["duration_seconds"])
+                    self.assertEqual(normalized["width"], document["width"])
+                    self.assertEqual(normalized["height"], document["height"])
+                    for field in ("style", "main_description", "prompt_override", "overall_soundscape", "summary",
+                                  "references", "subject_definitions", "retention_analysis"):
+                        self.assertFalse(document.get(field), field)
+                    for shot in document["shots"]:
+                        for field in ("composition", "subjects", "environment", "lighting", "action", "notes",
+                                      "dialogue", "visible_text", "sounds"):
+                            self.assertFalse(shot.get(field), field)
+            self.assertNotIn("ds", workflow.get("extra", {}))
+            output = next(n for n in workflow["nodes"] if n["type"] == "SaveVideo")
+            self.assertEqual(output["widgets_values"][0], "video/PromptStudio_Video/MiniMaxH3")
+
     def test_readable_sources_are_canonical_and_round_trip_without_compression(self):
         self.assertEqual(len(default_setup.DEFAULT_WORKFLOW_NAMES), 2)
         for name in default_setup.DEFAULT_WORKFLOW_NAMES:
