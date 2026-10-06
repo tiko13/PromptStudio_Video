@@ -136,6 +136,11 @@ def provider_context(messages):
 
 class DirectorTests(unittest.TestCase):
     def setUp(self):
+        # These are author/normalizer regression cases. The real planning and
+        # review stages are exercised separately in test_director_planning.py.
+        planner = patch("video.director._create_director_plan", return_value=None)
+        planner.start()
+        self.addCleanup(planner.stop)
         self.turn_intent = {
             "route": "mutate", "confidence": 1.0, "resolved_instruction": "",
             "reference_only": False, "reason": "Test route.",

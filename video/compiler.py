@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 
 from .contracts import PromptDocumentError, effective_duration, model_references, normalize_document
+from .prompt_advisories import link_dialogue
+from .vocabulary import shared_rules
+from .adapter_contract import has_reference_adapters
 
 
 def _canonical_tokens(value):
@@ -326,19 +329,26 @@ def _dialogue_text(event, *, speaker_anchor=""):
     speaker_id = event["speaker_id"]
     delivery = f" {event['delivery']}" if event.get("delivery") else ""
     dialogue = event["text"]
-    if event.get("crosses_cut"):
-        dialogue = f"<scenetrans>{dialogue}<scenetrans>"
+    if event.get("_continues_in") or (event.get("crosses_cut") and not event.get("utterance_id")):
+        dialogue = f"<scenetrans>{dialogue}"
+    if event.get("_continues_out") or (event.get("crosses_cut") and not event.get("utterance_id")):
+        dialogue = f"{dialogue}<scenetrans>"
     if event.get("cutoff"):
         dialogue = f"{dialogue}<cutoff>"
     block = f"<d>[{event['language']}] {dialogue}</d>"
+    continuity = ""
+    if event.get("_continues_in"):
+        continuity += " The same utterance carries over from the previous shot without a pause."
+    if event.get("_continues_out"):
+        continuity += " The audio continues seamlessly across the cut into the next shot."
     if event.get("voiceover"):
         return _sentence(
             f"{speaker} ({speaker_id}) says in an off-screen voiceover{delivery}: "
             f"{block} while the corresponding on-screen character's lips remain completely closed"
-        )
+        ) + continuity
     verb = "sings" if event.get("performance") == "singing" else "says"
     location = " off-screen" if event.get("offscreen") else ""
-    return _sentence(f"{speaker} ({speaker_id}) {verb}{location}{delivery}: {block}")
+    return _sentence(f"{speaker} ({speaker_id}) {verb}{location}{delivery}: {block}") + continuity
 
 
 def _step_text(step, *, speaker_anchor=""):
@@ -589,6 +599,8 @@ def _soundscape_value(document):
 
 def _compile_base(document):
     mode = document["resolved_mode"]
+    if mode == "ref2va" and not model_references(document):
+        mode = "t2va"  # Unnumbered RefMod conditioning has no keyframe alignment.
     duration = effective_duration(document)
     speaker_anchor = _first_frame_speaker_anchor(document)
     shots = " ".join(
@@ -853,6 +865,10 @@ def _compile_reference(document):
 
 def _reference_semantic_issues(document):
     """Return guide-compliance failures that would make REF2VA references inert."""
+    if has_reference_adapters(document) and not model_references(document):
+        # Saved latents are appended after text encoding. They have no numbered
+        # text/vision presentation, unlike uploaded native reference media.
+        return []
     definitions = document["subject_definitions"]
     retention = document["retention_analysis"]
     issues = []
@@ -1028,10 +1044,24 @@ def validate_reference_semantics(document):
 
 
 def compile_prompt(value, *, use_override=True):
+    compiled = _compile_prompt(value, use_override=use_override)
+    try:
+        result = shared_rules().enforce(compiled)
+    except ValueError as exc:
+        raise PromptDocumentError(str(exc)) from exc
+    # Vocabulary replacements must not damage the H3 wire grammar.
+    grammar = r"<[^>]+>|\[Shot \d+\]|(?:integrated_multimodal_description|overall_soundscape|non_diegetic_music):"
+    if re.findall(grammar, compiled) != re.findall(grammar, result):
+        raise PromptDocumentError("A forbidden-word replacement conflicts with required video prompt syntax. Change that rule.")
+    return result
+
+
+def _compile_prompt(value, *, use_override=True):
     document = normalize_document(value)
     if use_override and document["prompt_override"]:
         return document["prompt_override"]
-    if document["resolved_mode"] == "ref2va":
+    link_dialogue(document)
+    if document["resolved_mode"] == "ref2va" and model_references(document):
         validate_reference_semantics(document)
         return _compile_reference(document)
     compiled = _compile_base(document)

@@ -11,6 +11,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from typing import Literal, TypedDict
+from .adapter_contract import normalize_adapter_stack, has_reference_adapters
 
 
 class VideoDocumentWire(TypedDict):
@@ -246,7 +247,7 @@ def _normalize_reference(reference, index):
     if isinstance(roles, str):
         roles = [roles]
     roles = [_text(role).lower() for role in (roles or []) if _text(role)]
-    unknown = set(roles) - ANCHOR_ROLES - REFERENCE_ROLES - POSTPROCESS_ROLES
+    unknown = set(roles) - ANCHOR_ROLES - REFERENCE_ROLES - POSTPROCESS_ROLES - {"timeline_guide"}
     if unknown:
         raise PromptDocumentError(
             f"Reference {index + 1} has unsupported role '{sorted(unknown)[0]}'"
@@ -255,12 +256,19 @@ def _normalize_reference(reference, index):
         raise PromptDocumentError("Only images can be first-frame or last-frame anchors")
     if "exact_audio" in roles and (kind != "audio" or len(roles) != 1):
         raise PromptDocumentError("Exact timeline audio must be a standalone audio media role")
+    if "timeline_guide" in roles and len(roles) != 1:
+        raise PromptDocumentError("A timeline guide must have its own exclusive media role")
+    guide_frame = reference.get("guide_frame", 24)
+    if "timeline_guide" in roles and (isinstance(guide_frame, bool) or not isinstance(guide_frame, (int, float))
+                                    or not math.isfinite(guide_frame) or int(guide_frame) != guide_frame or guide_frame < 0):
+        raise PromptDocumentError("A timeline guide frame must be a non-negative whole number")
     return {
         "id": _identifier(reference.get("id"), "reference"),
         "kind": kind,
         "path": _text(reference.get("path")),
         "name": _text(reference.get("name") or reference.get("path"), f"Reference {index + 1}"),
         "roles": list(dict.fromkeys(roles)),
+        "guide_frame": int(guide_frame) if "timeline_guide" in roles else 24,
         "prompt": _text(reference.get("prompt")),
         "label": _canonical_reference_tokens(_text(reference.get("label"))),
         "trim_start": max(0.0, _number(reference.get("trim_start"), 0.0)),
@@ -312,7 +320,7 @@ def model_references(document):
     """References sent to MiniMax rather than applied after generation."""
     return [
         reference for reference in document.get("references") or []
-        if not is_exact_audio_reference(reference)
+        if not is_exact_audio_reference(reference) and "timeline_guide" not in reference.get("roles", [])
     ]
 
 
@@ -346,6 +354,7 @@ def _normalize_dialogue(event, index):
         "voiceover": bool(event.get("voiceover", False)),
         "offscreen": bool(event.get("offscreen", False)),
         "crosses_cut": bool(event.get("crosses_cut", False)),
+        "utterance_id": _text(event.get("utterance_id"))[:80],
         "cutoff": bool(event.get("cutoff", False)),
     }
 
@@ -524,6 +533,8 @@ def resolve_mode(document):
         raise PromptDocumentError(f"Unsupported MiniMax mode '{explicit}'")
     if explicit != "auto":
         return explicit
+    if has_reference_adapters(document):
+        return "ref2va"
     references = model_references(document)
     roles = {role for reference in references for role in reference.get("roles", [])}
     if any(reference.get("kind") in {"video", "audio"} for reference in references):
@@ -600,7 +611,7 @@ def normalize_document(value):
     label_counts = {"image": 0, "video": 0, "audio": 0}
     label_names = {"image": "Picture", "video": "Video", "audio": "Audio"}
     for reference in references:
-        if is_exact_audio_reference(reference):
+        if is_exact_audio_reference(reference) or "timeline_guide" in reference["roles"]:
             reference["label"] = ""
             continue
         label_counts[reference["kind"]] += 1
@@ -614,6 +625,17 @@ def normalize_document(value):
     shots[0]["start"] = 0.0
     previous = -1.0
     final_time = effective_duration(duration)
+    guides = [reference for reference in references if "timeline_guide" in reference["roles"]]
+    if len(guides) > 12:
+        raise PromptDocumentError("A project supports at most 12 timeline guides")
+    occupied = set()
+    for guide in guides:
+        if guide["guide_frame"] >= frame_count_for_duration(duration):
+            raise PromptDocumentError("Timeline guide lies outside the generated video; move it or extend the duration")
+        key = (guide["kind"], guide["guide_frame"])
+        if key in occupied:
+            raise PromptDocumentError("Two timeline guides of the same media kind cannot start at the same frame")
+        occupied.add(key)
     for index, shot in enumerate(shots):
         if shot["start"] <= previous:
             raise PromptDocumentError("Shot start times must be strictly increasing")
@@ -667,6 +689,8 @@ def normalize_document(value):
         "style": _text(value.get("style"), "Live-action, cinematic"),
         "shots": shots,
         "references": references,
+        "content_loras": normalize_adapter_stack(value.get("content_loras")),
+        "reference_adapters": normalize_adapter_stack(value.get("reference_adapters"), references=True),
         "overall_soundscape": _text(value.get("overall_soundscape")),
         "non_diegetic_music": _text(value.get("non_diegetic_music"), "N/A"),
         "complete_silence": bool(value.get("complete_silence", False)),
@@ -701,6 +725,8 @@ def normalize_document(value):
                 document["target_megapixels"],
             )
     document["resolved_mode"] = resolve_mode(document)
+    if has_reference_adapters(document) and document["resolved_mode"] != "ref2va":
+        raise PromptDocumentError("Active RefMods require Auto or REF2VA mode")
     generation_references = model_references(document)
     roles = {role for reference in generation_references for role in reference["roles"]}
     first_count = sum("first_frame" in reference["roles"] for reference in generation_references)
@@ -713,7 +739,7 @@ def normalize_document(value):
         raise PromptDocumentError("FL2VA mode requires one first-frame and one last-frame image")
     if document["resolved_mode"] == "l2va" and (last_count != 1 or first_count):
         raise PromptDocumentError("L2VA mode requires exactly one last-frame image")
-    if document["resolved_mode"] == "ref2va" and not generation_references:
+    if document["resolved_mode"] == "ref2va" and not generation_references and not has_reference_adapters(document):
         raise PromptDocumentError("REF2VA mode requires at least one reference asset")
     if document["resolved_mode"] == "ref2va" and not document["task_types"]:
         derived = []

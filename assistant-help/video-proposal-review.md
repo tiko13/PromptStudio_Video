@@ -1,0 +1,5 @@
+---
+{"id":"video.proposal-review","topic":"proposal-review","studio":"video","summary":"Director proposal shot cards, complete details, changes, numbering, timing, review retry and applying saved reviews."}
+---
+Proposals show numbered shot cards with resulting time ranges, complete new-shot details, highlighted edits, previous values, and expandable unchanged details. Action and dialogue steps remain in order; camera and sound settings use readable labels. Timeline changes identify added/removed cuts and shot counts. Reordered shots show old and new numbers; removed shots use original numbers.
+Review snapshots stay with each answer after applying or reloading. Apply proposal becomes available after the backend validates the review and revalidates the document when clicked. Retry review retries a failed preview; if the document has changed, ask the Director again. Older applied/discarded answers without saved reviews cannot reconstruct their original shot details. Reviews describe the proposal; they do not guarantee scene continuity or rendered quality.

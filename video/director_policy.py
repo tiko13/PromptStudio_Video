@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 
 
-POLICY_VERSION = "2026-09-05.1"
+POLICY_VERSION = "2026-10-06.2"
 OUTPUT_CONTRACT_VERSION = "director-response.1"
 AUTHORITY = (
     ("authorization", "Validated current-turn edit intent and protected-content permissions"),

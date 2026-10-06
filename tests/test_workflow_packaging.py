@@ -15,6 +15,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkflowPackagingTests(unittest.TestCase):
+    def test_all_bundled_workflows_have_typed_adapters_and_consistent_links(self):
+        for path in (ROOT / 'workflows').glob('*.json'):
+            with self.subTest(workflow=path.name):
+                graph = json.loads(path.read_text(encoding='utf-8'))
+                nodes = {node['id']:node for node in graph['nodes']}
+                for kind, field in [('KCPP_PromptStudioLoraLoader','lora_type'), ('PSV_MiniMaxH3ReferenceAdapters','adapter_type')]:
+                    loader = next(node for node in nodes.values() if node['type'] == kind)
+                    self.assertEqual(loader['widgets_values_named'][field], 'MiniMax3')
+                for link, origin, slot, target, target_slot, _ in graph['links']:
+                    self.assertIn(link, nodes[origin]['outputs'][slot]['links'])
+                    self.assertEqual(nodes[target]['inputs'][target_slot]['link'],link)
+                self.assertEqual(graph['last_node_id'], max(nodes))
+
     def test_bundled_director_documents_have_no_example_content_or_media(self):
         for name in default_setup.DEFAULT_WORKFLOW_NAMES:
             workflow = default_setup.load_bundled_workflow(name)

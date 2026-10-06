@@ -1,9 +1,10 @@
 [project]
 name = "PromptStudio_Video"
-version = "0.1.0"
+version = "0.1.1"
 description = "Structured video direction and MiniMax H3 generation for ComfyUI Prompt Studio"
 readme = "README.md"
-license = { text = "MIT License" }
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 # Installation range retained; only Python 3.14 is verified in the current local
 # suite. See the companion release checklist before claiming minimum support.
 requires-python = ">=3.9"

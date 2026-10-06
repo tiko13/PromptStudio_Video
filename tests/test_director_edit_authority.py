@@ -24,6 +24,9 @@ from test_director import director_document, edit_request
 
 class DirectorEditAuthorityTests(unittest.TestCase):
     def setUp(self):
+        planner = patch("video.director._create_director_plan", return_value=None)
+        planner.start()
+        self.addCleanup(planner.stop)
         self.document = director_document()
         self.document["shots"][0]["steps"][1]["text"] = "Stay here."
         self.document = normalize_document(self.document)

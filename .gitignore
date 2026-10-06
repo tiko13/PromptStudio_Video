@@ -1,6 +1,9 @@
 # Local agent guidance
 AGENTS.md
 
+# Internal development artifacts (audits, reports, and task briefs)
+/development-internal/
+
 # Python caches, environments, and build outputs
 __pycache__/
 *.py[cod]
@@ -21,6 +24,10 @@ dist/
 
 # Node dependencies and build outputs
 node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.auth/
 coverage/
 .cache/
 .parcel-cache/
@@ -58,6 +65,23 @@ Desktop.ini
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.har
+
+# Local credentials and authenticated browser state
+/.npmrc
+/.pypirc
+/.netrc
+/_netrc
+/credentials.json
+/secrets.json
+/storage-state*.json
+/storageState*.json
 
 # Prompt Studio Video runtime state
 promptstudio_video_projects.json

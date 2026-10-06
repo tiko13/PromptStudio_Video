@@ -1,8 +1,8 @@
 {
   "id": "f01da5ae-b6b7-4c03-a377-9f7f9fe361d3",
   "revision": 0,
-  "last_node_id": 24,
-  "last_link_id": 45,
+  "last_node_id": 101,
+  "last_link_id": 103,
   "nodes": [
     {
       "id": 3,
@@ -503,7 +503,7 @@
           "localized_name": "denoised_output",
           "name": "denoised_output",
           "type": "LATENT",
-          "links": null
+          "links": []
         }
       ],
       "properties": {
@@ -727,7 +727,7 @@
           "localized_name": "video",
           "name": "video",
           "type": "VIDEO",
-          "links": null
+          "links": []
         }
       ],
       "title": "Save MiniMax PSV Test",
@@ -1189,7 +1189,7 @@
           "name": "model",
           "type": "MODEL",
           "links": [
-            44
+            100
           ]
         },
         {
@@ -1197,7 +1197,7 @@
           "name": "positive",
           "type": "CONDITIONING",
           "links": [
-            11
+            102
           ]
         },
         {
@@ -1212,25 +1212,27 @@
           "localized_name": "frame_count",
           "name": "frame_count",
           "type": "INT",
-          "links": null
+          "links": []
         },
         {
           "localized_name": "effective_duration",
           "name": "effective_duration",
           "type": "FLOAT",
-          "links": null
+          "links": []
         },
         {
           "localized_name": "compiled_prompt",
           "name": "compiled_prompt",
           "type": "STRING",
-          "links": null
+          "links": []
         },
         {
           "localized_name": "mode",
           "name": "mode",
           "type": "STRING",
-          "links": null
+          "links": [
+            103
+          ]
         }
       ],
       "title": "[PSV] MiniMax H3 Director",
@@ -1242,6 +1244,121 @@
       ],
       "color": "#243447",
       "bgcolor": "#31465f"
+    },
+    {
+      "id": 100,
+      "type": "KCPP_PromptStudioLoraLoader",
+      "title": "Content LoRAs · Type: MiniMax3",
+      "pos": [
+        1250,
+        900
+      ],
+      "size": [
+        350,
+        240
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 100
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            101
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KCPP_PromptStudioLoraLoader"
+      },
+      "widgets_values": [
+        "MiniMax3",
+        "[]"
+      ],
+      "widgets_values_named": {
+        "lora_type": "MiniMax3",
+        "lora_stack_json": "[]"
+      }
+    },
+    {
+      "id": 101,
+      "type": "PSV_MiniMaxH3ReferenceAdapters",
+      "title": "RefMods / RefLoRAs · Type: MiniMax3",
+      "pos": [
+        1250,
+        1160
+      ],
+      "size": [
+        350,
+        240
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 101
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 102
+        },
+        {
+          "name": "mode",
+          "type": "STRING",
+          "link": 103
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            44
+          ]
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PSV_MiniMaxH3ReferenceAdapters"
+      },
+      "widgets_values": [
+        "[]",
+        16384,
+        "None",
+        1,
+        1,
+        1,
+        "all",
+        "MiniMax3"
+      ],
+      "widgets_values_named": {
+        "reference_stack_json": "[]",
+        "max_reference_tokens": 16384,
+        "adapter": "None",
+        "lora_strength": 1,
+        "visual_strength": 1,
+        "audio_strength": 1,
+        "components": "all",
+        "adapter_type": "MiniMax3"
+      }
     }
   ],
   "links": [
@@ -1287,7 +1404,7 @@
     ],
     [
       11,
-      6,
+      101,
       1,
       11,
       1,
@@ -1423,7 +1540,7 @@
     ],
     [
       44,
-      6,
+      101,
       0,
       24,
       0,
@@ -1436,6 +1553,38 @@
       9,
       0,
       "MODEL"
+    ],
+    [
+      100,
+      6,
+      0,
+      100,
+      0,
+      "MODEL"
+    ],
+    [
+      101,
+      100,
+      0,
+      101,
+      0,
+      "MODEL"
+    ],
+    [
+      102,
+      6,
+      1,
+      101,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      103,
+      6,
+      6,
+      101,
+      2,
+      "STRING"
     ]
   ],
   "groups": [

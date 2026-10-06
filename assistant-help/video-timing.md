@@ -1,0 +1,7 @@
+---
+{"id":"video.timing","topic":"video-timing","studio":"video","summary":"Project timeline timing: delivered frames, timecode entry, roll/ripple, resize policies and undo."}
+---
+The Timeline displays requested duration and delivered frames separately. Generation length follows the model's frame grid; the final shot extends to the delivered end. Structured extensions exclude their protected context from the editable delivered timeline.
+Choose Display for timecode, frames or seconds. Enter Selected shot start/end and leave the field to apply. Drag cut handles or use arrow keys for frame nudges; Shift moves one second. The final edge follows the generation-length grid. Escape cancels a drag.
+Roll changes the adjacent shot lengths while keeping the total. Ripple moves later shots and adjusts total length, including model-grid padding. Events stay local to their shot; guide positions remain absolute. Preserve blocks edits that would shorten an event. Trim overflow explicitly truncates affected ranges. Scale generated cues adjusts action/dialogue/sound timing in resized shots, preserves words, and blocks exact-audio overflow rather than stretching audio.
+Undo/Redo and Ctrl/Cmd+Z outside text fields restore document edits; Shift+Ctrl/Cmd+Z or Ctrl+Y redo. History is session-only and does not remove renders or undo remote changes. Shot cuts and generated cues are guidance, not a frame-exact output guarantee.

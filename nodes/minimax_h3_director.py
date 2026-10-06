@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from ..video.compiler import compile_prompt
+from ..video.vocabulary import shared_rules
 from ..video.contracts import default_document, effective_duration, frame_count_for_duration, normalize_document
 from ..video.media import anchor_images, reference_inputs
 
@@ -52,6 +53,10 @@ class PromptStudioMiniMaxH3Director:
     )
     FUNCTION = "build"
     CATEGORY = "Prompt Studio/Video"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return json.dumps(shared_rules().load_rules(), sort_keys=True)
 
     def check_lazy_status(
         self,
@@ -122,6 +127,8 @@ class PromptStudioMiniMaxH3Director:
             selected_model = fl2va_model
 
         positive, latent = result
+        from ..video.timeline_guides import apply_timeline_guides
+        positive, latent = apply_timeline_guides(document, positive, latent, video_vae, audio_vae)
         return (
             selected_model,
             positive,

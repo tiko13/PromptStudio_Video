@@ -13,6 +13,10 @@ from server import PromptServer
 
 from .nodes.h3_motion_context import native_masks_available
 from .video.compiler import compile_prompt
+from .video.prompt_advisories import prompt_advisories
+from .video.rewriter_review import review_rewrite
+from .video.sampling_profiles import profile_catalog
+from .video.reference_adapters import adapter_catalog
 from .video.audio_mix import assemble_exact_audio, probe_input_audio
 from .video.continuation import (
     CONTINUATION_CONTEXT_FRAMES,
@@ -60,6 +64,8 @@ from .video.default_setup import (
 from .video.llm_provider import abort_generation, generation_status, run_operation, check_admission, job_ledger, job_status
 from .video.store import (
     StoreConflictError,
+    shared_transactional_store,
+    _project_summary,
     read_project_store,
     read_project_query,
     maintain_project_store,
@@ -72,6 +78,7 @@ from .video.store import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_STORE_PATH = os.path.join(BASE_DIR, "promptstudio_video_projects.json")
 PROJECT_STORE_DIR = os.path.join(BASE_DIR, "promptstudio_video_projects")
+_HISTORY_STORAGE_STARTED = False
 WORKFLOW_STORE_PATH = os.path.join(BASE_DIR, "promptstudio_video_workflows.json")
 STANDALONE_PAGE_PATH = os.path.join(BASE_DIR, "web", "prompt_studio_video.html")
 STANDALONE_ALIAS_PATH = "/PromptStudioVideo"
@@ -150,7 +157,19 @@ def _studio_instances():
 
 
 async def promptstudio_video_capabilities(_request):
-    return web.json_response({**CAPABILITY, "studio_instances": _studio_instances()})
+    return web.json_response({**CAPABILITY, "studio_instances": _studio_instances(),
+                              "sampling_profiles": profile_catalog(), "timeline_guides": True,
+                              "reference_adapters": True, "content_loras": True})
+
+
+async def promptstudio_video_adapters(_request):
+    try:
+        adapter_type = _request.query.get("type", "*")
+        if len(adapter_type) > 256:
+            raise ValueError("Adapter Type is too long")
+        return web.json_response(await asyncio.to_thread(adapter_catalog, adapter_type))
+    except (OSError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
 
 def _bridge_text(value, name, maximum=256, required=False):
@@ -330,6 +349,7 @@ def _document_response(document, include_prompt=False):
         "resolved_mode": document["resolved_mode"],
         "frame_count": frame_count_for_duration(document["duration_seconds"]),
         "effective_duration": effective_duration(document),
+        "advisories": prompt_advisories(document),
     }
     if include_prompt:
         response["compiled_prompt"] = compile_prompt(document)
@@ -357,6 +377,14 @@ async def promptstudio_video_compile(request):
         return web.json_response(_document_response(await _document_body(request), include_prompt=True))
     except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
         return web.json_response({"valid": False, "error": str(exc), "code": "invalid_document"}, status=400)
+
+
+async def promptstudio_video_rewriter_review(request):
+    try:
+        data = await _director_body(request)
+        return web.json_response(review_rewrite(data.get("document"), data.get("draft"), data.get("adapter", "8b")))
+    except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
 
 async def promptstudio_video_continuation_prepare(request):
@@ -488,6 +516,8 @@ async def promptstudio_video_projects_get(request):
     try:
         async with PROJECT_LOCK:
             data, status = await asyncio.to_thread(read_project_query, PROJECT_STORE_PATH, PROJECT_STORE_DIR, request.query)
+        if _HISTORY_STORAGE_STARTED:
+            shared_transactional_store().schedule_maintenance(PROJECT_STORE_DIR, "projectFiles", "project")
         if status == 204:
             return web.Response(status=204, headers={"X-PromptStudio-Revision": str(data["revision"])})
         return web.json_response(data, status=status)
@@ -504,10 +534,38 @@ async def promptstudio_video_projects_put(request):
         data = await request.json()
         async with PROJECT_LOCK:
             saved = await asyncio.to_thread(update_project_store, PROJECT_STORE_PATH, data, PROJECT_STORE_DIR)
+        if _HISTORY_STORAGE_STARTED:
+            shared_transactional_store().schedule_maintenance(PROJECT_STORE_DIR, "projectFiles", "project")
         return web.json_response({"ok": True, "revision": saved["revision"]})
     except StoreConflictError as exc:
         return web.json_response({"error": str(exc)}, status=409)
     except (ValueError, PromptDocumentError, json.JSONDecodeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def promptstudio_video_storage(request):
+    service = shared_transactional_store()
+    try:
+        if request.method == "GET":
+            return web.json_response(await asyncio.to_thread(service.storage_status, PROJECT_STORE_DIR, "projectFiles", "project", request.query.get("checkpoint")))
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("Storage request must be an object")
+        async with PROJECT_LOCK:
+            if data.get("action") == "optimize":
+                result = await asyncio.to_thread(service.maintain_storage, PROJECT_STORE_DIR, "projectFiles", "project")
+            elif data.get("action") == "restore":
+                result = await asyncio.to_thread(service.restore_record, PROJECT_STORE_DIR, "projectFiles", "project",
+                    int(data["checkpoint"]), str(data["record_id"]), int(data["revision"]), summary_builder=_project_summary)
+                result = {"revision": result["revision"]}
+            else:
+                raise ValueError("Unknown storage action")
+        return web.json_response({"ok": True, **result})
+    except service.RevisionConflictError as exc:
+        return web.json_response({"error": str(exc)}, status=409)
+    except (ValueError, KeyError, TypeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
@@ -553,16 +611,23 @@ async def promptstudio_video_workflows_put(request):
         return web.json_response({"error": str(exc)}, status=500)
 
 
-async def promptstudio_video_default_workflows_get(_request):
+async def promptstudio_video_default_workflows_get(request):
     try:
-        return web.json_response(await asyncio.to_thread(workflow_setup_plan))
+        return web.json_response(await asyncio.to_thread(workflow_setup_plan, bundle=request.query.get("bundle", "legacy")))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
 
-async def promptstudio_video_default_setup_post(_request):
+async def promptstudio_video_default_setup_post(request):
     try:
-        return web.json_response(await asyncio.to_thread(start_default_model_setup))
+        data = await request.json() if request.can_read_body else {}
+        if not isinstance(data, dict):
+            raise ValueError("Setup request must be an object")
+        return web.json_response(await asyncio.to_thread(start_default_model_setup, bundle=data.get("bundle", "legacy")))
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
@@ -840,6 +905,12 @@ async def promptstudio_video_llm_abort(request):
         return _llm_error_response(exc)
 
 
+async def _optimize_history_on_startup(_application):
+    global _HISTORY_STORAGE_STARTED
+    _HISTORY_STORAGE_STARTED = True
+    shared_transactional_store().schedule_maintenance(PROJECT_STORE_DIR, "projectFiles", "project", PROJECT_STORE_PATH)
+
+
 def register_routes():
     """Register after ComfyUI has created its PromptServer singleton."""
     server = getattr(PromptServer, "instance", None)
@@ -850,6 +921,7 @@ def register_routes():
     if shutdown is not None and _shutdown_director_jobs not in shutdown:
         shutdown.append(_shutdown_director_jobs)
     routes.get("/promptstudio-video/capabilities")(promptstudio_video_capabilities)
+    routes.get("/promptstudio-video/adapters")(promptstudio_video_adapters)
     routes.post("/promptstudio-video/studio-presence")(promptstudio_video_presence)
     routes.post("/promptstudio-video/studio-handoff")(promptstudio_video_handoff_create)
     routes.get("/promptstudio-video/studio-handoff/{request_id}")(promptstudio_video_handoff_result)
@@ -859,11 +931,14 @@ def register_routes():
     routes.get("/promptstudio-video/runtime-health")(promptstudio_video_runtime_health)
     routes.post("/promptstudio-video/document/validate")(promptstudio_video_validate)
     routes.post("/promptstudio-video/document/compile")(promptstudio_video_compile)
+    routes.post("/promptstudio-video/rewriter/review")(promptstudio_video_rewriter_review)
     routes.post("/promptstudio-video/continuations/prepare")(promptstudio_video_continuation_prepare)
     routes.post("/promptstudio-video/continuations/assemble")(promptstudio_video_continuation_assemble)
     routes.post("/promptstudio-video/audio-mix")(promptstudio_video_audio_mix)
     routes.post("/promptstudio-video/media/audio-probe")(promptstudio_video_audio_probe)
     routes.get("/promptstudio-video/projects")(promptstudio_video_projects_get)
+    routes.get("/promptstudio-video/projects/storage")(promptstudio_video_storage)
+    routes.post("/promptstudio-video/projects/storage")(promptstudio_video_storage)
     routes.put("/promptstudio-video/projects")(promptstudio_video_projects_put)
     routes.post("/promptstudio-video/projects/maintenance")(promptstudio_video_projects_maintenance)
     routes.get("/promptstudio-video/workflows")(promptstudio_video_workflows_get)
@@ -886,3 +961,7 @@ def register_routes():
 
 
 register_routes()
+if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    startup = getattr(getattr(PromptServer.instance, "app", None), "on_startup", None)
+    if startup is not None:
+        startup.append(_optimize_history_on_startup)

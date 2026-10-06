@@ -1,0 +1,8 @@
+---
+{"id":"video.playback","topic":"video-playback","studio":"video","summary":"Main video player, generation selection, full video or extension playback, timeline preview and looping."}
+---
+Click the ruler to position the playhead; use Play and frame buttons. Set In/Out and Loop range rehearse a section without trimming output. Saved-take preview plays an existing render; new edits need another render. Without media, the playhead is a timing rehearsal. Zoom enlarges the timeline. Shot time is local; the displayed offset locates it in the project.
+The main player is on the left and Generations is on the right. Select a generation to load it in the main player. Entries have static thumbnails; playback controls and result actions are beneath or inside the main player. Selection is remembered per project in this browser. A newly completed generation does not replace the result you are reviewing. Use Up/Down or Home/End to focus history entries, then Enter or Space to select.
+On narrow workspaces, history stacks beneath the player. Open Projects or Shots from the top bar to access the side panels.
+Playback ranges are session-only and do not trim, modify or export media. The preview includes the saved render's existing mix, not unsaved audio edits.
+For an extension result, Full video plays the assembled output and Extension only plays the delivered segment. The editing timeline links to a selected saved take only when its saved document matches the current edits; extension timelines link only to Extension only. Otherwise the timeline is a timing rehearsal, separate from the selected result. Browsing history never restores or changes authored shots. Use Compare saved inputs to explicitly restore a saved document.

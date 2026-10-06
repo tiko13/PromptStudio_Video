@@ -19,6 +19,7 @@ from .director_policy import (
 )
 
 from .compiler import compile_prompt
+from .vocabulary import shared_rules
 from .contracts import (
     CAMERA_TYPES,
     RETENTION_RELATIONSHIPS,
@@ -31,6 +32,7 @@ from .contracts import (
 )
 from .director_vision import load_vision_images, normalize_attachments
 from .llm_provider import generate_chat
+from .director_planning import planning_payload, create_plan, validate_plan_result, review_result, author_messages
 from .assistant_help import shared_help, CATALOG_ROOT as HELP_CATALOG_ROOT
 
 _assistant_help = shared_help()
@@ -302,7 +304,7 @@ Preserve the user's explicit subject-object and spatial relations exactly. If th
 
 Treat every cut as a continuity checkpoint. Before and after each cut, carry forward a concrete state ledger for every continuing subject: identity and body proportions; hair, wardrobe, footwear, and accessories; carried props and which hand holds them; pose, gaze, screen direction, wetness/damage/fill/open-or-closed state; and relationships to other subjects and key objects. A cut, camera-angle change, location change, lighting change, or elapsed-time change never silently resets that ledger. In each later shot, state the continuing subject or object's stable identity and any continuity-critical state explicitly enough that a video model cannot redesign or swap it. If the user requests a deliberate change, change only the named attributes, make the change visible on screen or clearly establish the new post-cut state, and preserve all unnamed attributes. Keep screen direction and eyelines consistent unless the shot visibly crosses the axis or the user asks for reversal.
 
-Choose cuts and camera moves according to normal editing grammar. Use one continuous shot for one continuous action unless a cut adds a new location, viewpoint, reveal, reaction, time beat, or information. A later shot starts at its cut time and must not repeat an already completed action as though it happens again. For cut-on-action or match cuts, name the shared pose, motion, shape, or object state on both sides. Camera motion is a concurrent shot layer, not a substitute for subject action: its direction, target, amplitude, and speed must be feasible together and must not contradict a Static Shot. Avoid combining competing moves unless the user explicitly requests a compound move.
+Choose cuts and camera moves according to normal editing grammar. Default one continuous event to one continuous shot. Add cuts only when requested, clearly implied by discrete scenes/time jumps, or expressly delegated by the user. A new action, camera move, reaction or cinematic style alone does not authorize a cut. A later shot starts at its cut time and must not repeat an already completed action as though it happens again. For cut-on-action or match cuts, name the shared pose, motion, shape, or object state on both sides. Camera motion is a concurrent shot layer, not a substitute for subject action: its direction, target, amplitude, and speed must be feasible together and must not contradict a Static Shot. Avoid combining competing moves unless the user explicitly requests a compound move.
 
 Map camera language by physical motion, not by the user's casual verb alone. "Pan left/right" rotates the camera in place and uses Pan Left or Pan Right. "Pan around," "move around," "circle," or "orbit" a subject moves the viewpoint around that subject and must use Arc Shot. Tracking Shot follows a moving subject; Truck Left/Right translates laterally; Push In/Pull Out physically changes camera distance; Zoom In/Out changes focal length without translating; Tilt rotates vertically; Pedestal translates vertically. Never substitute one for another when the user states the physical move.
 
@@ -349,7 +351,7 @@ Each shot's steps array is its only writable performance sequence. Read action a
 The authoritative video document is edited by deterministic code. Never claim that you changed it. Every response must be exactly one JSON object with message and proposal. If the user only asks for advice, set proposal to null. If the user asks you to write, create, draft, suggest, or add a spoken line, return the complete resulting steps sequence inside the proposal so the user can apply it. Existing dialogue, lyrics, speaker IDs, and visible text are protected: never rewrite, remove, or repeat existing entries outside that preserved steps sequence. If the user explicitly asks to draft, refine, revise, fill, improve, or change the selected shot, return a brief message and one proposal in this form:
 {{"message":"Brief user-facing explanation","proposal":{{"summary":"Refine the selected shot","operations":[{{"op":"update_shot","shot_id":"the selected shot id","replace":false,"fields":{{"steps":[{{"type":"action","text":"A concrete visible action."}}],"camera":{{"type":"Push In","amplitude":"small","speed":"slow","target":"the primary subject"}}}}}}]}}}}
 
-Allowed shot fields: composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. `replace` is a boolean on update_shot. Use replace false or omit it for a small edit: omitted fields remain unchanged. Use replace true only when the user explicitly asks to completely rewrite, replace, redo, or start the selected shot/scene over; omitted writable fields are then cleared instead of inherited. A replacement must provide the complete desired shot, including every visual field and the complete steps, sounds, visible text, and camera state that should remain. This distinction is mandatory: never let an old field survive a requested full rewrite, and never erase unrelated fields during a narrow edit. steps is the complete chronological sequence: action objects use type and text; dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, and cutoff. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing because each event belongs to its shot. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them. Camera may contain type, amplitude, speed, and target. A selected-shot proposal may also use update_project only for task_types, subject_definitions, summary, and retention_analysis when reference semantics must be created or repaired. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed.
+Allowed shot fields: composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. `replace` is a boolean on update_shot. Use replace false or omit it for a small edit: omitted fields remain unchanged. Use replace true only when the user explicitly asks to completely rewrite, replace, redo, or start the selected shot/scene over; omitted writable fields are then cleared instead of inherited. A replacement must provide the complete desired shot, including every visual field and the complete steps, sounds, visible text, and camera state that should remain. This distinction is mandatory: never let an old field survive a requested full rewrite, and never erase unrelated fields during a narrow edit. steps is the complete chronological sequence: action objects use type and text; dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, cutoff, and utterance_id. For one continuous utterance spanning consecutive shots, put the exact spoken segment in each shot and use the same nonempty utterance_id, speaker_id, language and performance on every segment; never split or rewrite existing protected text without authorization. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing because each event belongs to its shot. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them. Camera may contain type, amplitude, speed, and target. A selected-shot proposal may also use update_project only for task_types, subject_definitions, summary, and retention_analysis when reference semantics must be created or repaired. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed.
 
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context. Never call an on-screen vocalizing person merely "the speaker": on first speaking appearance, bind the speaker to a concrete visible identity and its supplied source, or use its canonical Subject token in REF2VA. In base keyframe modes, identify the sole visible speaker as "the [neutral subject name] shown in <Picture N>"; do not invent a Subject token there. When a REF2VA referenced image supplies a person, object, scene, style, action, pose, or camera treatment, define reusable visible content as <Subject N> sourced from its <Picture N>, add it to summary and retention_analysis, and use <Subject N> naturally in every affected shot. One Picture may supply multiple independently selectable Subjects; the user's natural identifiers have already been resolved to canonical tokens from subject_registry. A Picture used only as the source of a Subject does not get a separate Picture definition or retention line. A storyboard or concrete keyframe may be defined directly as <Picture N>. Every REF2VA source reference must be represented in subject_definitions, and every defined label must have one retention_analysis entry and appear in the summary and applicable shot/audio fields.
 
@@ -372,12 +374,12 @@ Each shot's steps array is its only writable performance sequence. Read action a
 
 Follow MiniMax H3's timeline grammar. Shot 1 begins at 0 without a timestamp. Later shots use strictly increasing cut times inside the effective duration, and each cut must introduce useful new information. Prefer camera motion over a cut when only distance or angle changes. Express camera motion as type plus meaningful amplitude and speed. Keep action concrete, audiovisual, and feasible within each shot's time budget.
 
-Before emitting a change set, treat main_description and the production brief as a planning synopsis, infer the most effective shot structure from its requested visual beats, and realize every prompt-relevant detail in concrete shot fields. The synopsis is visible to the user and supplied to you, but is deliberately never compiled into the MiniMax prompt. Keep one continuous shot when a cut would add no useful information. For broad composition, creation, or restructuring requests, create multiple shots when distinct actions, reveals, reactions, locations, viewpoints, or time beats benefit from clear cuts, even when the user did not specify a shot count. When the user specifies an exact count, produce exactly that many resulting shots. For narrow localized edits, preserve the existing structure unless a structural change is requested or clearly necessary. Apply all timing operations mentally: the resulting first shot must begin at 0, every later shot must have a unique strictly increasing start time, and every cut must remain inside the effective duration. Never reuse an existing start time when adding or moving a shot. Every [Shot N] named in summary or retention_analysis must exist in the resulting operations.
+Before emitting a change set, treat main_description and the production brief as a planning synopsis, follow the validated shot plan and distinguish action beats from editorial cuts, and realize every prompt-relevant detail in concrete shot fields. The synopsis is visible to the user and supplied to you, but is deliberately never compiled into the MiniMax prompt. Keep one continuous shot when a cut would add no useful information. For broad composition, creation, or restructuring requests, create multiple shots when distinct actions, reveals, reactions, locations, viewpoints, or time beats benefit from clear cuts, even when the user did not specify a shot count. When the user specifies an exact count, produce exactly that many resulting shots. For narrow localized edits, preserve the existing structure unless a structural change is requested or clearly necessary. Apply all timing operations mentally: the resulting first shot must begin at 0, every later shot must have a unique strictly increasing start time, and every cut must remain inside the effective duration. Never reuse an existing start time when adding or moving a shot. Every [Shot N] named in summary or retention_analysis must exist in the resulting operations.
 
 The authoritative video document is edited and compiled by deterministic code. Never claim that you changed it and never emit a compiled MiniMax prompt. Every response must be exactly one JSON object with message and proposal. If the user only asks for advice, set proposal to null. If the user asks you to write, create, draft, suggest, or add a spoken line, return the complete resulting steps sequence inside the proposal so the user can apply it. Existing dialogue, lyrics, speaker IDs, and visible text are protected: never rewrite, remove, or repeat existing entries outside that preserved steps sequence. Treat requests to create, generate, compose, or apply the "full prompt" as requests to populate the complete structured video document. If the user explicitly asks to compose, create, generate, draft, restructure, refine, revise, fill, improve, split, add, remove, apply, or change the video, you MUST return a brief message and one proposal in this form:
 {{"message":"Brief user-facing explanation","proposal":{{"summary":"Apply the requested production changes","operations":[{{"op":"update_project","replace":false,"fields":{{"main_description":"A concise whole-video action description.","style":"A concrete visual style description.","overall_soundscape":"A concrete ambience and physical-sound description.","non_diegetic_music":"N/A"}}}},{{"op":"update_shot","shot_id":"existing shot id","replace":false,"fields":{{"steps":[{{"type":"action","text":"A concrete visible action."}}],"start":4.0}}}},{{"op":"add_shot","shot":{{"id":"new-shot-id","start":6.0,"transition":"the camera cuts to","composition":"A concrete composition.","subjects":"The visible subjects and positions.","environment":"A concrete environment.","lighting":"A concrete lighting setup.","steps":[{{"type":"action","text":"A concrete visible action."}}],"camera":{{"type":"Push In","amplitude":"small","speed":"slow","target":"the primary subject"}},"sounds":["A concrete synchronized sound."]}}}}]}}}}
 
-Allowed project fields: main_description, style, overall_soundscape, non_diegetic_music, summary, complete_silence, task_types, subject_definitions, and retention_analysis. `replace` is a boolean on update_project, update_shot, and remove_shot. For narrow edits, use replace false or omit it: omitted fields remain unchanged. For an explicit complete/full/entire production rewrite, use replace true on update_project and on every update_shot or remove_shot that replaces old content. Replacement updates clear omitted writable fields before applying the supplied complete result; replacement removals must carry every protected line, lyric, speaker ID, and visible-text entry into the resulting timeline unless its specific change is explicitly authorized. Every surviving old shot must receive a replace-true update, and update_project with replace true must describe the complete resulting production. Never use replace true for a localized change. main_description is the concise planning synopsis shown to the user; it is never compiled and cannot substitute for shot-specific detail. update_shot may target any existing shot and may change start, composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. add_shot uses those same fields plus a new unique id. steps replaces the complete chronological action/dialogue sequence. Action objects use type and text. Dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, and cutoff. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them; a complete production rewrite does not count as such a request. remove_shot without replace true cannot remove a shot that contains dialogue or visible text. Populate an existing shot with update_shot; never add a replacement for it. Preserve existing shot IDs when they remain useful. Preserve shot count and start times for narrow edits, but for broad production composition choose the shot count implied by the visual story and use add_shot or remove_shot as needed. A shot_id or new shot id is the exact literal id from the context, such as shot-1; it is never a display token such as [Shot 1]. Nest list and sequence fields inside fields for update_shot and inside shot for add_shot. Store camera movement only in camera; do not repeat the camera sentence in an action step because the deterministic compiler adds it. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed. Use N/A for no non-diegetic music. complete_silence suppresses dialogue, synchronized sounds, ambience, and non-diegetic music in the compiled prompt.
+Allowed project fields: main_description, style, overall_soundscape, non_diegetic_music, summary, complete_silence, task_types, subject_definitions, and retention_analysis. `replace` is a boolean on update_project, update_shot, and remove_shot. For narrow edits, use replace false or omit it: omitted fields remain unchanged. For an explicit complete/full/entire production rewrite, use replace true on update_project and on every update_shot or remove_shot that replaces old content. Replacement updates clear omitted writable fields before applying the supplied complete result; replacement removals must carry every protected line, lyric, speaker ID, and visible-text entry into the resulting timeline unless its specific change is explicitly authorized. Every surviving old shot must receive a replace-true update, and update_project with replace true must describe the complete resulting production. Never use replace true for a localized change. main_description is the concise planning synopsis shown to the user; it is never compiled and cannot substitute for shot-specific detail. update_shot may target any existing shot and may change start, composition, subjects, environment, lighting, transition, notes, sounds, visible_text, camera, and steps. add_shot uses those same fields plus a new unique id. steps replaces the complete chronological action/dialogue sequence. Action objects use type and text. Dialogue objects use type, speaker, speaker_id, language, performance, text, delivery, voiceover, offscreen, crosses_cut, cutoff, and utterance_id. For one continuous utterance spanning consecutive shots, put the exact spoken segment in each shot and use the same nonempty utterance_id, speaker_id, language and performance on every segment; never split or rewrite existing protected text without authorization. speaker_id must use the MiniMax form S1, S2, and so on; <Subject 1> speaks with speaker_id S1. performance is speech or singing. Omit event timing. Preserve existing dialogue, lyrics, and visible text verbatim unless the user explicitly asks to change or remove them; a complete production rewrite does not count as such a request. remove_shot without replace true cannot remove a shot that contains dialogue or visible text. Populate an existing shot with update_shot; never add a replacement for it. Preserve existing shot IDs when they remain useful. Preserve shot count and start times for narrow edits, and for broad production composition follow the validated shot plan exactly; do not invent cuts to separate action beats. A shot_id or new shot id is the exact literal id from the context, such as shot-1; it is never a display token such as [Shot 1]. Nest list and sequence fields inside fields for update_shot and inside shot for add_shot. Store camera movement only in camera; do not repeat the camera sentence in an action step because the deterministic compiler adds it. Use only camera types listed in the context. Camera amplitude must be exactly small, default, or large; camera speed must be exactly slow, default, or fast. Use default for medium amplitude or normal speed. Use N/A for no non-diegetic music. complete_silence suppresses dialogue, synchronized sounds, ambience, and non-diegetic music in the compiled prompt.
 
 Use MiniMax's exact guide grammar: reference identifiers are <Picture 1>, <Video 1>, <Audio 1>, and <Subject 1>; shots are [Shot 1], [Shot 2], and so on. Use only source tokens supplied in the context and preserve them verbatim. Never call an on-screen vocalizing person merely "the speaker": on first speaking appearance, bind the speaker to a concrete visible identity and its supplied source, or use its canonical Subject token in REF2VA. In base keyframe modes, identify the sole visible speaker as "the [neutral subject name] shown in <Picture N>"; do not invent a Subject token there. When the project resolves to REF2VA, always populate all six guide sections through the structured document: task_types and summary, subject_definitions, retention_analysis, detailed shot fields, overall_soundscape, and non_diegetic_music. Keep the detailed description chronological and concise. Aim toward the guide's 350–500-word range only when the requested generation genuinely needs that detail; never pad a short clip, repeat subject definitions, restate reference appearance in shot prose, or fill pixel-owned first-frame fields merely to reach a word count.
 
@@ -1104,7 +1106,14 @@ def build_provider_messages(data):
         policy_modules.append(PolicyModule("video_edit", VIDEO_EDIT_DIRECTOR_POLICY, "semantics"))
     prompt_guide_chars = 0
     prompt_guides = []
-    for guide_name, prompt_guide in _prompt_writing_guides(document["resolved_mode"]):
+    guide_mode = document["resolved_mode"]
+    if document.get("reference_adapters") and not model_references(document):
+        guide_mode = "t2va"
+        policy_modules.append(PolicyModule("saved_reference_adapters",
+            "This project uses unnumbered saved RefMod latents. REF2VA identifies the generation checkpoint only. "
+            "Use the T2VA prose guide without reference labels, subject_definitions or retention_analysis; "
+            "no Picture, Video, Audio or Subject tokens exist for these adapters. Preserve adapter selections.", "semantics"))
+    for guide_name, prompt_guide in _prompt_writing_guides(guide_mode):
         prompt_guide_chars += len(prompt_guide)
         prompt_guides.append(guide_name)
         policy_modules.append(PolicyModule(
@@ -1114,6 +1123,9 @@ def build_provider_messages(data):
             + f"\nEND AUTHORITATIVE MINIMAX H3 {guide_name.upper()} VIDEO PROMPT WRITING GUIDE",
             "semantics",
         ))
+    vocabulary_instruction = shared_rules().instruction()
+    if vocabulary_instruction:
+        policy_modules.append(PolicyModule("forbidden_words", vocabulary_instruction, "semantics"))
     system_message, policy_metadata = compose_policy(policy_modules)
     messages = [
         {"role": "system", "content": system_message},
@@ -1725,7 +1737,7 @@ def _dialogue_additions(value):
     result = []
     allowed = {
         "id", "speaker", "speaker_id", "language", "performance", "text", "delivery",
-        "voiceover", "offscreen", "crosses_cut", "cutoff", "start",
+        "voiceover", "offscreen", "crosses_cut", "cutoff", "start", "utterance_id",
     }
     for index, item in enumerate(value):
         if not isinstance(item, dict):
@@ -1755,6 +1767,7 @@ def _dialogue_additions(value):
             "voiceover": item.get("voiceover") is True,
             "offscreen": item.get("offscreen") is True,
             "crosses_cut": item.get("crosses_cut") is True,
+            "utterance_id": _text(item.get("utterance_id"), 80),
             "cutoff": item.get("cutoff") is True,
         })
     return result[:32]
@@ -3917,11 +3930,11 @@ def _proposal_retry_messages(messages, scope, raw="", proposal_error="", draft_p
     else:
         assistant_content = _text(raw) or "I answered without a machine-applicable structured proposal."
     validation_feedback = (
-        f" The previous proposal failed deterministic validation: {_text(proposal_error, 1_000)}."
+        f" The previous proposal failed validation: {_text(proposal_error, 1_000)}."
         if proposal_error
         else ""
     )
-    validation_feedback += " Repair these deterministic issue codes: " + json.dumps([
+    validation_feedback += " Repair these validation issue codes: " + json.dumps([
         {"code": issue["code"], "stage": issue["stage"], "detail_codes": issue.get("detail_codes", [])}
         for issue in issues
     ], separators=(",", ":")) + "."
@@ -4370,6 +4383,11 @@ def _restrict_reference_only_proposal(document, proposal, data):
 
 
 def _validate_requested_project_result(result_document, data):
+    if data.get("_shot_plan"):
+        # Planned turns resolve the request semantically, then enforce its exact
+        # topology above and review the resulting scene. Legacy keyword matching
+        # would treat "do not use two shots" or a quoted cut as an affirmative ask.
+        return
     content = _latest_user_content(data)
     number_words = {
         "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -4879,6 +4897,10 @@ def _validate_requested_dialogue_mechanics(result_document, data):
 
 
 def _validate_requested_camera_mechanics(result_document, data):
+    if data.get("_shot_plan"):
+        # The semantic review handles negation, multilingual requests and moves
+        # limited to one shot; a global mention of "orbit" is not an instruction.
+        return
     content = _latest_user_content(data)
     around_subject = re.search(
         r"\b(?:camera|shot)\b.{0,60}\b(?:pan(?:s|ning)?|move(?:s|ing)?|circle(?:s|ing)?|"
@@ -5533,6 +5555,7 @@ def _validate_proposal_result(document, result, proposal, request_data):
     # Validation stages receive isolated inputs and fail if a validator mutates
     # them. Normalization belongs above or in preview, never in a check.
     checks = (
+        ("structure", "planned_timeline", validate_plan_result, (request_data.get("_shot_plan"), result)),
         ("structure", "extension_timeline", _validate_extension_plan_timeline, (result, request_data)),
         ("authorization", "protected_content", _validate_protected_sequence_content, (document, result, request_data)),
         ("authorization", "reference_only", _validate_reference_only_preservation, (document, result, request_data)),
@@ -5571,6 +5594,16 @@ def _validate_parsed_proposal(document, parsed, request_data=None):
         _validate_normalized_proposal(document, proposal, request_data)
         preview = run_stage("structure", "changeset_preview", preview_changeset, document, proposal, request_data=request_data)
         _validate_proposal_result(document, preview["document"], proposal, request_data)
+        plan = (request_data or {}).get("_shot_plan")
+        if plan and not (request_data.get("_turn_intent") or {}).get("reference_only"):
+            _report_director_progress(request_data.get("_planning_progress"), {"phase": "continuity_review"})
+            semantic_issues = review_result(request_data, request_data["_planning_payload"], plan,
+                                           preview["document"], generate_chat, _json_object_from_response)
+            if semantic_issues:
+                code = "planning_conflict" if any(item["code"] == "plan_conflict" for item in semantic_issues) else "continuity_review"
+                raise ProposalIssueError(validation_issue(
+                    "; ".join(item["detail"] for item in semantic_issues), stage="semantics", code=code,
+                ))
         parsed["proposal"] = preview["proposal"]
         parsed["proposal_error"] = ""
         parsed.pop("pending_proposal", None)
@@ -5672,7 +5705,19 @@ def _director_help_packet(data):
     return _assistant_help.retrieve(data.get("messages", []), facts, select, extra_roots=(HELP_CATALOG_ROOT,))
 
 
-def director_chat(data, progress_callback=None):
+def _create_director_plan(request_data, document, context, progress_callback=None, feedback=""):
+    _report_director_progress(progress_callback, {"phase": "shot_planning"})
+    history, _, _ = _bounded_history(request_data.get("messages"), max(DEFAULT_HISTORY_CHARS, MAX_MESSAGE_CHARS + 32))
+    payload = planning_payload(request_data, document, context, history)
+    request_data["_planning_payload"] = payload
+    request_data["_planning_progress"] = progress_callback
+    if (request_data.get("_turn_intent") or {}).get("reference_only"):
+        return {"structure": "preserve", "rationale": "Reference-only edit preserves the existing timeline.",
+                "continuity": [], "shots": [], "timeline": payload["existing_timeline"]}
+    return create_plan(request_data, payload, generate_chat, _json_object_from_response, feedback)
+
+
+def director_chat(data, progress_callback=None, *, authoring_new_extension=False):
     request_data = dict(data)
     request_data["pending_plan"] = _current_pending_plan(request_data)
     pending = request_data.get("pending_plan")
@@ -5697,6 +5742,17 @@ def director_chat(data, progress_callback=None):
             "reference_only": False, "reason": "The intent router was unavailable.",
         }
         intent_warning = _text(exc, 1_000)
+    if authoring_new_extension:
+        # Only the internal extension builder passes this keyword, after making
+        # a separate tail document. Replacing that new draft is part of this
+        # operation, not an LLM inference about permission to rewrite the source.
+        # Protected-content permissions still come from the ordinary classifier.
+        turn_intent = copy.deepcopy(turn_intent)
+        edit_intent = _validated_edit_intent({**request_data, "_turn_intent": turn_intent})
+        edit_intent.update(scope="project", replacement="replace",
+                           replacement_evidence="Completely rewrite the entire production for this extension")
+        edit_intent["preserve"] = [item for item in edit_intent["preserve"] if item != "replacement"]
+        turn_intent.update(route="mutate", confidence=1.0, reference_only=False, edit_intent=edit_intent)
     request_data["_turn_intent"] = turn_intent
     help_packet = _director_help_packet(request_data) if _assistant_help.needs_help(turn_intent.get("help_domain")) else None
     if help_packet is not None and turn_intent["route"] != "mutate" and turn_intent.get("help_domain") == "app":
@@ -5746,6 +5802,10 @@ def director_chat(data, progress_callback=None):
             if intent_warning:
                 result["intent_warning"] = intent_warning
             return result
+    base_messages = messages
+    if proposal_required or turn_intent["route"] == "auto":
+        request_data["_shot_plan"] = _create_director_plan(request_data, document, _context, progress_callback)
+        messages = author_messages(base_messages, request_data["_shot_plan"])
     generation_request_data = (
         {**request_data, "temperature": _proposal_temperature(request_data.get("temperature"))}
         if proposal_required
@@ -5815,6 +5875,12 @@ def director_chat(data, progress_callback=None):
             if parsed["proposal"] is not None:
                 break
             correction_attempts += 1
+            if any(issue.get("code") == "planning_conflict" for issue in parsed.get("proposal_issues", [])):
+                request_data["_shot_plan"] = _create_director_plan(
+                    request_data, document, _context, progress_callback, parsed["proposal_error"],
+                )
+                retry_request_data["_shot_plan"] = request_data["_shot_plan"]
+                messages = author_messages(base_messages, request_data["_shot_plan"])
             _report_director_progress(progress_callback, {
                 "phase": "proposal_correction",
                 "attempt": _attempt + 1,
@@ -5846,7 +5912,7 @@ def director_chat(data, progress_callback=None):
                 f"{PROPOSAL_CORRECTION_ATTEMPTS} corrections."
             )
             parsed["message"] = (
-                "I couldn't produce a proposal that passed deterministic validation. "
+                "I couldn't produce a proposal that passed structure and continuity review. "
                 "Nothing was changed."
             )
             parsed.pop("pending_proposal", None)
@@ -5857,6 +5923,7 @@ def director_chat(data, progress_callback=None):
         "first_pass_issues": first_pass_issues,
         "correction_attempts": correction_attempts,
         "maximum_corrections": PROPOSAL_CORRECTION_ATTEMPTS,
+        "shot_structure": (request_data.get("_shot_plan") or {}).get("structure"),
     }
     parsed["clarification"] = None
     parsed["pending_plan"] = None

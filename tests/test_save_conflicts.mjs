@@ -1,8 +1,11 @@
+import {validateStoreResponse} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/chat/store-response.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import {createDraftScheduler} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/chat/draft-outbox.js";
+import {tagSubmission} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/generation/recovery.js";
+import {archiveDraft} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/chat/draft-review.js";
 
 const source = fs.readFileSync(new URL("../web/js/promptstudio_video_studio.js", import.meta.url), "utf8");
 function functionSource(name) {
@@ -37,10 +40,14 @@ function harness(server, shared = {}) {
   let fail = false;
   let loseAcknowledgement = false;
   let onPut = null;
-  const context = vm.createContext({ state, structuredClone, localStorage, sessionStorage, Map, Set, console,
+  const context = vm.createContext({ validateStoreResponse, archiveDraft, showRecoveredProjectDrafts: async () => {}, state, structuredClone, localStorage, sessionStorage, Map, Set, console,
     videoDraftOutbox, videoDraftPending:Promise.resolve(true), draftTabKey:product=>product, showDraftStorageFailure() {},
     projectDraftScheduler: createDraftScheduler(() => {}),
     captureRuntimeProvenance:async()=>({version:1}),
+    tagSubmission,
+    markProjectChanged() { state.projectMutation++; },
+    directorSettings:()=>({keep_models_loaded:true}),
+    workflowReferenceController:null,
     PROJECTS_ENDPOINT: "/projects", URLSearchParams, requireHistoryIndex() {}, async prepareHistoryIndex() { return false; }, clearTimeout, setTimeout, clone: copy, makeId: () => "tab-one",
     activeProject: () => state.projects.find(item => item.id === state.activeProjectId),
     renderAll() {}, setSaveState() {}, setStatus() {},
@@ -120,7 +127,7 @@ test("edits made during a request survive and are saved by the chained followup"
   assert.equal(client.state.projectSavedMutation, client.state.projectMutation);
 });
 
-test("reload restores the draft, blocks conflicting writes, and does not resume an uncertain preparation", async () => {
+test("reload archives a stale draft for review and leaves server projects and uncertain preparations untouched", async () => {
   const server = { revision: 1, projects: [project("a")] };
   const client = harness(server);
   client.edit(projects => {
@@ -131,10 +138,13 @@ test("reload restores the draft, blocks conflicting writes, and does not resume 
   server.revision++;
   const reloaded = harness(server, client);
   await reloaded.context.loadProjects();
-  assert.equal(reloaded.state.projects[0].document.shots[0].action, "draft");
-  assert.equal(reloaded.state.projects[0].generations[0].status, "error");
-  await assert.rejects(reloaded.save({ immediate: true }), /Review competing/);
-  assert.deepEqual(reloaded.calls, ["GET", "GET"], "draft reconciliation loads the complete remote baseline after the initial page");
+  assert.equal(reloaded.state.projects[0].document.shots[0].action, "remote");
+  assert.equal(reloaded.state.projects[0].generations.length, 0);
+  const archive = [...reloaded.outboxRecords.entries()].find(([key]) => key.startsWith('video:review:'))[1];
+  assert.equal(archive.projects[0].document.shots[0].action, 'draft');
+  assert.equal(archive.projects[0].generations[0].status, 'queueing');
+  assert.equal(reloaded.localStorage.getItem(reloaded.state.projectDraftKey), null);
+  assert.deepEqual(reloaded.calls, ["GET"], "unreviewed drafts do not write or execute work");
 });
 
 test("record deletion versus editing conflicts and explicit choices preserve IDs", () => {
@@ -188,6 +198,39 @@ test("mandatory persistence failure prevents the common queue path from submitti
   await assert.rejects(client.context.queueSnapshot(client.state.projects[0], {}, { workflow: {}, output: {} }, {}), /offline/);
   assert.equal(queued, 0);
 });
+
+for (const scenario of ["queue-fails", "release-fails", "cancelled", "dedicated"]) {
+  test(`video GPU handoff: ${scenario}`, async () => {
+    const client = harness({ revision: 1, projects: [project("a")] });
+    const operation = { id: "gpu-test", status: "queueing" };
+    const events = [];
+    Object.assign(client.context, {
+      applyPromptStudioInputValues() {}, normalizePromptStudioInputSelections: value => value,
+      instrumentGenerationSnapshot: () => ({}),
+      directorSettings: () => ({ llm_provider: "llamacpp", keep_models_loaded: scenario === "dedicated" }),
+    });
+    const fetch = client.context.api.fetchApi;
+    client.context.api.fetchApi = async (url, options) => {
+      if (!url.includes("/llm/")) return fetch(url, options);
+      if (url.endsWith("/release")) {
+        events.push("release");
+        if (scenario === "release-fails") return response(500, {error:"unload failed"});
+        if (scenario === "cancelled") operation.status = "cancelled";
+        return response(200, {handoff_token:"token"});
+      }
+      assert.equal(JSON.parse(options.body).handoff_token, "token");
+      events.push("ack");
+      return response(200, {completed:true});
+    };
+    client.context.api.queuePrompt = async () => { events.push("queue"); throw new Error("queue failed"); };
+    vm.runInContext(functionSource("queueSnapshot"), client.context);
+    const run = client.context.queueSnapshot(client.state.projects[0], {}, {workflow:{},output:{}}, {}, operation);
+    if (scenario === "cancelled") await run;
+    else await assert.rejects(run, scenario === "release-fails" ? /unload failed/ : /queue failed/);
+    assert.deepEqual(events, scenario === "dedicated" ? ["queue"] : scenario === "release-fails" ? ["release"]
+      : scenario === "cancelled" ? ["release", "ack"] : ["release", "queue", "ack"]);
+  });
+}
 
 test("quota failure is surfaced and does not hide mandatory remote save failure", async () => {
   const client = harness({ revision: 1, projects: [project("a")] });

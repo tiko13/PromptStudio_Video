@@ -31,9 +31,9 @@ def _load_image(path):
 
 
 
-def _video_components(path, trim_start=0, trim_end=None, embedded_audio=True):
+def _video_components(path, trim_start=0, trim_end=None, embedded_audio=True, *, minimum=2):
     path = _input_path(path)
-    frames, start, end = video_range(path, trim_start, trim_end, minimum=2)
+    frames, start, end = video_range(path, trim_start, trim_end, minimum=minimum)
     audio = None
     if embedded_audio and probe_video(path)["has_audio"]:
         audio = {"waveform": torch.from_numpy(audio_array(path, 48000, start, end))[None], "sample_rate": 48000}
@@ -77,9 +77,9 @@ def _trim_audio(audio, trim_start=0.0, trim_end=None):
     }
 
 
-def _load_audio(path, trim_start=0, trim_end=None):
+def _load_audio(path, trim_start=0, trim_end=None, *, minimum=2):
     metadata = probe_input_audio(path)
-    start, end = trim_range(metadata["duration_seconds"], trim_start, trim_end, 15, 2)
+    start, end = trim_range(metadata["duration_seconds"], trim_start, trim_end, 15, minimum)
     rate = int(metadata["sample_rate"])
     return {"waveform": torch.from_numpy(audio_array(_input_path(path), rate, start, end))[None], "sample_rate": rate}
 

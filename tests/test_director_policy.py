@@ -19,13 +19,14 @@ from video.director_policy import (
 from test_director import director_document, edit_request
 
 
-# Captured using measurement_requests before policy composition/stage changes.
+# Updated for the continuous-action shot planning policy; composition below
+# still verifies all policy sections against the canonical instructions.
 # Stable T2VA cases: small/large, shot/project.
 BASELINE_HASHES = (
-    "afc01e3fead2fed0d6daa0cb0e9543977de7177c849fe95d0a0842cc21499701",
-    "bc325eb3edfc5e756116f96536a350187f1dab31006bb089afe9ff92e55ad364",
-    "162444df9f7a1272d945a23718f6b2d391b5836637eda8eb380593a1c689761c",
-    "bd8e8f4cdc6f0fa7d6c3a450f0496be149d5a13960db3ceb2b891226fb93cac2",
+    "077f9d0e4f2f6f78b494d2eef9257d0861e0483d4cde67910f27f42354cafef6",
+    "1a8a680e2bda3b8a53c17fdc40e13fda83a294dd2d6c66d68261227ec764dd68",
+    "fa45e6da2ab119527b0ae5e50b9d98324162a9d6bf1a35bd4c030fd843477e24",
+    "e25075df4c9db5f212b90f4684dd77eb51b23730330dab4d92b7dbe141d29e55",
 )
 
 
@@ -39,6 +40,12 @@ def proposal_for(document, fields, scope="project"):
 
 
 class DirectorPolicyTests(unittest.TestCase):
+    def setUp(self):
+        # Isolate existing author policy/correction tests from the extra model stages.
+        planner = patch("video.director._create_director_plan", return_value=None)
+        planner.start()
+        self.addCleanup(planner.stop)
+
     def test_initial_prompt_bytes_match_twenty_baseline_cases(self):
         rows = measurement_report()
         # Original reference fixtures generated random IDs, so only the four

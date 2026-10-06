@@ -13,6 +13,7 @@ import tempfile
 from fractions import Fraction
 
 from .contracts import FPS, PromptDocumentError, normalize_document
+from .adapter_contract import has_reference_adapters
 from .media_budget import (audio_array, iter_audio, checkpoint, geometry as check_geometry, bounded_media, assembly_job, duration as check_duration, MAX_ASSEMBLY_SECONDS, MAX_SAMPLE_RATE)
 
 
@@ -258,7 +259,7 @@ def build_extension_authoring_document(parent_document, brief, duration_seconds)
     shot["steps"] = []
     shot["sounds"] = []
     return normalize_document({
-        **copy.deepcopy(parent), "mode": "t2va", "duration_seconds": timing["requested_duration"],
+        **copy.deepcopy(parent), "mode": "ref2va" if has_reference_adapters(parent) else "t2va", "duration_seconds": timing["requested_duration"],
         "main_description": str(brief or "").strip(), "prompt_override": "",
         "style": _without_reference_tokens(parent.get("style")), "shots": [shot],
         "references": [], "task_types": [], "subject_definitions": [], "retention_analysis": [],
@@ -329,7 +330,9 @@ def _build_structured_continuation_document(parent, extension_document, timing):
 
     result = {
         **copy.deepcopy(authored),
-        "mode": "t2va",
+        "mode": "ref2va" if has_reference_adapters(parent) else "t2va",
+        "content_loras": copy.deepcopy(parent.get("content_loras", [])),
+        "reference_adapters": copy.deepcopy(parent.get("reference_adapters", [])),
         "duration_seconds": timing["sample_duration"],
         "width": parent["width"],
         "height": parent["height"],
@@ -372,7 +375,9 @@ def build_continuation_document(
     next_action = _without_reference_tokens(brief).strip()
     document = {
         "version": 1,
-        "mode": "t2va",
+        "mode": "ref2va" if has_reference_adapters(parent) else "t2va",
+        "content_loras": copy.deepcopy(parent.get("content_loras", [])),
+        "reference_adapters": copy.deepcopy(parent.get("reference_adapters", [])),
         "duration_seconds": timing["sample_duration"],
         "width": parent["width"],
         "height": parent["height"],

@@ -23,6 +23,19 @@ _ACQUISITION_SPEC.loader.exec_module(ACQUISITION)
 
 DEFAULT_WORKFLOW_NAMES = ("[PSV] MiniMax H3.json", "[PSV] MiniMax H3 Turbo.json")
 WORKFLOW_SOURCE_DIRECTORY = Path(__file__).resolve().parents[1] / "workflows"
+OPTIONAL_MODEL_ASSETS = tuple(json.loads((Path(__file__).parent / "optional_assets.json").read_text(encoding="utf-8")))
+WORKFLOW_BUNDLES = {
+    "legacy": {"label": "Original Normal and Turbo", "workflows": DEFAULT_WORKFLOW_NAMES},
+    "modern": {"label": "H3 Fast, Balanced and Full quality", "workflows": (
+        "[PSV] MiniMax H3 Fast v2.json", "[PSV] MiniMax H3 Balanced v2.json", "[PSV] MiniMax H3 Full quality v2.json"),
+        "assets": ("fl2va", "ref2va", "text_encoder", "video_vae", "audio_vae", "turbo_v12", "turbo_768_8", "turbo_ref_8")},
+    "sparse": {"label": "Experimental H3 sparse attention", "workflows": ("[PSV] MiniMax H3 Sparse experiment.json",),
+        "assets": ("fl2va", "ref2va", "text_encoder", "video_vae", "audio_vae")},
+    "taomate": {"label": "Experimental TaoMate T2VA", "workflows": ("[PSV] MiniMax H3 TaoMate experiment.json",),
+        "assets": ("fl2va", "text_encoder", "video_vae", "audio_vae", "taomate")},
+    "fasth3": {"label": "Experimental FastH3 V2", "workflows": ("[PSV] FastH3 V2 experiment.json",),
+        "assets": ("fasth3", "text_encoder", "video_vae", "audio_vae")},
+}
 
 
 # Sizes and LFS SHA-256 values verified from each repository's Hugging Face
@@ -155,7 +168,7 @@ def serialize_workflow_source(workflow):
 
 
 def load_bundled_workflow(name):
-    if name not in DEFAULT_WORKFLOW_NAMES:
+    if name not in {name for bundle in WORKFLOW_BUNDLES.values() for name in bundle["workflows"]}:
         raise ValueError("Unknown bundled Video workflow")
     workflow = json.loads((WORKFLOW_SOURCE_DIRECTORY / name).read_text(encoding="utf-8"))
     if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), list):
@@ -163,11 +176,16 @@ def load_bundled_workflow(name):
     return workflow
 
 
-def workflow_setup_plan(folder_paths_module=None):
+def workflow_setup_plan(folder_paths_module=None, bundle="legacy"):
+    if bundle not in WORKFLOW_BUNDLES:
+        raise ValueError("Unknown Video workflow bundle")
+    selection = WORKFLOW_BUNDLES[bundle]
     folder_paths_module = folder_paths_module or _folder_paths_module()
     replacements = {}
     models = []
-    for source in MODEL_ASSETS:
+    sources = MODEL_ASSETS if bundle == "legacy" else tuple(
+        asset for asset in (*MODEL_ASSETS, *OPTIONAL_MODEL_ASSETS) if asset["id"] in selection["assets"])
+    for source in sources:
         asset = copy.deepcopy(source)
         resolved = _find_existing_asset(asset, folder_paths_module)
         asset["name"] = os.path.basename(_normalized_relative(asset["relative_path"]))
@@ -181,9 +199,12 @@ def workflow_setup_plan(folder_paths_module=None):
             "name": name[:-5],
             "data": _replace_workflow_values(load_bundled_workflow(name), replacements),
         }
-        for name in DEFAULT_WORKFLOW_NAMES
+        for name in selection["workflows"]
     ]
     return {
+        "bundle": bundle,
+        "label": selection["label"],
+        "bundles": [{"id": key, "label": value["label"]} for key, value in WORKFLOW_BUNDLES.items()],
         "workflows": workflows,
         "models": models,
         "total_bytes": sum(asset["size"] for asset in models),
@@ -287,7 +308,7 @@ def _refresh_model_cache(folder_paths_module):
         cache_helper.clear()
     cache = getattr(folder_paths_module, "filename_list_cache", None)
     if isinstance(cache, dict):
-        for category in {asset["category"] for asset in MODEL_ASSETS}:
+        for category in {asset["category"] for asset in (*MODEL_ASSETS, *OPTIONAL_MODEL_ASSETS)}:
             cache.pop(category, None)
 
 
@@ -333,13 +354,15 @@ def _run_setup(job_id, folder_paths_module):
                 _ACTIVE_JOB_ID = None
 
 
-def start_default_model_setup(folder_paths_module=None):
+def start_default_model_setup(folder_paths_module=None, bundle="legacy"):
     global _ACTIVE_JOB_ID
     folder_paths_module = folder_paths_module or _folder_paths_module()
     with _SETUP_LOCK:
         if _ACTIVE_JOB_ID and _ACTIVE_JOB_ID in _SETUP_JOBS:
+            if _SETUP_JOBS[_ACTIVE_JOB_ID].get("bundle", "legacy") != bundle:
+                raise ValueError("Another workflow bundle is installing; wait for it to finish")
             return _public_job(_SETUP_JOBS[_ACTIVE_JOB_ID])
-    plan = workflow_setup_plan(folder_paths_module)
+    plan = workflow_setup_plan(folder_paths_module, bundle=bundle)
     now = time.time() * 1000
     models = []
     targets = {}
@@ -357,6 +380,7 @@ def start_default_model_setup(folder_paths_module=None):
     _validate_target_capacity(models, targets)
     job_id = uuid.uuid4().hex
     job = {
+        "bundle": bundle,
         "id": job_id,
         "status": "complete" if all(item["installed"] for item in models) else "starting",
         "current_model": "",

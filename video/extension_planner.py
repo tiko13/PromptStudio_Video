@@ -24,7 +24,7 @@ def _planning_instruction(brief):
         "dialogue step with a concrete speaker, stable speaker_id, language, performance, delivery, "
         "and verbatim text so the deterministic compiler emits MiniMax <d> syntax. Put visible action "
         "in action steps and audible consequences in synchronized sounds. Choose one continuous shot "
-        "unless a later cut adds useful new information. Do not create reference tokens or media "
+        "unless the user requests cuts or clearly implies discrete scenes or time jumps. Do not create reference tokens or media "
         "semantics for the source; its pixels and audio are supplied by the protected latent handoff. "
         "The user's exact continuation request follows:\n<extension_request>\n"
         + str(brief or "").strip()
@@ -64,7 +64,7 @@ def plan_extension(data, progress_callback=None):
         "require_proposal": True,
         "messages": [{"role": "user", "content": _planning_instruction(brief)}],
     }
-    result = director_chat(request, progress_callback)
+    result = director_chat(request, progress_callback, authoring_new_extension=True)
     if result.get("status") == "needs_clarification":
         raise ValueError(result.get("message") or "The extension plan needs clarification")
     proposal = result.get("proposal")
@@ -74,7 +74,9 @@ def plan_extension(data, progress_callback=None):
             or result.get("message")
             or "The Director did not return a valid extension plan"
         )
-    planned = preview_changeset(authored, proposal, request_data=request)["document"]
+    # Use the validated proposal's signed authority. The outer request does not
+    # contain the Director's classified edit intent and must not replace it.
+    planned = preview_changeset(authored, proposal)["document"]
     _validate_extension_plan_timeline(planned, request)
     if planned.get("resolved_mode") != "t2va" or planned.get("references"):
         raise PromptDocumentError(

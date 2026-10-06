@@ -1,0 +1,9 @@
+---
+{"id":"video.history","topic":"history","studio":"video","summary":"Saving video projects, retrying failed saves, reviewing conflicts, and retaining drafts."}
+---
+Projects save automatically. Save failed offers Retry save. If another browser has competing edits, use Review conflicts and choose which version to retain. Keep the tab open until saving succeeds. Invalid server acknowledgements do not mark a project Saved or discard its draft.
+Generations appears beside the player (below it in narrow workspaces). Select a result to highlight it and access Continue video, Replay exact, Compare saved inputs or View prompt when available. Selection never edits the document or submits work. Queued, running and failed entries remain selectable; select an active generation to Cancel.
+If browser storage fails, View draft inspects the copy; Export unsaved draft downloads it. Dismiss warning hides the warning without deleting or saving edits. The cap is Prompt Studio’s, not the browser’s; server saves can still succeed. Recovery clears the warning. Export before closing unsaved work.
+For an older browser draft, View draft compares edits with the current project. Apply saves each field, shot or generation into its original project; Dismiss keeps the current version. Dismiss on the notice discards the recovery draft. Viewing never dismisses it, even with no changes. Close preserves unresolved items across reloads. Refresh differences if the project changed. Unrelated server edits remain; reviewing or applying never queues generation.
+Reload reconnects queued generations to ComfyUI history. A submission interrupted before its prompt ID was saved is looked up in the queue and recent history, never automatically resubmitted. If it cannot be found, check ComfyUI before generating again.
+In prompt preview, Copy reports its result inside the dialog. If clipboard access is unavailable, the text is selected so you can use your browser's Copy command.

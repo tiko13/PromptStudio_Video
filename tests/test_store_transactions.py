@@ -24,6 +24,20 @@ class ProjectStoreTransactionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_shared_retention_compresses_and_restores_one_project(self):
+        update = copy.deepcopy(self.first)
+        update["projects"][0]["name"] = "edited a"
+        saved = store.update_project_store(self.path, update)
+        service = store.shared_transactional_store()
+        service.maintain_storage(self.directory, "projectFiles", "project")
+        self.assertEqual(store.read_project_store(self.path)["projects"], saved["projects"])
+        index = service.read_manifest(self.directory, "projectFiles", "project")
+        self.assertTrue(all(entry["file"].endswith(".gz") for entry in index["projectFiles"]))
+        service.restore_record(self.directory, "projectFiles", "project", 1, "a", saved["revision"], summary_builder=store._project_summary)
+        restored = store.read_project_store(self.path)
+        self.assertEqual(restored["projects"], self.first["projects"])
+        self.assertEqual(restored["revision"], saved["revision"] + 1)
+
     def test_failure_on_second_project_never_exposes_mixed_revision(self):
         service = store.shared_transactional_store()
         commit = service.commit_records

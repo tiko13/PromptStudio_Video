@@ -4,6 +4,97 @@ Build MiniMax H3 videos in a visual, shot-based studio that keeps timing, refere
 
 `PromptStudio_Video` is the standalone video companion for [`ComfyUI_PromptStudio`](https://github.com/tiko13/ComfyUI_PromptStudio) and works directly with current native ComfyUI MiniMax nodes.
 
+Saved projects use Prompt Studio's shared compressed history store. Backend startup automatically migrates the entire Image and Video libraries and retires obsolete recovery copies after verification. Current projects remain intact. Projects → History storage shows usage and dated recovery checkpoints, and can restore an individual project. The shared policy keeps recent, daily, and weekly checkpoints within a recovery budget; temporary legacy backups expire after migration. See the companion's `docs/history-storage.md` for details.
+
+## Versioned H3 sampling and experiments
+
+The Shots sidebar's **LoRAs & reference adapters** section loads content LoRAs
+separately from Turbo sampling. **Refresh adapters** scans registered `loras`,
+`refmods` and `audio_refmods` folders. Select matching H3 adapters; a filename in
+the catalog does not establish FL2VA/Ref2VA compatibility. RefLoRAs have separate
+model strength and visual/audio retention controls. Active reference adapters
+select Ref2VA in Auto mode and require that model connection in the workflow.
+Selections persist with projects and freeze into render snapshots and extensions.
+
+The shared `KCPP_PromptStudioLoraLoader` applies model-only content weights.
+`PSV_MiniMaxH3ReferenceAdapters` loads standalone RefMod v2/v4, v5 visual/audio
+bundles and RefLoRA v1 containers, without another custom-node pack. It patches
+the RefLoRA's model weights once and appends selected reference latents to native
+conditioning. These are unnumbered references; native uploaded media keeps its
+existing labels. Lower retention blends the latent toward a low-pass version.
+Small files still cost attention tokens, and audio support does not promise
+voice identity. Creation/training tools remain external. On the ComfyUI canvas,
+choose the adapter in the new node and wire its model/positive outputs onward.
+
+Formats: [RefMod](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod/blob/main/BUNDLE_FORMAT.md),
+[RefLoRA](https://github.com/malcolmamal/ComfyUI-MiniMaxH3RefLoRA/blob/main/HYBRID_FORMAT.md).
+
+**Install workflows** in the top bar installs separate Fast, Balanced and Full
+quality workflows. The installer shows missing bytes, reuses verified models,
+resumes downloads and preserves existing workflows and generation snapshots.
+The new `PSV_MiniMaxH3SamplingProfile` couples the adapter, strength, sampler,
+steps and shifts; downstream `BasicScheduler` uses `simple`.
+
+| Profile | Base modes | REF2VA |
+| --- | --- | --- |
+| Fast | FL2V v1.2 768p, 4 steps, shifts 6/3 | REF2V v1.0 768p, 8 steps, shifts 12/3 |
+| Balanced | FL2V v1.0 768p, 8 steps, shifts 6/3 | REF2V v1.0 768p, 8 steps, shifts 12/3 |
+| Full quality | 20 steps, shifts 11/4 | 25 steps, shifts 11/4 |
+
+Modern acceleration adapters use strength 1. Legacy Turbo profiles keep their
+existing policy and weights. Newly installed bundled workflows use PyTorch
+dense attention, avoiding the known int8-convrot/CK attention alignment issue.
+Existing user graphs are not silently patched.
+
+Optional experiment bundles isolate native sol-attn, TaoMate T2VA and FastH3 V2.
+Sparse attention retains exact audio rows; its sigma window is calculated after
+the profile's shifts. FastH3 requires its matching checkpoint and VSA at 10%
+keep, 8 steps, `res_multistep/simple`, shifts 10/3, and does not support REF2VA.
+Missing kernels and mismatched checkpoints fail explicitly. TaoMate is limited
+to T2VA and uses native ManualSigmas with retained states 0,16,33,49 from its
+shifted 50-point grid (12/3), not a generic Simple schedule. Its converted LoRA
+is an experiment, not the original streaming engine.
+These presets have no guaranteed local speed or quality improvement. Compare
+speech, synchronization, motion, identity and artifacts before adopting one.
+
+For controlled comparisons, queue the same document/canvas/duration/seed through
+Studio using one optimization at a time. Observe each prompt ID with
+`tools/observe_h3_benchmark.py --prompt-id ID --label dense --output result.json`
+using the ComfyUI Python environment. Record cold runs separately from repeats.
+The observer never queues or unloads models: it records runtime metadata,
+execution time, cache use, output descriptors and sampled whole-device VRAM.
+It rejects cached sampling as valid timing evidence; sampled VRAM can miss peaks
+and includes other processes. Fill in the human quality review fields separately.
+
+Release contracts: [FL2V 4-step v1.2](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/52),
+[FL2V 8-step](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/48),
+[REF2V 8-step](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51),
+[native FastH3](https://docs.comfy.org/tutorials/video/minimax/minimax-h3-fastvideo).
+
+## Prompt continuity, guides and rewrite review
+
+Give dialogue segments in adjacent shots the same **Dialogue link ID** to compile
+connecting `<scenetrans>` markers and explicit audio continuity. Each segment
+keeps its exact text. Speaker, language and performance must agree; a cutoff
+cannot continue. Prompt preview adds advisory speech-density and camera checks.
+
+Assign **Timed generation guide** to an image, video or audio asset and set its
+guide time in Media. Timeline diamonds preview the guide; arrow keys move one
+frame and Shift moves one second. Guides use native `MiniMaxH3AddGuide`, remain
+separate from identity references and do not force REF2VA. Trim clips to fit the
+remaining timeline. Generation guidance does not guarantee an exact frame;
+exact imported audio remains a separate postprocessing feature.
+
+**Prompt > Review specialist rewrite** evaluates pasted text or `enhanced_prompt`
+JSON from LightX2V's [8B](https://huggingface.co/lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B)
+or [Omni](https://huggingface.co/lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-Omni)
+adapter. Host the specialist separately with its matching base model; the 8B
+release excludes REF2VA. Keep duration, canvas and media ordering consistent.
+Review compares required sections, spoken blocks, speaker IDs and visible text.
+**Use as Director draft** then opens a conversion request through the existing
+shared LLM service and normal proposal review. It never directly changes the
+document or generation prompt, and structural checks are not a quality score.
+
 ## Direct the video on a real timeline
 
 Plan multiple shots on a proportional, frame-snapped timeline. Reorder and trim them visually, then edit each shot's setup, camera, sound, visible text, and chronological action or dialogue steps.
@@ -421,6 +512,18 @@ Projects and cached workflow snapshots are stored transactionally in ignored
 runtime files inside this repository. Every queued generation stores its
 normalized document, compiled prompt, effective duration, output routing, and
 complete executable workflow snapshot for exact replay.
+
+## License
+
+Copyright (c) 2026 tiko13.
+
+PromptStudio Video is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 3 only
+(`GPL-3.0-only`). It is distributed without any warranty, including the implied
+warranties of merchantability or fitness for a particular purpose.
+See [LICENSE](LICENSE) for the complete terms.
+
+Third-party dependencies and model weights retain their respective licenses.
 
 ## Development checks
 

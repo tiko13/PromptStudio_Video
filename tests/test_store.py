@@ -48,7 +48,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(saved["revision"], 1)
             self.assertEqual(saved["version"], 2)
             self.assertFalse(os.path.exists(path))
-            self.assertEqual(len(list(Path(directory, "projects").glob("project_*.json"))), 1)
+            self.assertEqual(len(list(Path(directory, "projects").glob("project_*.json.gz"))), 1)
             restored_project = read_project_store(path)["projects"][0]
             self.assertEqual(restored_project["document"]["resolved_mode"], "t2va")
             self.assertEqual(restored_project["document"]["main_description"], project["brief"])
@@ -94,7 +94,7 @@ class StoreTests(unittest.TestCase):
             })
             index = json.loads((project_directory / "index.json").read_text(encoding="utf-8"))
             self.assertEqual(len(index["projectFiles"]), 2)
-            self.assertEqual(len(list(project_directory.glob("project_*.json"))), 2)
+            self.assertEqual(len(list(project_directory.glob("project_*.json.gz"))), 2)
 
             saved = update_project_store(path, {
                 "version": 2,
@@ -103,7 +103,7 @@ class StoreTests(unittest.TestCase):
                 "projects": [projects[0]],
             })
             self.assertEqual(saved["revision"], 2)
-            self.assertEqual(len(list(project_directory.glob("project_*.json"))), 2)
+            self.assertEqual(len(list(project_directory.glob("project_*.json.gz"))), 2)
             self.assertTrue((project_directory / "_backups" / "index.bak").is_file())
             self.assertEqual([project["id"] for project in read_project_store(path)["projects"]], ["project-one"])
 
@@ -134,7 +134,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(restored["revision"], 7)
             self.assertTrue(path.exists())
             self.assertTrue((project_directory / "index.json").is_file())
-            self.assertEqual(len(list(project_directory.glob("project_*.json"))), 1)
+            self.assertEqual(len(list(project_directory.glob("project_*.json.gz"))), 1)
             self.assertTrue((project_directory / "_backups" / "legacy_store.bak").is_file())
 
     def test_generation_snapshot_is_preserved(self):

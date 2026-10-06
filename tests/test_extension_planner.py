@@ -59,7 +59,8 @@ class ExtensionPlannerTests(unittest.TestCase):
         brief = 'The masked courier finishes standing and says "We move now." while opening the map.'
         captured = {}
 
-        def fake_director(request, progress_callback=None):
+        def fake_director(request, progress_callback=None, *, authoring_new_extension=False):
+            self.assertTrue(authoring_new_extension)
             captured.update(request)
             seed = request["document"]
             changeset = normalize_project_changeset({
