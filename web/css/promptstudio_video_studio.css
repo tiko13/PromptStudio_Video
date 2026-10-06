@@ -763,6 +763,8 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 }
 
 @media (forced-colors: active) {
+  .psvstudio-field > span,
+  .psvstudio-director-launch .psvstudio-field > span,
   .psvstudio-shot-block,
   .psvstudio-shot-duration,
   .psvstudio-shot-range,
@@ -795,6 +797,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-adapters > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px; font-size: 11px; font-weight: 650; cursor: pointer; }
 .psvstudio-adapters > summary::before { content: "▸"; color: var(--ps-muted); }
 .psvstudio-adapters[open] > summary::before { content: "▾"; }
+.psvstudio-adapter-actions { display: flex; justify-content: flex-end; }
 .psvstudio-adapters .psvstudio-adapter-refresh { width: 24px; min-height: 24px; margin-left: auto; padding: 0; border-radius: 7px; }
 .psvstudio-adapters small { display: block; overflow-wrap: anywhere; color: var(--ps-muted); font-size: 9px; line-height: 1.4; }
 .psvstudio-adapter-row { display: grid; gap: 5px; min-width: 0; }

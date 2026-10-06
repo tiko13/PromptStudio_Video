@@ -6234,6 +6234,7 @@ function renderTimeline() {
 
   const guideLane = el("div", "psvstudio-guide-lane");
   guideLane.style.cssText = `position:relative;width:${width}px;height:30px`;
+  guideLane.setAttribute("role", "group");
   guideLane.ariaLabel = "Timed generation guides";
   renderGuideRanges(project, guideLane, scale, width);
 
@@ -7232,6 +7233,9 @@ function renderShotDetailTimeline(shot, duration) {
   const inspector = el("div", "psvstudio-shot-timeline-inspector");
   renderShotTimelineInspector(inspector, shot, duration);
   const scroll = el('div', 'psvstudio-shot-timeline-scroll');
+  scroll.tabIndex = 0;
+  scroll.setAttribute('role', 'region');
+  scroll.setAttribute('aria-label', 'Shot timing timeline');
   const content = el('div', 'psvstudio-shot-timeline-content'); content.style.width = `${state.shotTimelineZoom * 100}%`;
   content.append(ruler, timeline); scroll.append(content);
   const output = latestTimingOutput(project);

@@ -13,7 +13,9 @@ export function createVideoAdapterControls({ project, workflow, catalog, disable
   const refresh = make("button", "↻"); refresh.type = "button"; refresh.disabled = disabled;
   refresh.className = "psvstudio-button psvstudio-adapter-refresh";
   refresh.title = "Refresh adapters"; refresh.setAttribute("aria-label", refresh.title);
-  refresh.onclick = event => { event.preventDefault(); onRefresh(); }; summary.append(refresh);
+  refresh.onclick = () => onRefresh();
+  const actions = make("div", ""); actions.className = "psvstudio-adapter-actions";
+  actions.append(refresh); body.append(actions);
   body.append(make("small", disabled ? "This render uses its saved adapter selections." : "Use H3 LoRAs matching the active FL2VA or Ref2VA model. Turbo remains controlled by the sampling profile."));
   if (!catalog) { body.append(make("p", "Load the adapter catalog to browse installed files.")); return root; }
   if (catalog.error) body.append(make("p", catalog.error));
