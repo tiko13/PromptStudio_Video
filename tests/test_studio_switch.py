@@ -142,8 +142,12 @@ class UnifiedStudioContractTests(unittest.TestCase):
         self.assertIn('preset === "fast_4step"', helper)
         self.assertLess(helper.index('mode === "ref2va"'), helper.index("width === 1344 && height === 768"))
         self.assertLess(helper.index("width === 1344 && height === 768"), helper.index('preset === "fast_4step"'))
-        self.assertIn("renderTurboProfileIndicator(project, true)", self.source)
-        self.assertIn("container.append(row, turboIndicator)", self.source)
+        settings_start = self.source.index("function appendGlobalSettings")
+        settings_end = self.source.index("function globalSettingsSummary", settings_start)
+        settings = self.source[settings_start:settings_end]
+        self.assertIn("turboIndicator = renderTurboProfileIndicator(project)", settings)
+        self.assertIn("container.append(row, turboIndicator)", settings)
+        self.assertIn("container.append(fixed, row, turboIndicator)", settings)
         self.assertIn(".psvstudio-turbo-profile {", self.styles)
 
     def test_llamacpp_piggybacks_primary_settings_and_management(self):

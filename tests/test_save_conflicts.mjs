@@ -41,7 +41,8 @@ function harness(server, shared = {}) {
   let loseAcknowledgement = false;
   let onPut = null;
   const context = vm.createContext({ validateStoreResponse, archiveDraft, showRecoveredProjectDrafts: async () => {}, state, structuredClone, localStorage, sessionStorage, Map, Set, console,
-    videoDraftOutbox, videoDraftPending:Promise.resolve(true), draftTabKey:product=>product, showDraftStorageFailure() {},
+    videoDraftOutbox, videoDraftPending:Promise.resolve(true), videoDraftWrite:0,
+    draftTabKey:product=>product, showDraftStorageFailure() {}, clearDraftStorageFailure() {},
     projectDraftScheduler: createDraftScheduler(() => {}),
     captureRuntimeProvenance:async()=>({version:1}),
     tagSubmission,
