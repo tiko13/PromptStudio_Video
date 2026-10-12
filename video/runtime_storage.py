@@ -11,4 +11,3 @@ def migrate_runtime_state():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.migrate_legacy_state(root, module.VIDEO_STATE)
-
