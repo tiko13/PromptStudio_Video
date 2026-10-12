@@ -1,4 +1,5 @@
 import { copyEditorText } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/copy-editor.js";
+import { mountBackgroundTasks } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/background-tasks.js";
 import { frame, seconds, formatTime, parseTime, generatedFrames, timingPlan, shotDuration, editBoundary, changeDuration, guideRange, validateTimeline, createHistory } from './timeline-model.js';
 import { mountTransport, drawWaveform } from './timeline-media.js';
 import { applyVideoAdapters, hasReferenceAdapters } from "./video-adapters.js";
@@ -10,6 +11,8 @@ let videoAdapterCatalog = null;
 let videoAdapterCatalogRequest = null;
 import { validateStoreResponse } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/chat/store-response.js";
 import { workflowDefaults, setWorkflowDefault, markDefaultWorkflowOptions } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/settings/workflow-defaults.js";
+import { applyImageOutputSettings } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/settings/image-output.js";
+import { mountImageOutputSettings } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/image-output-settings.js";
 import { thinkingModeEnablesReasoning } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/llm/status.js";
 import { workflowHelpFacts } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/generation/help-context.js";
 import { createEditReferenceController } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/edit-reference.js";
@@ -4236,6 +4239,7 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
       workflow,
       normalizePromptStudioInputSelections(project?.additional_input_selections),
     );
+    applyImageOutputSettings(snapshot);
   }
   if (existingGeneration?.preparation_kind === "base") applyVideoAdapters(snapshot, workflow, metadata.document);
   const savedSnapshot = clone(snapshot);
@@ -4346,9 +4350,12 @@ async function queueSnapshot(project, workflow, snapshot, metadata, existingGene
   if (!existingGeneration) project.generations.unshift(generation);
   const pendingGenerationProgress = state.pendingGenerationProgress ||= new Map();
   const earlyProgress = pendingGenerationProgress.get(String(promptId));
+  // The prompt ID is attached before the acceptance save and GPU handoff finish.
+  // Events in those awaits update the tracked map rather than the early buffer.
+  const trackedProgress = state.generationProgress.get(String(promptId));
   pendingGenerationProgress.delete(String(promptId));
-  if (earlyProgress) Object.assign(generation, { status: "generating", updated_at: Date.now() });
-  state.generationProgress.set(String(promptId), { phase: "queued", ...(earlyProgress || {}) });
+  if (earlyProgress || trackedProgress) Object.assign(generation, { status: "generating", updated_at: Date.now() });
+  state.generationProgress.set(String(promptId), { phase: "queued", ...(earlyProgress || {}), ...(trackedProgress || {}) });
   markProjectChanged({ render: true });
   await persistProjects();
   touchGeneration(promptId);
@@ -5789,6 +5796,9 @@ function showGlobalSettings(project = activeProject()) {
     const body = el("div", "psvstudio-global-settings-body");
     appendProjectBrief(body, project);
     appendGlobalSettings(body, project, render);
+    const imageOutputSettings = el("div");
+    body.append(imageOutputSettings);
+    mountImageOutputSettings(imageOutputSettings, [selectedWorkflow(project)]);
     const footer = el("footer", "psvstudio-global-settings-footer");
     footer.append(
       el("small", "psvstudio-help", "Changes save automatically and apply to the whole project."),
@@ -7610,6 +7620,8 @@ function renderInspector() {
     return;
   }
   content.append(createVideoAdapterControls({ project, workflow: selectedWorkflow(project), catalog: videoAdapterCatalog,
+    modelSnapshot: pendingGenerationRestore(project)?.generation?.workflow_snapshot
+      || project.extension_source?.workflow_snapshot || selectedWorkflow(project)?.snapshot,
     disabled: isStructuredExtensionProject(project) || Boolean(pendingGenerationRestore(project)),
     onChange: () => { markProjectChanged({ project }); renderHeader(); },
     onRefresh: () => refreshVideoAdapterCatalog(),
@@ -8146,6 +8158,7 @@ function buildPanel() {
               <div class="psvstudio-system-status-row"><strong>ComfyUI</strong><span id="psvstudio-comfy-status-detail" data-state="busy" role="status" aria-live="polite">Checking…</span></div>
               <button id="psvstudio-comfy-restart" class="psvstudio-button" type="button">Restart ComfyUI</button>
             </section>
+            <section class="psvstudio-system-status-section" id="psvstudio-background-tasks"></section>
             <section class="psvstudio-system-status-section">
               <strong>Recent jobs</strong>
               <div id="psvstudio-job-activity">Open activity to check job stages.</div>
@@ -8275,6 +8288,9 @@ function buildPanel() {
   panel.querySelector("#psvstudio-install-workflows").addEventListener("click", () => showWorkflowInstaller());
   panel.querySelector("#psvstudio-kobold-stop").addEventListener("click", stopLlmGeneration);
   panel.querySelector("#psvstudio-comfy-restart").addEventListener("click", restartComfyUIFromStatus);
+  mountBackgroundTasks(panel.querySelector("#psvstudio-background-tasks"), {
+    scope: studioPollingScope(), fetchApi: (...args) => api.fetchApi(...args),
+  });
   panel.querySelector("#psvstudio-job-refresh").addEventListener("click", async () => {
     const target = panel.querySelector("#psvstudio-job-activity");
     try {

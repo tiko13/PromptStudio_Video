@@ -1,5 +1,10 @@
 # PromptStudio_Video
 
+Python routes live in `video/`, help cards in `docs/assistant-help/`, and private
+project/workflow stores in ignored `user-data/`. Startup moves legacy root stores
+without changing their contents. Shared services live in the companion's
+`backend/`; see its `docs/repository-layout.md` for the complete layout.
+
 Build MiniMax H3 videos in a visual, shot-based studio that keeps timing, references, dialogue, camera, and sound under your control.
 
 `PromptStudio_Video` is the standalone video companion for [`ComfyUI_PromptStudio`](https://github.com/tiko13/ComfyUI_PromptStudio) and works directly with current native ComfyUI MiniMax nodes.

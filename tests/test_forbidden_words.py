@@ -21,7 +21,11 @@ class ForbiddenWordsTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def save(self, name, replacement="", **options):
-        self.path.write_text(json.dumps({"forbidden_words": [{"name": name, "replacement": replacement, **options}]}), encoding="utf-8")
+        self.path.write_text(json.dumps({"version": 1, "items": [{"name": name, "replacement": replacement, **options}]}), encoding="utf-8")
+
+    def test_shared_configuration_directory(self):
+        expected = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "config" / "user"
+        self.assertEqual(shared_rules()._preset_storage.USER_DIR, expected)
 
     def test_guidance_reaches_director_without_becoming_compiled_text(self):
         guidance = "Replace cinematic with a concrete description of lighting"

@@ -1,7 +1,8 @@
 import { createSearchableSelect } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/searchable-select.js";
+import { createModelDetailsButton } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/model-metadata.js";
 import { videoAdapterLoaders, adapterMatchesType } from "./video-adapters.js";
 
-export function createVideoAdapterControls({ project, workflow, catalog, disabled = false, onChange, onRefresh }) {
+export function createVideoAdapterControls({ project, workflow, catalog, modelSnapshot = workflow?.snapshot, disabled = false, onChange, onRefresh }) {
   const loaders = videoAdapterLoaders(workflow);
   const root = document.createElement("details");
   root.className = "psvstudio-adapters";
@@ -16,6 +17,21 @@ export function createVideoAdapterControls({ project, workflow, catalog, disable
   refresh.onclick = () => onRefresh();
   const actions = make("div", ""); actions.className = "psvstudio-adapter-actions";
   actions.append(refresh); body.append(actions);
+  const models = make("details", "");
+  models.className = "psvstudio-workflow-models";
+  models.append(make("summary", "Workflow model details"));
+  const seenModels = new Set();
+  for (const node of Object.values(modelSnapshot?.output || {})) {
+    const category = ["UNETLoader", "KCPP_PromptStudioModelLoader", "OTUNetLoaderW8A8"].includes(node.class_type)
+      ? "diffusion_models" : ["CheckpointLoaderSimple", "CheckpointLoader"].includes(node.class_type) ? "checkpoints" : null;
+    const name = node.inputs?.[category === "checkpoints" ? "ckpt_name" : "unet_name"];
+    if (!category || typeof name !== "string" || !name || seenModels.has(`${category}:${name}`)) continue;
+    seenModels.add(`${category}:${name}`);
+    const row = make("div", ""); row.className = "promptstudio-model-selection";
+    const label = make("span", name); label.className = "promptstudio-lora-name"; label.title = name;
+    row.append(label, createModelDetailsButton({category, name})); models.append(row);
+  }
+  if (seenModels.size) body.append(models);
   body.append(make("small", disabled ? "This render uses its saved adapter selections." : "Use H3 LoRAs matching the active FL2VA or Ref2VA model. Turbo remains controlled by the sampling profile."));
   if (!catalog) { body.append(make("p", "Load the adapter catalog to browse installed files.")); return root; }
   if (catalog.error) body.append(make("p", catalog.error));
@@ -84,7 +100,7 @@ export function createVideoAdapterControls({ project, workflow, catalog, disable
         remove.className = "psvstudio-button promptstudio-lora-remove"; remove.title = `Remove ${row.name}`;
         remove.setAttribute("aria-label", `Remove ${row.name}`);
         remove.onclick = () => { project.document[key] = rows.filter(item => item !== row); onChange(); render(); };
-        rowHeading.append(remove); group.append(card);
+        rowHeading.append(createModelDetailsButton({category: row.category || "loras", name: row.name}), remove); group.append(card);
       }
       group.append(add); body.append(group);
     }

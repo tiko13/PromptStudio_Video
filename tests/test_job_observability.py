@@ -9,7 +9,7 @@ from unittest.mock import patch
 from test_extension_jobs import route_functions
 
 
-path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "job_observability.py"
+path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "job_observability.py"
 spec = importlib.util.spec_from_file_location("video_test_job_observability", path)
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)

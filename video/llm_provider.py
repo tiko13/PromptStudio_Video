@@ -13,7 +13,7 @@ def _service_api():
     """Load only the pure versioned API; never discover or import route modules."""
     name = "_promptstudio_companion_api"
     if name not in sys.modules:
-        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "product_services.py"
+        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "product_services.py"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None or not path.is_file():
             raise RuntimeError("PromptStudio_Video requires the companion ComfyUI_PromptStudio. Install or update both studios.")

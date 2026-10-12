@@ -21,7 +21,7 @@ def shared_transactional_store():
     """Consume the primary pure persistence service without ComfyUI startup."""
     name = "_promptstudio_shared_transactional_store"
     if name not in sys.modules:
-        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "transactional_store.py"
+        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "transactional_store.py"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
             raise RuntimeError("Prompt Studio shared persistence service is unavailable")

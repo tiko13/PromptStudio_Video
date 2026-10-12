@@ -17,7 +17,7 @@ class VideoHelpTests(unittest.TestCase):
         inventory = "\n".join(help.render_packet(cards, facts, ["nodes", "video-nodes"])["instructions"])
         index = {item["topic"]: item["summary"] for item in help.topic_index(cards, facts)}
         names = {}
-        for path in (CATALOG_ROOT.parent / "nodes").glob("*.py"):
+        for path in (CATALOG_ROOT.parents[1] / "nodes").glob("*.py"):
             for node in ast.parse(path.read_text(encoding="utf-8")).body:
                 if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
                     and any(isinstance(target, ast.Name) and target.id == "NODE_DISPLAY_NAME_MAPPINGS"
@@ -77,6 +77,9 @@ class VideoHelpTests(unittest.TestCase):
         packet = help.render_packet(cards, facts, ["references", "workflows", "director"])
         self.assertEqual(set(packet["documents"]), {"video.references", "video.workflows", "video.director"})
         self.assertNotIn("references.qwen", packet["documents"])
+        config_packet = help.render_packet(cards, facts, ["configuration-files"])
+        self.assertEqual(config_packet["documents"], ["configuration-files"])
+        self.assertIn("config/user/", "\n".join(config_packet["instructions"]))
 
     def test_app_help_skips_vision_and_production_compilation(self):
         turn = {"route": "discuss", "help_domain": "app", "confidence": 1}

@@ -13,7 +13,7 @@ from video.extension_planner import plan_extension
 
 
 def route_functions():
-    source = Path(__file__).resolve().parents[1] / "routes.py"
+    source = Path(__file__).resolve().parents[1] / "video" / "routes.py"
     names = {"_prune_director_jobs", "_start_director_job", "_run_director_job", "_cancel_director_job",
              "promptstudio_video_director_status", "promptstudio_video_director_cancel",
              "promptstudio_video_extension_plan_status", "promptstudio_video_extension_plan_cancel"}

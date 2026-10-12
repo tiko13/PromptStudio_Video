@@ -99,7 +99,7 @@ class WorkflowPackagingTests(unittest.TestCase):
             return next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
         self.assertEqual(CONTINUATION_CONTEXT_FRAMES, 39)
         self.assertEqual(assignment(ROOT / "nodes/h3_motion_context.py", "DEFAULT_CONTEXT_FRAMES"), CONTINUATION_CONTEXT_FRAMES)
-        self.assertIn("native_h3_soft_av_39", assignment(ROOT / "routes.py", "CAPABILITY")["features"])
+        self.assertIn("native_h3_soft_av_39", assignment(ROOT / "video" / "routes.py", "CAPABILITY")["features"])
         architecture = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
         self.assertIn("39 frames", architecture)
         self.assertNotIn("22-frame", architecture)

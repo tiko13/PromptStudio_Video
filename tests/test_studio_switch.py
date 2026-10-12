@@ -13,7 +13,7 @@ class UnifiedStudioContractTests(unittest.TestCase):
         cls.interaction_controller = (ROOT / "web/js/controllers/document-interaction-controller.js").read_text(encoding="utf-8")
         cls.redirect = (ROOT / "web" / "js" / "promptstudio_video_redirect.js").read_text(encoding="utf-8")
         cls.page = (ROOT / "web" / "prompt_studio_video.html").read_text(encoding="utf-8")
-        cls.routes = (ROOT / "routes.py").read_text(encoding="utf-8")
+        cls.routes = (ROOT / "video" / "routes.py").read_text(encoding="utf-8")
         cls.styles = (ROOT / "web" / "css" / "promptstudio_video_studio.css").read_text(encoding="utf-8")
 
     def test_capabilities_advertise_unified_shell(self):

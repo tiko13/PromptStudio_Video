@@ -89,3 +89,6 @@ promptstudio_video_projects.json.tmp
 promptstudio_video_projects/
 promptstudio_video_workflows.json
 promptstudio_video_workflows.json.tmp
+
+# Private runtime stores and cached assets
+/user-data/

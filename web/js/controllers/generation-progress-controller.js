@@ -70,7 +70,8 @@ export function createVideoGenerationProgressController({ state, markGenerationE
         const tracked = markGenerationExecuting(id);
         const current = savedProgress(id);
         const samplerComplete = Number.isFinite(current.value) && current.max > 0 && current.value >= current.max;
-        const node = event?.detail?.node ?? event?.detail;
+        const detail = event?.detail;
+        const node = detail && typeof detail === "object" && Object.hasOwn(detail, "node") ? detail.node : detail;
         const changes = { phase: node == null || samplerComplete ? "finalizing" : "generating" };
         if (!tracked) {
           rememberEarlyProgress(id, changes);

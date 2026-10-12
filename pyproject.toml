@@ -1,6 +1,6 @@
 [project]
 name = "PromptStudio_Video"
-version = "0.1.1"
+version = "0.2.0"
 description = "Structured video direction and MiniMax H3 generation for ComfyUI Prompt Studio"
 readme = "README.md"
 license = "GPL-3.0-only"

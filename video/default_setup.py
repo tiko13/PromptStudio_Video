@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 # Load the companion's standalone service without running its ComfyUI __init__.
-_ACQUISITION_PATH = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "asset_acquisition.py"
+_ACQUISITION_PATH = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "asset_acquisition.py"
 _ACQUISITION_SPEC = importlib.util.spec_from_file_location("prompt_studio_asset_acquisition", _ACQUISITION_PATH)
 ACQUISITION = importlib.util.module_from_spec(_ACQUISITION_SPEC)
 _ACQUISITION_SPEC.loader.exec_module(ACQUISITION)

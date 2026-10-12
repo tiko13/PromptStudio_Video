@@ -6,6 +6,7 @@ import vm from "node:vm";
 import {createDraftScheduler} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/chat/draft-outbox.js";
 import {tagSubmission} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/generation/recovery.js";
 import {archiveDraft} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/chat/draft-review.js";
+import {applyImageOutputSettings} from "../../ComfyUI_PromptStudio/web/js/prompt-studio/settings/image-output.js";
 
 const source = fs.readFileSync(new URL("../web/js/promptstudio_video_studio.js", import.meta.url), "utf8");
 function functionSource(name) {
@@ -45,7 +46,7 @@ function harness(server, shared = {}) {
     draftTabKey:product=>product, showDraftStorageFailure() {}, clearDraftStorageFailure() {},
     projectDraftScheduler: createDraftScheduler(() => {}),
     captureRuntimeProvenance:async()=>({version:1}),
-    tagSubmission,
+    tagSubmission, applyImageOutputSettings,
     markProjectChanged() { state.projectMutation++; },
     directorSettings:()=>({keep_models_loaded:true}),
     workflowReferenceController:null,

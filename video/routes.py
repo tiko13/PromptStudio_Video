@@ -11,14 +11,14 @@ import uuid
 from aiohttp import web
 from server import PromptServer
 
-from .nodes.h3_motion_context import native_masks_available
-from .video.compiler import compile_prompt
-from .video.prompt_advisories import prompt_advisories
-from .video.rewriter_review import review_rewrite
-from .video.sampling_profiles import profile_catalog
-from .video.reference_adapters import adapter_catalog
-from .video.audio_mix import assemble_exact_audio, probe_input_audio
-from .video.continuation import (
+from ..nodes.h3_motion_context import native_masks_available
+from .compiler import compile_prompt
+from .prompt_advisories import prompt_advisories
+from .rewriter_review import review_rewrite
+from .sampling_profiles import profile_catalog
+from .reference_adapters import adapter_catalog
+from .audio_mix import assemble_exact_audio, probe_input_audio
+from .continuation import (
     CONTINUATION_CONTEXT_FRAMES,
     CONTINUATION_CONTEXT_SECONDS,
     annotated_output_path,
@@ -28,7 +28,7 @@ from .video.continuation import (
     probe_video,
     resolve_output_path,
 )
-from .video.contracts import (
+from .contracts import (
     ANCHOR_ROLES,
     AUDIO_RETENTION,
     CANVAS_MULTIPLE,
@@ -49,20 +49,20 @@ from .video.contracts import (
     frame_count_for_duration,
     normalize_document,
 )
-from .video.media import (
+from .media import (
     MAX_REFERENCE_SECONDS,
     MAX_REFERENCE_TOTAL_SECONDS,
     MIN_REFERENCE_SECONDS,
 )
-from .video.director import director_chat, preview_changeset
-from .video.extension_planner import plan_extension
-from .video.default_setup import (
+from .director import director_chat, preview_changeset
+from .extension_planner import plan_extension
+from .default_setup import (
     default_model_setup_status,
     start_default_model_setup,
     workflow_setup_plan,
 )
-from .video.llm_provider import abort_generation, generation_status, run_operation, check_admission, job_ledger, job_status
-from .video.store import (
+from .llm_provider import abort_generation, generation_status, run_operation, check_admission, job_ledger, job_status
+from .store import (
     StoreConflictError,
     shared_transactional_store,
     _project_summary,
@@ -75,11 +75,11 @@ from .video.store import (
 )
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_STORE_PATH = os.path.join(BASE_DIR, "promptstudio_video_projects.json")
-PROJECT_STORE_DIR = os.path.join(BASE_DIR, "promptstudio_video_projects")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_STORE_PATH = os.path.join(BASE_DIR, "user-data", "promptstudio_video_projects.json")
+PROJECT_STORE_DIR = os.path.join(BASE_DIR, "user-data", "promptstudio_video_projects")
 _HISTORY_STORAGE_STARTED = False
-WORKFLOW_STORE_PATH = os.path.join(BASE_DIR, "promptstudio_video_workflows.json")
+WORKFLOW_STORE_PATH = os.path.join(BASE_DIR, "user-data", "promptstudio_video_workflows.json")
 STANDALONE_PAGE_PATH = os.path.join(BASE_DIR, "web", "prompt_studio_video.html")
 STANDALONE_ALIAS_PATH = "/PromptStudioVideo"
 MAX_DOCUMENT_REQUEST_BYTES = 2 * 1024 * 1024

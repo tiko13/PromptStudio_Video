@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 
 
 def route_functions():
-    source = Path(__file__).resolve().parents[1] / "routes.py"
+    source = Path(__file__).resolve().parents[1] / "video" / "routes.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     names = {"_run_director_job", "_cancel_director_job", "promptstudio_video_director_chat"}
     tree.body = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name in names]

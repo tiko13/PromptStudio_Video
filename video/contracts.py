@@ -24,7 +24,7 @@ def shared_wire_contracts():
     """Load the pure shared contract module without importing ComfyUI startup code."""
     name = "_promptstudio_shared_wire_contracts"
     if name not in sys.modules:
-        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "wire_contracts.py"
+        path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "wire_contracts.py"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
             raise RuntimeError("Prompt Studio shared wire contracts are unavailable")

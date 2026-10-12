@@ -5,7 +5,7 @@ import sys
 
 _name = "_promptstudio_model_catalog"
 if _name not in sys.modules:
-    _path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "model_catalog.py"
+    _path = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "model_catalog.py"
     _spec = importlib.util.spec_from_file_location(_name, _path)
     _module = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_module)

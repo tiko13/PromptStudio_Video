@@ -450,14 +450,14 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-global-settings-dialog { width: min(920px, calc(100vw - 28px)); max-width: calc(100vw - 28px); height: min(860px, calc(100vh - 28px)); height: min(860px, calc(100dvh - 28px)); max-height: calc(100vh - 28px); max-height: calc(100dvh - 28px); padding: 0; overflow: hidden; color: var(--psv-text); background: #11131b; border: 1px solid var(--psv-border-strong); border-radius: 16px; box-shadow: 0 28px 90px rgba(0, 0, 0, .68); }
 .psvstudio-global-settings-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .psvstudio-global-settings-dialog::backdrop { background: rgba(0, 0, 0, .78); backdrop-filter: blur(3px); }
-.psvstudio-global-settings-header, .psvstudio-global-settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: rgba(22, 24, 35, .97); }
+.psvstudio-global-settings-header, .psvstudio-global-settings-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: rgba(22, 24, 35, .97); }
 .psvstudio-global-settings-header { border-bottom: 1px solid var(--psv-border); }
 .psvstudio-global-settings-footer { border-top: 1px solid var(--psv-border); }
 .psvstudio-global-settings-heading { display: grid; gap: 2px; }
 .psvstudio-global-settings-heading h2 { margin: 0; font-size: 15px; }
 .psvstudio-global-settings-heading small { color: var(--psv-muted); font-size: 10px; }
-.psvstudio-global-settings-body { min-width: 0; min-height: 0; display: grid; grid-auto-rows: max-content; align-content: start; gap: 10px; overflow: auto; overscroll-behavior: contain; padding: 14px; scrollbar-color: rgba(150, 134, 218, .55) transparent; scrollbar-gutter: stable; scrollbar-width: thin; }
-.psvstudio-global-settings-body > .psvstudio-field-row { padding: 12px; background: rgba(8, 9, 14, .45); border: 1px solid var(--psv-border); border-radius: 11px; }
+.psvstudio-global-settings-body { min-width: 0; min-height: 0; display: grid; grid-auto-rows: max-content; align-content: start; gap: 8px; overflow: auto; overscroll-behavior: contain; padding: 10px; scrollbar-color: rgba(150, 134, 218, .55) transparent; scrollbar-gutter: stable; scrollbar-width: thin; }
+.psvstudio-global-settings-body > .psvstudio-field-row { padding: 9px; background: rgba(8, 9, 14, .45); border: 1px solid var(--psv-border); border-radius: 11px; }
 
 .psvstudio-media-preview-dialog { width: min(980px, calc(100vw - 28px)); height: min(820px, calc(100vh - 28px)); padding: 0; overflow: hidden; color: var(--psv-text); background: #0b0c11; border: 1px solid var(--psv-border-strong); border-radius: 16px; box-shadow: 0 28px 90px rgba(0, 0, 0, .72); }
 .psvstudio-media-preview-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr); }
@@ -502,7 +502,7 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-shot-editor-dialog { width: min(1180px, calc(100vw - 28px)); height: min(860px, calc(100vh - 28px)); height: min(860px, calc(100dvh - 28px)); max-height: calc(100vh - 28px); max-height: calc(100dvh - 28px); padding: 0; overflow: hidden; color: var(--psv-text); background: #11131b; border: 1px solid var(--psv-border-strong); border-radius: 16px; box-shadow: 0 28px 90px rgba(0, 0, 0, .68); }
 .psvstudio-shot-editor-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .psvstudio-shot-editor-dialog::backdrop { background: rgba(0, 0, 0, .78); backdrop-filter: blur(3px); }
-.psvstudio-shot-editor-header, .psvstudio-shot-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; background: rgba(22, 24, 35, .97); }
+.psvstudio-shot-editor-header, .psvstudio-shot-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; background: rgba(22, 24, 35, .97); }
 .psvstudio-shot-editor-header { border-bottom: 1px solid var(--psv-border); }
 .psvstudio-shot-editor-footer { border-top: 1px solid var(--psv-border); }
 .psvstudio-shot-editor-heading { display: grid; gap: 2px; }
@@ -798,6 +798,9 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-adapters > summary::before { content: "▸"; color: var(--ps-muted); }
 .psvstudio-adapters[open] > summary::before { content: "▾"; }
 .psvstudio-adapter-actions { display: flex; justify-content: flex-end; }
+.psvstudio-workflow-models > summary { cursor: pointer; font-size: 11px; padding: 5px 0; }
+.psvstudio-workflow-models .promptstudio-model-selection { margin: 5px 0; }
+.psvstudio-workflow-models .promptstudio-lora-name { flex: 1; }
 .psvstudio-adapters .psvstudio-adapter-refresh { width: 24px; min-height: 24px; margin-left: auto; padding: 0; border-radius: 7px; }
 .psvstudio-adapters small { display: block; overflow-wrap: anywhere; color: var(--ps-muted); font-size: 9px; line-height: 1.4; }
 .psvstudio-adapter-row { display: grid; gap: 5px; min-width: 0; }
@@ -806,9 +809,10 @@ body.psvstudio-dragging-shot, body.psvstudio-dragging-shot * { cursor: grabbing 
 .psvstudio-adapters :is(input, select) { min-height: 28px; padding: 4px 6px; color: var(--ps-text); background: rgba(7, 9, 14, .72); border: 1px solid var(--ps-border); border-radius: 7px; font-size: 10px; }
 .psvstudio-adapter-row label input { width: 68px; }
 .psvstudio-adapter-row select { min-width: 0; max-width: 65%; }
-.psvstudio-adapters .promptstudio-lora-remove { min-height: 28px; padding: 0; border-radius: 7px; }
+.psvstudio-adapters .promptstudio-lora-remove,
+.psvstudio-adapters .promptstudio-model-info { min-height: 28px; padding: 0; border-radius: 7px; }
 .psvstudio-adapters .promptstudio-lora-add input { width: 100%; min-height: 30px; padding: 0 8px; }
-.psvstudio-adapter-reference-heading { grid-template-columns: minmax(0, 1fr) 28px; }
+.psvstudio-adapter-reference-heading { grid-template-columns: minmax(0, 1fr) 28px 28px; }
 
 /* Frame-based authoring timeline and shot transport. */
 #psvstudio-timing-toolbar { min-width: 0; padding: 4px 0; border-bottom: 1px solid var(--psv-border); }

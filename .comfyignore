@@ -4,3 +4,6 @@
 
 # Development and regression tests
 tests/
+
+# Private runtime stores and cached assets
+/user-data/

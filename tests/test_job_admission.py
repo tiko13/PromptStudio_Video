@@ -17,7 +17,7 @@ class Overload(RuntimeError):
 
 
 def functions():
-    path = Path(__file__).resolve().parents[1] / "routes.py"
+    path = Path(__file__).resolve().parents[1] / "video" / "routes.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names = {"_prune_director_jobs", "_start_director_job", "_llm_error_response",
              "_shutdown_director_jobs", "promptstudio_video_director_chat"}

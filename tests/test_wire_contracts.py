@@ -18,7 +18,7 @@ class VideoWireContractsTests(unittest.TestCase):
 
     def test_shared_provider_contract_is_the_image_module(self):
         module = shared_wire_contracts()
-        expected = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "wire_contracts.py"
+        expected = Path(__file__).resolve().parents[2] / "ComfyUI_PromptStudio" / "backend" / "wire_contracts.py"
         self.assertEqual(Path(module.__file__).resolve(), expected.resolve())
         self.assertIs(module, shared_wire_contracts())
         self.assertEqual(module.normalize_provider_settings({"llm_provider": "ollama"})["llm_provider"], "ollama")
