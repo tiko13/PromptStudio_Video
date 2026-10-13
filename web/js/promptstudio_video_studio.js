@@ -1,3 +1,4 @@
+import { watchExternalGeneration } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/external-generation.js";
 import { copyEditorText } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/copy-editor.js";
 import { mountBackgroundTasks } from "/extensions/ComfyUI_PromptStudio/js/prompt-studio/ui/background-tasks.js";
 import { frame, seconds, formatTime, parseTime, generatedFrames, timingPlan, shotDuration, editBoundary, changeDuration, guideRange, validateTimeline, createHistory } from './timeline-model.js';
@@ -418,7 +419,7 @@ function saveDirectorSettings(dialog = state.directorDialog) {
 }
 
 function comfyUiIsProcessing() {
-  return state.comfyQueueRemaining > 0 || activeGenerationPromptIds().length > 0;
+  return state.loraStudioGeneration?.reserved || state.comfyQueueRemaining > 0 || activeGenerationPromptIds().length > 0;
 }
 
 function renderSystemStatusSummary() {
@@ -442,7 +443,7 @@ function renderSystemStatusSummary() {
     || state.directorJobs.size > 0
     || state.comfyRestartBusy;
   const unhealthy = !state.apiConnected || llmUnhealthy;
-  const stateName = unhealthy ? "offline" : (processing ? "busy" : "idle");
+  const stateName = state.apiConnected && state.loraStudioGeneration?.reserved ? "busy" : (unhealthy ? "offline" : (processing ? "busy" : "idle"));
   control.dataset.state = stateName;
   control.querySelector("summary").title = stateName === "offline"
     ? "System status: attention needed"
@@ -451,11 +452,16 @@ function renderSystemStatusSummary() {
     ? "Status: attention needed"
     : (stateName === "busy" ? "Status: processing" : "Status: ready");
 
+  if (state.apiConnected && state.loraStudioGeneration?.reserved) label.textContent = state.loraStudioGeneration.label;
+
   if (!state.apiConnected) {
     comfyDetail.textContent = "Not responding";
     comfyDetail.dataset.state = "offline";
   } else if (state.comfyRestartBusy) {
     comfyDetail.textContent = "Restart requested";
+    comfyDetail.dataset.state = "busy";
+  } else if (state.loraStudioGeneration?.reserved) {
+    comfyDetail.textContent = state.loraStudioGeneration.label;
     comfyDetail.dataset.state = "busy";
   } else if (comfyProcessing) {
     const queued = Math.max(0, Number(state.comfyQueueRemaining) || 0);
@@ -8044,7 +8050,9 @@ function renderHeader() {
   }
   if (generate) {
     generate.disabled = !project || workflowReferenceController?.uploading(project?.id) || (!structuredExtension && !state.workflows.length && !pendingGenerationRestore(project));
-    generate.textContent = structuredExtension ? "Generate extension" : "Generate";
+    generate.textContent = state.loraStudioGeneration?.reserved
+      ? (structuredExtension ? "Queue extension" : "Queue generation")
+      : (structuredExtension ? "Generate extension" : "Generate");
   }
   if (duplicate) duplicate.disabled = !project;
   if (reset) reset.disabled = !project || structuredExtension || Boolean(projectPendingGenerationCount(project)) || projectHasPendingDirectorJob(project.id) || state.directorBusy;
@@ -8655,6 +8663,11 @@ app.registerExtension({
     buildPanel();
     setupProgressEvents();
     startKoboldStatusMonitor();
+    watchExternalGeneration((status) => {
+      state.loraStudioGeneration = status;
+      renderHeader();
+      renderSystemStatusSummary();
+    }, api.fetchApi.bind(api));
     try {
       await loadConfig();
       await Promise.all([loadProjects(), loadWorkflowCache()]);

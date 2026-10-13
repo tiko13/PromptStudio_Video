@@ -1,23 +1,80 @@
 name: Publish to Comfy registry
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "pyproject.toml"
+  workflow_run:
+    workflows: [Studio integration quality]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Keep the version check and upload in the same lock, including reruns.
+concurrency:
+  group: comfy-registry-publish
+  cancel-in-progress: false
 
 jobs:
-  quality:
-    uses: ./.github/workflows/quality.yml
   publish-node:
-    needs: quality
     name: Publish Custom Node to registry
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Check exact version and uploaded archive
+        id: registry
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          from pathlib import Path
+          from urllib.error import HTTPError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          project = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']
+          name, version = project['name'], project['version']
+          url = f"https://api.comfy.org/nodes/{quote(name, safe='')}/versions/{quote(version, safe='')}"
+          published = False
+          try:
+              with urlopen(url, timeout=30) as response:
+                  record = json.load(response)
+          except HTTPError as error:
+              if error.code != 404:
+                  raise
+          else:
+              if record.get('version') != version or record.get('node_id', '').lower() != name.lower():
+                  raise RuntimeError('Registry returned a different node or version')
+              archive = record.get('downloadUrl', '')
+              if not archive.startswith('https://cdn.comfy.org/'):
+                  raise RuntimeError('Registry returned no recognized archive URL')
+              # A version record can exist before the upload finishes. Pending
+              # registry review is fine, but a missing archive still needs a retry.
+              try:
+                  with urlopen(Request(archive, method='HEAD'), timeout=30) as response:
+                      published = response.status == 200
+                      if not published:
+                          raise RuntimeError(f'Unexpected archive status: {response.status}')
+              except HTTPError as error:
+                  if error.code != 404:
+                      raise
+          print(f'{name} {version}: ' + ('already uploaded; skipping publish' if published else 'not uploaded; publish required'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'published={str(published).lower()}\n')
+          PY
       - name: Publish Custom Node
+        if: steps.registry.outputs.published == 'false'
         uses: Comfy-Org/publish-node-action@d2366e7abb6ab16f3bb03e3520ae25c8cf749bc9
         with:
+          skip_checkout: 'true'
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }} ## Add your own personal access token to your Github Repository secrets and reference it here.
