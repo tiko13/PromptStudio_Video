@@ -8,6 +8,6 @@ version is skipped. Publish does not run Quality again.
 For a manual release, run Quality on `main`. To retry only a failed upload, rerun
 its Publish run. Concurrent publish runs are serialized.
 
-See the shared [publication behavior and validation notes](https://github.com/tiko13/ComfyUI_PromptStudio/blob/master/.github/README.md).
+See the shared [publication behavior and validation notes](https://github.com/tiko13/ComfyUI_PromptStudio/blob/master/docs/registry-publication.md).
 Video integration CI also exercises this workflow's embedded registry check
 through the companion's `tests/test_registry_publish.py`.
